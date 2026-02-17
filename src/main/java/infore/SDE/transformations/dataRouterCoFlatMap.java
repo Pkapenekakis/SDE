@@ -38,12 +38,18 @@ public class dataRouterCoFlatMap extends RichCoFlatMapFunction<Datapoint, Reques
     @Override
     public void flatMap1(Datapoint value, Collector<Datapoint> out) throws Exception {
 
+        boolean emitted = false; //pkapenekakis TEST
+
+       /* System.out.println("[DATA_ROUTER] got datapoint: key=" +
+                value.getKey() + " dataSetkey=" + value.getDataSetkey() +
+                " streamID=" + value.getStreamID()); */
         if (MapToGrid.containsKey(value.getDataSetkey())) {
             RadiusSketch RS = MapToGrid.get(value.getDataSetkey());
             ArrayList<Datapoint> sketches_to_grid = (ArrayList<Datapoint>) RS.estimate(value.getValues());
             for (Datapoint dp : sketches_to_grid) {
                 out.collect(dp);
             }
+            emitted = true; //Pkapenekakis test
         }
 
         //Send Data with default Key the StreamID
@@ -71,10 +77,7 @@ public class dataRouterCoFlatMap extends RichCoFlatMapFunction<Datapoint, Reques
                 value.setDataSetkey(t.f1);
                 out.collect(value);
             }
-
-        }
-        if (RandomParallelism.size() > 0) {
-
+            emitted = true;
         }
         if (RandomParallelism.size() > 0) {
             for (Map.Entry<Integer, Tuple2<Integer, Integer>> entry : RandomParallelism.entrySet()) {
@@ -90,6 +93,10 @@ public class dataRouterCoFlatMap extends RichCoFlatMapFunction<Datapoint, Reques
                     entry.setValue(v);
                 }
             }
+            emitted = true; //Pkapenekakis Test
+        }
+        if(!emitted){
+            out.collect(value);
         }
     }
 

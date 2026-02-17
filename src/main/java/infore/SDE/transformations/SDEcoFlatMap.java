@@ -6,6 +6,7 @@ import java.net.URLClassLoader;
 import java.util.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import infore.SDE.synopses.OnePassSampler.OnePassPhaseTwo;
 import lib.WDFT.controlBucket;
 import lib.WLSH.Bucket;
 import infore.SDE.synopses.*;
@@ -49,6 +50,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			}
 		MC_Synopses.put(node.getKey(),C_Synopses);
 		}
+		//System.out.println("[SDEcoFlatMap] flatMap1 got datapoint key=" + node.getKey());
 	}
 
 	@Override
@@ -221,6 +223,16 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				if (rq.getParam().length > 3)
 					sketch = new PastDFTSynopsis(rq.getUID(), rq.getParam());
 				Synopses.add(sketch);
+				break;
+			// One-Pass Phase 2
+			case 30:
+				System.out.println("ADD -> OnePassPhaseTwo " + rq.toString());
+				if (rq.getParam().length > 5) {   // περιμένουμε 6 params
+					sketch = new OnePassPhaseTwo(rq.getUID(), rq.getParam());
+					Synopses.add(sketch);
+				} else {
+					System.err.println("OnePassPhaseTwo: expected >= 6 parameters");
+				}
 				break;
 		}
 			M_Synopses.put(rq.getKey(),Synopses);

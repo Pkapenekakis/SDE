@@ -182,8 +182,8 @@ public class Run {
 			System.out.println("[INFO] Default values");
 			//Default values
 			//kafkaDataInputTopic = "FAN";
-			kafkaDataInputTopic = "data_topic";
-			kafkaRequestInputTopic = "request_topic";
+			kafkaDataInputTopic = "dataTopic";
+			kafkaRequestInputTopic = "requestTopic";
 			//kafkaRequestInputTopic = "Rq_FAN";
 			parallelism = 4;
 			//parallelism2 = 4;
@@ -191,7 +191,7 @@ public class Run {
 			//kafkaBrokersList = "45.10.26.123:19092";
 			kafkaBrokersList = "localhost:9092";
 			//kafkaBrokersList = "159.69.32.166:9092";
-			kafkaOutputTopic = "estimation_topic";
+			kafkaOutputTopic = "estimationTopic";
 		}
 	}
 }

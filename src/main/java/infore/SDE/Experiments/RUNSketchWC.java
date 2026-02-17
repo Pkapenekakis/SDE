@@ -1,4 +1,4 @@
-package infore.SDE.experiments;
+package infore.SDE.Experiments;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Datapoint;
@@ -58,7 +58,7 @@ public class RUNSketchWC {
                 }).name("DATA_SOURCE").setParallelism(1).keyBy((KeySelector<Datapoint, String>) Datapoint::getKey);
 
 
-        DataStream<Datapoint> DataStream2 = dataStream.flatMap(new SketchFlatMap()).setParallelism(1);
+        DataStream<Datapoint> DataStream2 = dataStream.flatMap(new infore.SDE.experiments.SketchFlatMap()).setParallelism(1);
 
 
         env.execute("StreamingSketch"+parallelism+"_"+multi+"_"+kafkaDataInputTopic);
