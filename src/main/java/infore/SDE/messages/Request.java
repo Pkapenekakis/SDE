@@ -2,6 +2,7 @@ package infore.SDE.messages;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import java.io.Serializable;
 import java.util.Arrays;
 
@@ -15,6 +16,8 @@ public class Request implements Serializable{
 	private String StreamID; //the stream ID
 	private String[] Param; // the parameters of the Request
 	private int NoOfP; // Number of parallelism
+	private JsonNode parameters; //Used for Onepass* Algorithm to describe the stream correlation
+
 
 		public Request(){
 
@@ -128,10 +131,14 @@ public class Request implements Serializable{
 		NoOfP = noOfP;
 	}
 
+	public JsonNode getParameters() { return parameters; }
+
+	public void setParameters(JsonNode parameters) { this.parameters = parameters; }
+
 	@Override
 	public String toString() {
 		return "Request [key=" + DataSetkey + ", RequestID=" + RequestID + ", SynopsisID=" + SynopsisID + ", UID=" + UID
-				+ ", StreamID=" + StreamID + ", Param=" + Arrays.toString(Param) + ", NoOfP=" + NoOfP + "]";
+				+ ", StreamID=" + StreamID + ", Param=" + Arrays.toString(Param) + ", NoOfP=" + NoOfP + "]" + ", Parameters=" + parameters + "]";
 	}
 	public String toSumString() {
 		return  "[" + UID + "," + SynopsisID + "," + Arrays.toString(Param)  + "," + NoOfP + "]\n";
@@ -148,7 +155,7 @@ public class Request implements Serializable{
 			if(i == Param.length -1)
 				pr = pr + Param[i];
 			else
-			pr = pr + Param[i]+";";
+				pr = pr + Param[i]+";";
 		}
 
 		return "\"" +DataSetkey+","+RequestID+","+UID+","+SynopsisID+","+StreamID+","+pr+","+NoOfP+"\"";

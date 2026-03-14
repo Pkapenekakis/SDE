@@ -2,15 +2,11 @@ package infore.SDE.Experiments;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.producer.KafkaProducer;
-import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
-import org.apache.kafka.common.serialization.StringSerializer;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Properties;
-import java.util.concurrent.ExecutionException;
 
 public class Phase2TestDriver {
 
@@ -49,13 +45,51 @@ public class Phase2TestDriver {
     }
 
     private static void sendAddPhase2Request(KafkaProducer<String, String> producer) throws Exception {
-        String json = "{\"streamID\":\"INTEL\","
+       /* Request before the JSON schema
+       String json = "{\"streamID\":\"INTEL\","
                 + "\"synopsisID\":30,"
                 + "\"requestID\":1,"
                 + "\"dataSetkey\":\"Forex\","
                 + "\"param\":[\"StockID\",\"price\",\"joinKey\",\"group_id\",\"weight\",\"5\"],"
                 + "\"noOfP\":1,"
-                + "\"uid\":1110}";
+                + "\"uid\":1110}"; */
+
+        String json = "{"
+                + "\"streamID\":\"INTEL\","
+                + "\"synopsisID\":30,"
+                + "\"requestID\":1,"
+                + "\"dataSetkey\":\"Forex\","
+                + "\"param\":[\"StockID\",\"price\",\"joinKey\",\"group_id\",\"weight\",\"5\"],"
+                + "\"noOfP\":1,"
+                + "\"uid\":1110,"
+                + "\"parameters\":{"
+                + "  \"onePassStarParams\":{"
+                + "    \"queryName\":\"QY\","
+                + "    \"mainTable\":\"l1\","
+                + "    \"dataset\":{"
+                + "      \"name\":\"tpch\","
+                + "      \"dbConfig\":\"tpch.json\","
+                + "      \"scaleFactor\":1,"
+                + "      \"seed\":\"test123\""
+                + "    },"
+                + "    \"relations\":["
+                + "      {\"table\":\"lineitem\",\"alias\":\"l1\"},"
+                + "      {\"table\":\"orders\",\"alias\":\"o1\"}"
+                + "    ],"
+                + "    \"joins\":["
+                + "      {\"leftAlias\":\"l1\",\"leftField\":\"l_orderkey\",\"rightAlias\":\"o1\",\"rightField\":\"o_orderkey\"}"
+                + "    ],"
+                + "    \"weight\":{"
+                + "      \"expression\":\"w\","
+                + "      \"variables\":[\"w\"]"
+                + "    },"
+                + "    \"output\":{"
+                + "      \"sampleSize\":5"
+                + "    }"
+                + "  }"
+                + "}"
+                + "}";
+
 
         ProducerRecord<String, String> rec =
                 new ProducerRecord<>("requestTopic", json);

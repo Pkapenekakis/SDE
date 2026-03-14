@@ -6,7 +6,9 @@ import java.net.URLClassLoader;
 import java.util.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.synopses.OnePassSampler.OnePassPhaseTwo;
+import infore.SDE.transformations.onepass.OnePassRequestParser;
 import lib.WDFT.controlBucket;
 import lib.WLSH.Bucket;
 import infore.SDE.synopses.*;
@@ -227,12 +229,21 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			// One-Pass Phase 2
 			case 30:
 				System.out.println("ADD -> OnePassPhaseTwo " + rq.toString());
-				if (rq.getParam().length > 5) {   // περιμένουμε 6 params
+				/* Testing OnePass PhaseTwo, before JSON schema
+				System.out.println("ADD -> OnePassPhaseTwo " + rq.toString());
+				if (rq.getParam().length > 5) {   // Expect 6 params
 					sketch = new OnePassPhaseTwo(rq.getUID(), rq.getParam());
 					Synopses.add(sketch);
 				} else {
 					System.err.println("OnePassPhaseTwo: expected >= 6 parameters");
-				}
+				} */
+				OnePassParams onePassParams = OnePassRequestParser.parse(rq);
+				sketch = new OnePassPhaseTwo(rq.getUID(), rq.getParam());
+				OnePassParams p = OnePassRequestParser.parse(rq);
+				System.out.println("Parsed OnePass queryName = " + p.getQueryName());
+				System.out.println("Parsed OnePass mainTable = " + p.getMainTable());
+				System.out.println("Parsed relations size = " + p.getRelations().size());
+				Synopses.add(sketch);
 				break;
 		}
 			M_Synopses.put(rq.getKey(),Synopses);
