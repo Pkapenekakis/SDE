@@ -237,7 +237,6 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				} else {
 					System.err.println("OnePassPhaseTwo: expected >= 6 parameters");
 				} */
-				OnePassParams onePassParams = OnePassRequestParser.parse(rq);
 				sketch = new OnePassPhaseTwo(rq.getUID(), rq.getParam());
 				OnePassParams p = OnePassRequestParser.parse(rq);
 				System.out.println("Parsed OnePass queryName = " + p.getQueryName());

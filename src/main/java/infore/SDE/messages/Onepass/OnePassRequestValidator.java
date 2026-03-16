@@ -10,7 +10,7 @@ public final class OnePassRequestValidator {
 
     public static void validate(OnePassParams params) {
         if (params == null) {
-            throw new IllegalArgumentException("OnePassStarParams is null");
+            throw new IllegalArgumentException("OnePassParams is null");
         }
 
         if (isBlank(params.getQueryName())) {

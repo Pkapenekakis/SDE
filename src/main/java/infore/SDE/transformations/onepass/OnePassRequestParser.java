@@ -23,9 +23,9 @@ public final class OnePassRequestParser {
             throw new IllegalArgumentException("Request.parameters is missing");
         }
 
-        JsonNode onePassNode = parameters.get("onePassStarParams");
+        JsonNode onePassNode = parameters.get("onePassParams");
         if (onePassNode == null || onePassNode.isNull()) {
-            throw new IllegalArgumentException("Request.parameters.onePassStarParams is missing");
+            throw new IllegalArgumentException("Request.parameters.onePassParams is missing");
         }
 
         try {
@@ -42,7 +42,7 @@ public final class OnePassRequestParser {
             return params;
 
         } catch (Exception e) {
-            throw new IllegalArgumentException("Failed to parse onePassStarParams: " + e.getMessage(), e);
+            throw new IllegalArgumentException("Failed to parse onePassParams: " + e.getMessage(), e);
         }
     }
 }

@@ -63,7 +63,7 @@ public class Phase2TestDriver {
                 + "\"noOfP\":1,"
                 + "\"uid\":1110,"
                 + "\"parameters\":{"
-                + "  \"onePassStarParams\":{"
+                + "  \"onePassParams\":{"
                 + "    \"queryName\":\"QY\","
                 + "    \"mainTable\":\"l1\","
                 + "    \"dataset\":{"
