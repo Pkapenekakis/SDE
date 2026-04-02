@@ -17,26 +17,59 @@ public final class OnePassTupleExtractor {
      * e.g. {"table":"orders","o_orderkey":1,"o_custkey":42}    --Could have more fields
      */
     public static OnePassTuple extract(String valuesJson) {
-        if (valuesJson == null || valuesJson.trim().isEmpty()) {
-            throw new IllegalArgumentException("Datapoint values JSON is null or empty");
+        return extract((Object) valuesJson);
+    }
+
+    public static OnePassTuple extract(Object payload) {
+        JsonNode tupleNode = toJsonNode(payload);
+
+        if (tupleNode == null || tupleNode.isNull() || !tupleNode.isObject()) {
+            throw new IllegalArgumentException("Datapoint values is not a valid JSON object: " + payload);
+        }
+
+        JsonNode aliasNode = tupleNode.get("alias");
+        JsonNode tableNode = tupleNode.get("table");
+
+        String relationId = null;
+
+        if (aliasNode != null && !aliasNode.isNull() && !aliasNode.asText().trim().isEmpty()) {
+            relationId = aliasNode.asText().trim();
+        } else if (tableNode != null && !tableNode.isNull() && !tableNode.asText().trim().isEmpty()) {
+            relationId = tableNode.asText().trim();
+        }
+
+        if (relationId == null) {
+            throw new IllegalArgumentException(
+                    "Missing required relation identifier. Expected 'alias' or 'table' in datapoint values: "
+                            + tupleNode.toString());
+        }
+
+        return new OnePassTuple(relationId, tupleNode);
+    }
+
+    private static JsonNode toJsonNode(Object payload) {
+        if (payload == null) {
+            throw new IllegalArgumentException("Datapoint values payload is null");
         }
 
         try {
-            JsonNode tupleNode = MAPPER.readTree(valuesJson);
-
-            if (tupleNode == null || tupleNode.isNull() || !tupleNode.isObject()) {
-                throw new IllegalArgumentException("Datapoint values is not a valid JSON object: " + valuesJson);
+            if (payload instanceof JsonNode) {
+                return (JsonNode) payload;
             }
 
-            JsonNode tableNode = tupleNode.get("table");
-            if (tableNode == null || tableNode.isNull() || tableNode.asText().trim().isEmpty()) {
-                throw new IllegalArgumentException("Missing required field 'table' in datapoint values: " + valuesJson);
+            if (payload instanceof String) {
+                String s = ((String) payload).trim();
+                if (s.isEmpty()) {
+                    throw new IllegalArgumentException("Datapoint values JSON is empty");
+                }
+                return MAPPER.readTree(s);
             }
 
-            return new OnePassTuple(tableNode.asText(), tupleNode);
+            return MAPPER.valueToTree(payload);
 
         } catch (Exception e) {
-            throw new IllegalArgumentException("Failed to parse OnePass datapoint values JSON", e);
+            throw new IllegalArgumentException("Failed to parse OnePass datapoint payload", e);
         }
     }
+
 }
