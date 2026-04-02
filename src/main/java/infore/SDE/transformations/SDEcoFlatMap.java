@@ -8,6 +8,8 @@ import java.util.*;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.synopses.OnePassSampler.OnePassPhaseTwo;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOne;
+import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
 import lib.WDFT.controlBucket;
 import lib.WLSH.Bucket;
@@ -243,6 +245,20 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				System.out.println("Parsed OnePass mainTable = " + p.getMainTable());
 				System.out.println("Parsed relations size = " + p.getRelations().size());
 				Synopses.add(sketch);
+				break;
+			//Onepass* phase 1
+			case 31:
+				System.out.println("ADD -> OnePassPhaseOne " + rq.toString());
+
+				OnePassParams phase1Params = OnePassRequestParser.parse(rq);
+				CompiledOnePassPlan phase1Plan = CompiledOnePassPlan.from(phase1Params);
+
+				sketch = new OnePassPhaseOne(rq.getUID(), phase1Plan, phase1Params.getWeight());
+				Synopses.add(sketch);
+
+				System.out.println("Parsed OnePass Phase1 queryName = " + phase1Params.getQueryName());
+				System.out.println("Parsed OnePass Phase1 mainTable = " + phase1Params.getMainTable());
+				System.out.println("Parsed OnePass Phase1 relations size = " + phase1Params.getRelations().size());
 				break;
 		}
 			M_Synopses.put(rq.getKey(),Synopses);
