@@ -1,10 +1,6 @@
 package infore.SDE.synopses.OnePassSampler.PhaseOne;
 
-import infore.SDE.messages.Onepass.JoinEdgeSpec;
-import infore.SDE.messages.Onepass.OnePassParams;
-import infore.SDE.messages.Onepass.OutputSpec;
-import infore.SDE.messages.Onepass.RelationSpec;
-import infore.SDE.messages.Onepass.WeightSpec;
+import infore.SDE.messages.Onepass.*;
 
 import java.util.Arrays;
 
@@ -46,6 +42,9 @@ public class TestOnePassFixtures {
         out.setSampleSize(10);
         p.setOutput(out);
 
+        DatasetConfig datasetConfig = new DatasetConfig();
+        p.setDataset(datasetConfig);
+
         return p;
     }
 
@@ -80,6 +79,9 @@ public class TestOnePassFixtures {
         OutputSpec out = new OutputSpec();
         out.setSampleSize(10);
         p.setOutput(out);
+
+        DatasetConfig datasetConfig = new DatasetConfig();
+        p.setDataset(datasetConfig);
 
         return p;
     }
