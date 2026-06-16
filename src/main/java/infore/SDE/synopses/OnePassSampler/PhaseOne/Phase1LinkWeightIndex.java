@@ -5,10 +5,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/**
- * Hash-table implementation for one link-node partition.
- * Stores aggregated subtree/group weight by join value.
- */
 public class Phase1LinkWeightIndex implements Serializable {
 
     private static final long serialVersionUID = 1L;
@@ -39,7 +35,6 @@ public class Phase1LinkWeightIndex implements Serializable {
         weightsByJoinValue.put(key, current + delta);
     }
 
-    //Lookup method, if the key exists return the aggregated weight else 0
     public double getOrZero(JoinValue key) {
         Double v = weightsByJoinValue.get(key);
         return v == null ? 0.0d : v;
@@ -53,6 +48,26 @@ public class Phase1LinkWeightIndex implements Serializable {
         return Collections.unmodifiableMap(weightsByJoinValue);
     }
 
+    public int size() {
+        return weightsByJoinValue.size();
+    }
+
+    public double totalWeight() {
+        double total = 0.0d;
+        for (Double weight : weightsByJoinValue.values()) {
+            if (weight != null) {
+                total += weight;
+            }
+        }
+        return total;
+    }
+
+    public Phase1LinkWeightIndex copy() {
+        Phase1LinkWeightIndex copy = new Phase1LinkWeightIndex(edgeId);
+        copy.weightsByJoinValue.putAll(this.weightsByJoinValue);
+        return copy;
+    }
+
     public Map<String, Double> toDebugMap() {
         Map<String, Double> out = new LinkedHashMap<String, Double>();
         for (Map.Entry<JoinValue, Double> e : weightsByJoinValue.entrySet()) {
@@ -61,7 +76,6 @@ public class Phase1LinkWeightIndex implements Serializable {
         return out;
     }
 
-    //Used for future distributed implementation, merges key computations from diff workers
     public void mergeFrom(Phase1LinkWeightIndex other) {
         if (other == null) {
             return;
