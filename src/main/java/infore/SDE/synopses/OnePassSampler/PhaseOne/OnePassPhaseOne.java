@@ -40,12 +40,12 @@ public class OnePassPhaseOne extends Synopsis {
 
     @Override
     public Object estimate(Object k) {
-        return state.debugSnapshot();
+        return state.exportResult();
     }
 
     @Override
     public Estimation estimate(Request rq) {
-        return new Estimation(rq, state.debugSnapshot(), Integer.toString(rq.getUID()));
+        return new Estimation(rq, state.exportResult(), Integer.toString(rq.getUID()));
     }
 
     @Override
@@ -64,5 +64,9 @@ public class OnePassPhaseOne extends Synopsis {
 
     public OnePassPhaseOneState getState() {
         return state;
+    }
+
+    public OnePassPhaseOneResult exportResult() {
+        return state.exportResult();
     }
 }
