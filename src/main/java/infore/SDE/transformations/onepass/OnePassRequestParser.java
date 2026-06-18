@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Request;
 import infore.SDE.messages.Onepass.OnePassRequestValidator;
 import infore.SDE.messages.Onepass.OnePassParams;
+import infore.SDE.transformations.onepass.sql.OnePassSqlCompiler;
 
 public final class OnePassRequestParser {
 
@@ -23,15 +24,26 @@ public final class OnePassRequestParser {
             throw new IllegalArgumentException("Request.parameters is missing");
         }
 
-        JsonNode onePassNode = parameters.get("onePassParams");
-        if (onePassNode == null || onePassNode.isNull()) {
-            throw new IllegalArgumentException("Request.parameters.onePassParams is missing");
-        }
-
         try {
-            OnePassParams params = MAPPER.treeToValue(onePassNode, OnePassParams.class);
+            OnePassParams params;
 
-            // first version constraint
+            JsonNode onePassNode = parameters.get("onePassParams");
+
+            if (onePassNode != null && !onePassNode.isNull()) {
+                params = MAPPER.treeToValue(onePassNode, OnePassParams.class);
+            } else {
+                JsonNode onePassSqlNode = parameters.get("onePassSql");
+
+                if (onePassSqlNode == null || onePassSqlNode.isNull()
+                        || !onePassSqlNode.isTextual()) {
+                    throw new IllegalArgumentException(
+                            "Request.parameters must contain either onePassParams or textual onePassSql"
+                    );
+                }
+
+                params = OnePassSqlCompiler.compile(onePassSqlNode.asText());
+            }
+
             if (rq.getNoOfP() != 1) {
                 throw new IllegalArgumentException(
                         "OnePass* initial implementation supports only noOfP = 1, got " + rq.getNoOfP()
@@ -42,7 +54,7 @@ public final class OnePassRequestParser {
             return params;
 
         } catch (Exception e) {
-            throw new IllegalArgumentException("Failed to parse onePassParams: " + e.getMessage(), e);
+            throw new IllegalArgumentException("Failed to parse OnePass request: " + e.getMessage(), e);
         }
     }
 }

@@ -94,8 +94,15 @@ public class PhaseOneTpchQ3Test {
         System.out.println("Max orders rows: " + maxOrdersRows);
 
         System.out.println();
-        System.out.println("1. Sending ADD request for weighted TPC-H Q3 Phase 1...");
-        send(producer, REQUEST_TOPIC, buildAddPhaseOneRequest());
+        System.out.println("1. Sending ADD request for SQL/catalog weighted TPC-H Q3 Phase 1...");
+
+        ObjectNode addRequest = buildAddPhaseOneSqlRequest();
+
+        System.out.println();
+        System.out.println("ADD request:");
+        System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(addRequest));
+
+        send(producer, REQUEST_TOPIC, addRequest);
 
         Thread.sleep(3000L);
 
@@ -121,7 +128,14 @@ public class PhaseOneTpchQ3Test {
 
         System.out.println();
         System.out.println("4. Sending ESTIMATE request...");
-        send(producer, REQUEST_TOPIC, buildEstimateRequest());
+
+        ObjectNode estimateRequest = buildEstimateRequest();
+
+        System.out.println();
+        System.out.println("ESTIMATE request:");
+        System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(estimateRequest));
+
+        send(producer, REQUEST_TOPIC, estimateRequest);
 
         System.out.println();
         System.out.println("5. Waiting for weighted TPC-H Q3 Phase 1 result...");
@@ -785,6 +799,30 @@ public class PhaseOneTpchQ3Test {
                     actualValue
             );
         }
+    }
+
+    private static ObjectNode buildAddPhaseOneSqlRequest() {
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", DATASET_KEY);
+        request.put("requestID", 1);
+        request.put("synopsisID", 31);
+        request.put("uid", UID);
+        request.put("streamID", "tpch-q3-sql");
+        request.put("noOfP", 1);
+
+        ArrayNode param = request.putArray("param");
+        param.add("unused");
+
+        ObjectNode parameters = request.putObject("parameters");
+
+        parameters.put(
+                "onePassSql",
+                "SELECT * FROM wq3 ROOT customer LIMIT 1000000 " +
+                        "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */"
+        );
+
+        return request;
     }
 
     private static void assertClose(String label,

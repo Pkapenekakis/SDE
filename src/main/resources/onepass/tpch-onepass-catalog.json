@@ -1,0 +1,203 @@
+{
+  "dataset": {
+    "name": "tpch",
+    "defaultScaleFactor": 1,
+    "tables": {
+      "customer": {
+        "file": "customer.tbl",
+        "separator": "|",
+        "columns": [
+          "c_custkey",
+          "c_name",
+          "c_address",
+          "c_nationkey",
+          "c_phone",
+          "c_acctbal"
+        ]
+      },
+      "orders": {
+        "file": "orders.tbl",
+        "separator": "|",
+        "columns": [
+          "o_orderkey",
+          "o_custkey",
+          "o_status",
+          "o_totalprice"
+        ]
+      },
+      "lineitem": {
+        "file": "lineitem.tbl",
+        "separator": "|",
+        "columns": [
+          "l_orderkey",
+          "l_partkey",
+          "l_suppkey",
+          "l_linenumber",
+          "l_quantity",
+          "l_extendedprice",
+          "l_discount",
+          "l_tax",
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipdate",
+          "l_commitdate",
+          "l_receiptdate",
+          "l_shipinstruct",
+          "l_shipmode",
+          "l_comment"
+        ]
+      },
+      "supplier": {
+        "file": "supplier.tbl",
+        "separator": "|",
+        "columns": [
+          "s_suppkey",
+          "s_name",
+          "s_address",
+          "s_nationkey",
+          "s_phone",
+          "s_acctbal",
+          "s_comment"
+        ]
+      },
+      "nation": {
+        "file": "nation.tbl",
+        "separator": "|",
+        "columns": [
+          "n_nationkey",
+          "n_name",
+          "n_regionkey",
+          "n_comment"
+        ]
+      }
+    }
+  },
+  "queries": {
+    "q3": {
+      "description": "TPC-H Q3 customer-orders-lineitem join",
+      "defaultRoot": "customer",
+      "relations": [
+        {
+          "alias": "customer",
+          "table": "customer"
+        },
+        {
+          "alias": "orders",
+          "table": "orders"
+        },
+        {
+          "alias": "lineitem",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "customer",
+          "leftField": "c_custkey",
+          "rightAlias": "orders",
+          "rightField": "o_custkey"
+        },
+        {
+          "leftAlias": "orders",
+          "leftField": "o_orderkey",
+          "rightAlias": "lineitem",
+          "rightField": "l_orderkey"
+        }
+      ],
+      "projection": [
+        "customer",
+        "orders",
+        "lineitem"
+      ],
+      "defaultWeightsByAlias": {
+        "customer": "1",
+        "orders": "1",
+        "lineitem": "1"
+      }
+    },
+    "wq3_alias": {
+      "description": "Weighted TPC-H Q3 with aliases c-o-l",
+      "defaultRoot": "c",
+      "relations": [
+        {
+          "alias": "c",
+          "table": "customer"
+        },
+        {
+          "alias": "o",
+          "table": "orders"
+        },
+        {
+          "alias": "l",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "c",
+          "leftField": "c_custkey",
+          "rightAlias": "o",
+          "rightField": "o_custkey"
+        },
+        {
+          "leftAlias": "o",
+          "leftField": "o_orderkey",
+          "rightAlias": "l",
+          "rightField": "l_orderkey"
+        }
+      ],
+      "projection": [
+        "c.c_custkey",
+        "o.o_orderkey",
+        "l.l_linenumber"
+      ],
+      "defaultWeightsByAlias": {
+        "c": "1",
+        "o": "o_totalprice",
+        "l": "l_extendedprice"
+      }
+    },
+    "w_two_lineitems": {
+      "description": "Tree query with two lineitem aliases connected through orders",
+      "defaultRoot": "o",
+      "relations": [
+        {
+          "alias": "o",
+          "table": "orders"
+        },
+        {
+          "alias": "l1",
+          "table": "lineitem"
+        },
+        {
+          "alias": "l2",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "o",
+          "leftField": "o_orderkey",
+          "rightAlias": "l1",
+          "rightField": "l_orderkey"
+        },
+        {
+          "leftAlias": "o",
+          "leftField": "o_orderkey",
+          "rightAlias": "l2",
+          "rightField": "l_orderkey"
+        }
+      ],
+      "projection": [
+        "o.o_orderkey",
+        "l1.l_linenumber",
+        "l2.l_linenumber"
+      ],
+      "defaultWeightsByAlias": {
+        "o": "o_totalprice",
+        "l1": "l_extendedprice",
+        "l2": "l_extendedprice"
+      }
+    }
+  }
+}
