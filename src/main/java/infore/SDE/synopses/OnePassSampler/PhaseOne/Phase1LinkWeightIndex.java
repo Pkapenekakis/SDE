@@ -89,4 +89,27 @@ public class Phase1LinkWeightIndex implements Serializable {
             add(e.getKey(), e.getValue());
         }
     }
+
+    public Map<String, Object> toSummaryMap(int sampleLimit) {
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+
+        out.put("numberOfKeys", size());
+        out.put("totalWeight", totalWeight());
+
+        Map<String, Double> sampleEntries = new LinkedHashMap<String, Double>();
+
+        int count = 0;
+        for (Map.Entry<JoinValue, Double> entry : weightsByJoinValue.entrySet()) {
+            if (sampleLimit >= 0 && count >= sampleLimit) {
+                break;
+            }
+
+            sampleEntries.put(entry.getKey().toString(), entry.getValue());
+            count++;
+        }
+
+        out.put("sampleEntries", sampleEntries);
+
+        return out;
+    }
 }

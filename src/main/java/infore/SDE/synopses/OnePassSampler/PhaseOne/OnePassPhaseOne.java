@@ -45,7 +45,22 @@ public class OnePassPhaseOne extends Synopsis {
 
     @Override
     public Estimation estimate(Request rq) {
-        return new Estimation(rq, state.exportResult(), Integer.toString(rq.getUID()));
+        OnePassPhaseOneResult result = state.exportResult();
+
+        if (wantsSummary(rq)) {
+            int sampleLimit = summarySampleLimit(rq);
+            return new Estimation(
+                    rq,
+                    result.toSummaryMap(sampleLimit),
+                    Integer.toString(rq.getUID())
+            );
+        }
+
+        return new Estimation(
+                rq,
+                result.toDebugMap(),
+                Integer.toString(rq.getUID())
+        );
     }
 
     @Override
@@ -68,5 +83,62 @@ public class OnePassPhaseOne extends Synopsis {
 
     public OnePassPhaseOneResult exportResult() {
         return state.exportResult();
+    }
+
+    private boolean wantsSummary(Request rq) {
+        if (rq == null || rq.getParam() == null) {
+            return false;
+        }
+
+        for (String p : rq.getParam()) {
+            if (p == null) {
+                continue;
+            }
+
+            String value = p.trim();
+
+            if ("summary".equalsIgnoreCase(value)
+                    || "phase1-summary".equalsIgnoreCase(value)
+                    || "stats".equalsIgnoreCase(value)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private int summarySampleLimit(Request rq) {
+        int defaultLimit = 5;
+
+        if (rq == null || rq.getParam() == null) {
+            return defaultLimit;
+        }
+
+        for (String p : rq.getParam()) {
+            if (p == null) {
+                continue;
+            }
+
+            String value = p.trim();
+
+            if (value.startsWith("sample=")) {
+                return parsePositiveInt(value.substring("sample=".length()), defaultLimit);
+            }
+
+            if (value.startsWith("summarySample=")) {
+                return parsePositiveInt(value.substring("summarySample=".length()), defaultLimit);
+            }
+        }
+
+        return defaultLimit;
+    }
+
+    private int parsePositiveInt(String value, int fallback) {
+        try {
+            int parsed = Integer.parseInt(value.trim());
+            return parsed < 0 ? fallback : parsed;
+        } catch (Exception e) {
+            return fallback;
+        }
     }
 }

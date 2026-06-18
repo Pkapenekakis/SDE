@@ -4,10 +4,7 @@ import infore.SDE.synopses.OnePassSampler.OnePassTuple;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 
 import java.io.Serializable;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Serializable output of One-pass* Phase 1.
@@ -148,10 +145,67 @@ public final class OnePassPhaseOneResult implements Serializable {
 
         out.put("queryName", getQueryName());
         out.put("rootAlias", getRootAlias());
-        out.put("rootToLeafOrder", getRootToLeafOrder());
-        out.put("leafToRootOrder", getLeafToRootOrder());
-        out.put("seenTuplesByAlias", getSeenTuplesByAlias());
-        out.put("edgeIndexes", getEdgeIndexes());
+
+        /*
+         * Important for Flink/Kryo:
+         * Never expose Collections.unmodifiableList or Collections.unmodifiableMap
+         * inside the object that goes through the Flink stream.
+         */
+        out.put("rootToLeafOrder", new ArrayList<String>(getRootToLeafOrder()));
+        out.put("leafToRootOrder", new ArrayList<String>(getLeafToRootOrder()));
+
+        out.put(
+                "seenTuplesByAlias",
+                new LinkedHashMap<String, Long>(getSeenTuplesByAlias())
+        );
+
+        out.put("edgeIndexes", mutableEdgeIndexes());
+
+        return out;
+    }
+
+    private Map<String, Map<String, Double>> mutableEdgeIndexes() {
+        Map<String, Map<String, Double>> out =
+                new LinkedHashMap<String, Map<String, Double>>();
+
+        Map<String, Map<String, Double>> edgeIndexes = getEdgeIndexes();
+
+        for (Map.Entry<String, Map<String, Double>> entry : edgeIndexes.entrySet()) {
+            out.put(
+                    entry.getKey(),
+                    new LinkedHashMap<String, Double>(entry.getValue())
+            );
+        }
+
+        return out;
+    }
+
+    public Map<String, Map<String, Object>> getEdgeSummaries(int sampleLimit) {
+        Map<String, Map<String, Object>> out =
+                new LinkedHashMap<String, Map<String, Object>>();
+
+        for (Map.Entry<String, Phase1LinkWeightIndex> entry : indexByEdgeId.entrySet()) {
+            out.put(entry.getKey(), entry.getValue().toSummaryMap(sampleLimit));
+        }
+
+        return out;
+    }
+
+    public Map<String, Object> toSummaryMap(int sampleLimit) {
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+
+        out.put("queryName", getQueryName());
+        out.put("rootAlias", getRootAlias());
+
+        out.put("rootToLeafOrder", new ArrayList<String>(getRootToLeafOrder()));
+        out.put("leafToRootOrder", new ArrayList<String>(getLeafToRootOrder()));
+
+        out.put(
+                "seenTuplesByAlias",
+                new LinkedHashMap<String, Long>(getSeenTuplesByAlias())
+        );
+
+        out.put("edgeSummaries", getEdgeSummaries(sampleLimit));
 
         return out;
     }
