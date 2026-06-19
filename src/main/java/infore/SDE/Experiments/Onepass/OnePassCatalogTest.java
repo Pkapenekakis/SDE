@@ -37,6 +37,7 @@ import java.util.Properties;
 
 public class OnePassCatalogTest {
 
+
     /*
      * ============================================================
      * Generic OnePass Phase 1 catalog test configuration
@@ -49,20 +50,33 @@ public class OnePassCatalogTest {
             "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
 
     /*
-     * Query name must exist inside tpch-onepass-catalog.json.
+     * This is the actual OnePass SQL request used by the test.
+     *
+     * The SELECT list is now parsed. SELECT * means: use the projection
+     * from the external catalog JSON. A concrete SELECT list overrides
+     * the catalog projection in OnePassParams.output.projection.
      *
      * Examples:
-     *   "wq3_alias"
-     *   "w_two_lineitems"
-     *   "wqx_alias"
+     *
+     * SELECT * FROM wq3_alias LIMIT 1000000
+     * SELECT c.c_custkey, o.o_orderkey, l.l_linenumber FROM wq3_alias LIMIT 1000000
+     * SELECT o.o_orderkey, l1.l_linenumber, l2.l_linenumber FROM w_two_lineitems LIMIT 1000000
+     *
+     * Can explicitly use the ROOT keyword to test the query with a different root, example:
+     * SELECT * FROM wq3_alias ROOT c LIMIT 1000000
      */
-    private static final String TEST_QUERY_NAME = "wq3_alias";
+    private static final String TEST_ONEPASS_SQL =
+            "SELECT * " +
+                    "FROM wqx_alias LIMIT 1000000 " +
+                    "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     /*
-     * Use "default" to use the catalog's defaultRoot.
-     * Or write the root alias manually, e.g. "c", "o", "nat".
+     * Fallback values used only if TEST_ONEPASS_SQL is blank.
      */
+    private static final String TEST_QUERY_NAME = "wq3_alias";
     private static final String TEST_ROOT_ALIAS = "default";
+    private static final String TEST_CATALOG_REF = "tpch-onepass-catalog.json";
+    private static final int TEST_SAMPLE_LIMIT = 1000000;
 
     /*
      * Use:
@@ -84,11 +98,7 @@ public class OnePassCatalogTest {
      * Use -1 for unlimited rows, for example:
      *   "all=-1"
      */
-    private static final String TEST_ROW_LIMITS = "all=50";
-
-    private static final String TEST_CATALOG_REF = "tpch-onepass-catalog.json";
-
-    private static final int TEST_SAMPLE_LIMIT = 1000000;
+    private static final String TEST_ROW_LIMITS = "all=5000";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -111,19 +121,14 @@ public class OnePassCatalogTest {
         expectedIndexesByEdge.clear();
         sentRowsByAlias.clear();
 
-        datasetKey = "onepass-catalog-" + TEST_QUERY_NAME + "-" + UID;
+        String sql = resolveTestSql();
+        OnePassSqlRequest sqlRequest = OnePassSqlParser.parse(sql);
+        String effectiveQueryName = sqlRequest.getQueryName();
 
-        String sql = buildSql(
-                TEST_QUERY_NAME,
-                TEST_ROOT_ALIAS,
-                TEST_SAMPLE_LIMIT,
-                TEST_CATALOG_REF
-        );
+        datasetKey = "onepass-catalog-" + effectiveQueryName + "-" + UID;
 
         OnePassParams params = OnePassSqlCompiler.compile(sql);
         CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
-
-        OnePassSqlRequest sqlRequest = OnePassSqlParser.parse(sql);
         OnePassCatalog catalog = OnePassQueryCatalogLoader.load(sqlRequest.getCatalogRef());
 
         initializeExpectedIndexes(plan);
@@ -136,12 +141,13 @@ public class OnePassCatalogTest {
         System.out.println("Using UID: " + UID);
         System.out.println("Using dataSetkey: " + datasetKey);
         System.out.println("TPC-H directory: " + TEST_TPCH_DIR);
-        System.out.println("Query name: " + TEST_QUERY_NAME);
+        System.out.println("Query name: " + effectiveQueryName);
         System.out.println("Root alias: " + plan.getRootAlias());
         System.out.println("Mode: " + TEST_MODE);
         System.out.println("Row limits: " + TEST_ROW_LIMITS);
-        System.out.println("Catalog ref: " + TEST_CATALOG_REF);
-        System.out.println("Sample limit: " + TEST_SAMPLE_LIMIT);
+        System.out.println("Catalog ref: " + sqlRequest.getCatalogRef());
+        System.out.println("Sample limit: " + params.getOutput().getSampleSize());
+        System.out.println("Projection: " + params.getOutput().getProjection());
         System.out.println("Compiled plan: " + plan);
         System.out.println("Leaf-to-root replay order: " + plan.getLeafToRootOrder());
         System.out.println("SQL:");
@@ -203,7 +209,7 @@ public class OnePassCatalogTest {
 
         System.out.println();
         System.out.println("4. Waiting for Phase 1 result...");
-        waitForAndValidateResult(consumer, TEST_MODE, TEST_QUERY_NAME);
+        waitForAndValidateResult(consumer, TEST_MODE, effectiveQueryName);
 
         producer.close();
         consumer.close();
@@ -237,6 +243,69 @@ public class OnePassCatalogTest {
         sql.append("', seed='test123', scalefactor=1 */");
 
         return sql.toString();
+    }
+
+    private static String resolveTestSql() {
+        if (!isBlank(TEST_ONEPASS_SQL)) {
+            return TEST_ONEPASS_SQL.trim();
+        }
+
+        return buildSql(
+                TEST_QUERY_NAME,
+                TEST_ROOT_ALIAS,
+                TEST_SAMPLE_LIMIT,
+                TEST_CATALOG_REF
+        );
+    }
+
+
+    private static long rowsForAlias(String alias) {
+        if (TEST_ROW_LIMITS == null || TEST_ROW_LIMITS.trim().isEmpty()) {
+            return 50L;
+        }
+
+        String spec = TEST_ROW_LIMITS.trim();
+
+        if (spec.matches("-?\\d+")) {
+            return Long.parseLong(spec);
+        }
+
+        long defaultRows = 50L;
+        Long specificRows = null;
+
+        String[] pieces = spec.split(",");
+
+        for (String piece : pieces) {
+            if (piece == null || piece.trim().isEmpty()) {
+                continue;
+            }
+
+            String[] kv = piece.split("=", 2);
+
+            if (kv.length != 2) {
+                throw new IllegalArgumentException(
+                        "Invalid TEST_ROW_LIMITS entry: " + piece +
+                                ". Use examples like all=50 or l=50,o=100"
+                );
+            }
+
+            String key = kv[0].trim();
+            long value = Long.parseLong(kv[1].trim());
+
+            if ("all".equalsIgnoreCase(key)
+                    || "default".equalsIgnoreCase(key)
+                    || "*".equals(key)) {
+                defaultRows = value;
+            } else if (key.equals(alias)) {
+                specificRows = value;
+            }
+        }
+
+        if (specificRows != null) {
+            return specificRows.longValue();
+        }
+
+        return defaultRows;
     }
 
     private static KafkaProducer<String, String> createProducer() {
@@ -395,8 +464,6 @@ public class OnePassCatalogTest {
         System.out.println(
                 "Replaying alias '" + alias + "' from table '" + tableName + "' file "
                         + tableFile.getAbsolutePath()
-                        + " with maxRows="
-                        + maxRows
         );
 
         long sent = 0L;
@@ -589,62 +656,6 @@ public class OnePassCatalogTest {
         }
 
         map.put(key, current + delta);
-    }
-
-    private static long rowsForAlias(String alias) {
-        if (TEST_ROW_LIMITS == null || TEST_ROW_LIMITS.trim().isEmpty()) {
-            return 50L;
-        }
-
-        String spec = TEST_ROW_LIMITS.trim();
-
-        /*
-         * Simple form:
-         *
-         * "50"
-         *
-         * means every alias gets 50 rows.
-         */
-        if (spec.matches("-?\\d+")) {
-            return Long.parseLong(spec);
-        }
-
-        long defaultRows = 50L;
-        Long specificRows = null;
-
-        String[] parts = spec.split(",");
-
-        for (String part : parts) {
-            if (part == null || part.trim().isEmpty()) {
-                continue;
-            }
-
-            String[] kv = part.split("=", 2);
-
-            if (kv.length != 2) {
-                throw new IllegalArgumentException(
-                        "Invalid TEST_ROW_LIMITS entry: " + part +
-                                ". Use examples like all=50 or l=50,o=100"
-                );
-            }
-
-            String key = kv[0].trim();
-            long value = Long.parseLong(kv[1].trim());
-
-            if ("all".equalsIgnoreCase(key)
-                    || "default".equalsIgnoreCase(key)
-                    || "*".equals(key)) {
-                defaultRows = value;
-            } else if (key.equals(alias)) {
-                specificRows = value;
-            }
-        }
-
-        if (specificRows != null) {
-            return specificRows.longValue();
-        }
-
-        return defaultRows;
     }
 
     private static void waitForAndValidateResult(KafkaConsumer<String, String> consumer,

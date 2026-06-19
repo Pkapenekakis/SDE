@@ -54,7 +54,7 @@ public final class OnePassSqlCompiler {
         params.setRelations(copyRelations(query.getRelations()));
         params.setJoins(copyJoins(query.getJoins()));
         params.setWeight(buildWeightSpec(query, request.getWeightOverride()));
-        params.setOutput(buildOutputSpec(query, request.getSampleSize()));
+        params.setOutput(buildOutputSpec(query, request, catalog));
 
         return params;
     }
@@ -75,13 +75,8 @@ public final class OnePassSqlCompiler {
         }
 
         /*
-         * First implementation:
-         *
-         * - A plain WEIGHTED BY expression becomes a global fallback expression.
-         * - Alias-specific defaults are still preferred when present.
-         *
-         * In the next iteration we can add a stricter decomposer for:
-         *   WEIGHTED BY orders:o_totalprice, lineitem:l_extendedprice
+         * A plain WEIGHTED BY expression becomes a global fallback expression.
+         * Alias-specific decomposed weights are intentionally not inferred here.
          */
         weight.setExpression(weightOverride.trim());
         weight.setWeightsByAlias(new LinkedHashMap<String, String>());
@@ -91,13 +86,135 @@ public final class OnePassSqlCompiler {
     }
 
     private static OutputSpec buildOutputSpec(OnePassCatalog.CatalogQuery query,
-                                              int sampleSize) {
+                                              OnePassSqlRequest request,
+                                              OnePassCatalog catalog) {
         OutputSpec output = new OutputSpec();
 
-        output.setSampleSize(sampleSize);
-        output.setProjection(copyStringList(query.getProjection()));
+        output.setSampleSize(request.getSampleSize());
+
+        List<String> projection = resolveProjection(query, request);
+
+        validateProjection(projection, query, catalog);
+
+        output.setProjection(projection);
 
         return output;
+    }
+
+    private static List<String> resolveProjection(OnePassCatalog.CatalogQuery query,
+                                                  OnePassSqlRequest request) {
+        List<String> sqlProjection = request.getProjection();
+
+        /*
+         * If SQL uses SELECT *, use the catalog projection.
+         */
+        if (isStarProjection(sqlProjection)) {
+            return copyStringList(query.getProjection());
+        }
+
+        /*
+         * Otherwise, use the explicit SQL projection.
+         */
+        return copyStringList(sqlProjection);
+    }
+
+    private static boolean isStarProjection(List<String> projection) {
+        if (projection == null || projection.isEmpty()) {
+            return true;
+        }
+
+        return projection.size() == 1 && "*".equals(projection.get(0).trim());
+    }
+
+    private static void validateProjection(List<String> projection,
+                                           OnePassCatalog.CatalogQuery query,
+                                           OnePassCatalog catalog) {
+        if (projection == null || projection.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Projection is empty. Use SELECT * or at least one alias.field expression."
+            );
+        }
+
+        Map<String, String> tableByAlias = buildTableByAlias(query);
+
+        for (String item : projection) {
+            validateProjectionItem(item, tableByAlias, catalog);
+        }
+    }
+
+    private static Map<String, String> buildTableByAlias(OnePassCatalog.CatalogQuery query) {
+        Map<String, String> tableByAlias = new LinkedHashMap<String, String>();
+
+        if (query.getRelations() == null) {
+            return tableByAlias;
+        }
+
+        for (RelationSpec relation : query.getRelations()) {
+            if (relation == null) {
+                continue;
+            }
+
+            tableByAlias.put(relation.getAlias(), relation.getTable());
+        }
+
+        return tableByAlias;
+    }
+
+    private static void validateProjectionItem(String item,
+                                               Map<String, String> tableByAlias,
+                                               OnePassCatalog catalog) {
+        if (isBlank(item)) {
+            throw new IllegalArgumentException("Projection contains a blank item");
+        }
+
+        String trimmed = item.trim();
+
+        if ("*".equals(trimmed)) {
+            return;
+        }
+
+        int dot = trimmed.indexOf('.');
+
+        if (dot <= 0 || dot == trimmed.length() - 1 || trimmed.indexOf('.', dot + 1) >= 0) {
+            throw new IllegalArgumentException(
+                    "Invalid projection item '" + trimmed + "'. Expected format alias.field, for example c.c_custkey."
+            );
+        }
+
+        String alias = trimmed.substring(0, dot);
+        String field = trimmed.substring(dot + 1);
+
+        String tableName = tableByAlias.get(alias);
+
+        if (tableName == null) {
+            throw new IllegalArgumentException(
+                    "Projection item '" + trimmed + "' uses unknown alias '" + alias + "'. " +
+                            "Available aliases are: " + tableByAlias.keySet()
+            );
+        }
+
+        if (catalog.getDataset() == null || catalog.getDataset().getTables() == null) {
+            throw new IllegalArgumentException("Catalog dataset tables are missing");
+        }
+
+        OnePassCatalog.CatalogTable table = catalog.getDataset().getTables().get(tableName);
+
+        if (table == null) {
+            throw new IllegalArgumentException(
+                    "Alias '" + alias + "' refers to table '" + tableName +
+                            "', but that table is not defined in the catalog dataset."
+            );
+        }
+
+        List<String> columns = table.getColumns();
+
+        if (columns == null || !columns.contains(field)) {
+            throw new IllegalArgumentException(
+                    "Projection item '" + trimmed + "' uses unknown field '" + field +
+                            "' for alias '" + alias + "' / table '" + tableName + "'. " +
+                            "Available columns are: " + columns
+            );
+        }
     }
 
     private static List<RelationSpec> copyRelations(List<RelationSpec> source) {
