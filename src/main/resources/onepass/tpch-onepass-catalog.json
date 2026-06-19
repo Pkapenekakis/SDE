@@ -198,6 +198,72 @@
         "l1": "l_extendedprice",
         "l2": "l_extendedprice"
       }
+    },
+    "wqx_alias": {
+      "description": "Weighted TPC-H QX-style tree with aliases nat-sup-cus-ord-lin",
+      "defaultRoot": "nat",
+      "relations": [
+        {
+          "alias": "nat",
+          "table": "nation"
+        },
+        {
+          "alias": "sup",
+          "table": "supplier"
+        },
+        {
+          "alias": "cus",
+          "table": "customer"
+        },
+        {
+          "alias": "ord",
+          "table": "orders"
+        },
+        {
+          "alias": "lin",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "nat",
+          "leftField": "n_nationkey",
+          "rightAlias": "sup",
+          "rightField": "s_nationkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_nationkey",
+          "rightAlias": "cus",
+          "rightField": "c_nationkey"
+        },
+        {
+          "leftAlias": "cus",
+          "leftField": "c_custkey",
+          "rightAlias": "ord",
+          "rightField": "o_custkey"
+        },
+        {
+          "leftAlias": "ord",
+          "leftField": "o_orderkey",
+          "rightAlias": "lin",
+          "rightField": "l_orderkey"
+        }
+      ],
+      "projection": [
+        "nat.n_nationkey",
+        "sup.s_suppkey",
+        "cus.c_custkey",
+        "ord.o_orderkey",
+        "lin.l_linenumber"
+      ],
+      "defaultWeightsByAlias": {
+        "nat": "1",
+        "sup": "1",
+        "cus": "1",
+        "ord": "o_totalprice",
+        "lin": "l_extendedprice"
+      }
     }
   }
 }
