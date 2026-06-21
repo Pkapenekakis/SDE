@@ -1,4 +1,4 @@
-package Tests;
+package Tests.PhaseOne;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;

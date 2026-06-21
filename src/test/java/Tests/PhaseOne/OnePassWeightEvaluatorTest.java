@@ -1,4 +1,4 @@
-package Tests;
+package Tests.PhaseOne;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Onepass.WeightSpec;

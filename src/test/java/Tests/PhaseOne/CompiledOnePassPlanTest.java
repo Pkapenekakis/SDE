@@ -1,4 +1,4 @@
-package Tests;
+package Tests.PhaseOne;
 
 import infore.SDE.synopses.OnePassSampler.PhaseOne.TestOnePassFixtures;
 import infore.SDE.messages.Onepass.OnePassParams;

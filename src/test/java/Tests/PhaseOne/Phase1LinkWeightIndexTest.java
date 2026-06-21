@@ -1,4 +1,4 @@
-package Tests;
+package Tests.PhaseOne;
 
 import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
