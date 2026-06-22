@@ -1,4 +1,4 @@
-package infore.SDE.Experiments.Onepass;
+package infore.SDE.Experiments.Onepass.Deprecated;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.producer.KafkaProducer;
