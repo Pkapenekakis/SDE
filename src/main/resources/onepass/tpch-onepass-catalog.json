@@ -105,9 +105,9 @@
         }
       ],
       "projection": [
-        "customer",
-        "orders",
-        "lineitem"
+        "customer.c_custkey",
+        "orders.o_orderkey",
+        "lineitem.l_linenumber"
       ],
       "defaultWeightsByAlias": {
         "customer": "1",

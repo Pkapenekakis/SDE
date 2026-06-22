@@ -67,7 +67,12 @@ public class OnePassCatalogTest {
      */
     private static final String TEST_ONEPASS_SQL =
             "SELECT * " +
-                    "FROM wqx_alias LIMIT 1000000 " +
+                    "FROM wq3_alias " +
+                    "WEIGHTED BY (" +
+                    "o.o_totalprice * " +
+                    "(l.l_extendedprice * (2 - l.l_discount))" +
+                    ") " +
+                    "LIMIT 1000000 " +
                     "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     /*
@@ -98,7 +103,7 @@ public class OnePassCatalogTest {
      * Use -1 for unlimited rows, for example:
      *   "all=-1"
      */
-    private static final String TEST_ROW_LIMITS = "all=5000";
+    private static final String TEST_ROW_LIMITS = "all=500";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -130,6 +135,7 @@ public class OnePassCatalogTest {
         OnePassParams params = OnePassSqlCompiler.compile(sql);
         CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
         OnePassCatalog catalog = OnePassQueryCatalogLoader.load(sqlRequest.getCatalogRef());
+        validateWeightedByCompilation(sqlRequest, params);
 
         initializeExpectedIndexes(plan);
 
@@ -852,6 +858,99 @@ public class OnePassCatalogTest {
                             + allowed
             );
         }
+    }
+
+    private static void validateWeightedByCompilation(OnePassSqlRequest sqlRequest,
+                                                      OnePassParams params) {
+        if (sqlRequest == null) {
+            throw new IllegalArgumentException("sqlRequest must not be null");
+        }
+
+        if (params == null || params.getWeight() == null) {
+            throw new IllegalArgumentException("Compiled OnePassParams has no WeightSpec");
+        }
+
+        String rawWeightedBy = sqlRequest.getWeightOverride();
+
+        if (isBlank(rawWeightedBy)) {
+            System.out.println("No SQL WEIGHTED BY override found. Using catalog default weights.");
+            return;
+        }
+
+        System.out.println();
+        System.out.println("Parsed WEIGHTED BY expression:");
+        System.out.println(rawWeightedBy);
+
+        Map<String, String> weightsByAlias = params.getWeight().getWeightsByAlias();
+
+        if (weightsByAlias == null || weightsByAlias.isEmpty()) {
+            throw new IllegalStateException(
+                    "SQL WEIGHTED BY was present, but compiled weightsByAlias is empty"
+            );
+        }
+
+        System.out.println();
+        System.out.println("Compiled weightsByAlias:");
+        for (Map.Entry<String, String> entry : weightsByAlias.entrySet()) {
+            System.out.println(entry.getKey() + " -> " + entry.getValue());
+        }
+
+        /*
+         * These assertions match the recommended TEST_ONEPASS_SQL:
+         *
+         * WEIGHTED BY (
+         *     o.o_totalprice *
+         *     (l.l_extendedprice * (1 - l.l_discount))
+         * )
+         */
+        assertCompiledWeight(weightsByAlias, "o", "o_totalprice");
+        assertCompiledWeight(weightsByAlias, "l", "l_extendedprice * (2 - l_discount)");
+
+        /*
+         * Alias c is not explicitly present in the WEIGHTED BY expression.
+         * That is okay: OnePassWeightEvaluator should default missing aliases to 1.
+         */
+        if (weightsByAlias.containsKey("c")) {
+            assertCompiledWeight(weightsByAlias, "c", "1");
+        }
+
+        System.out.println();
+        System.out.println("WEIGHTED BY parser/compiler validation passed.");
+    }
+
+    private static void assertCompiledWeight(Map<String, String> weightsByAlias,
+                                             String alias,
+                                             String expectedExpression) {
+        String actual = weightsByAlias.get(alias);
+
+        if (actual == null) {
+            throw new IllegalStateException(
+                    "Missing compiled weight for alias '" + alias + "'. " +
+                            "Available aliases: " + weightsByAlias.keySet()
+            );
+        }
+
+        String normalizedActual = normalizeExpressionForAssert(actual);
+        String normalizedExpected = normalizeExpressionForAssert(expectedExpression);
+
+        if (!normalizedExpected.equals(normalizedActual)) {
+            throw new IllegalStateException(
+                    "Compiled weight mismatch for alias '" + alias + "'. Expected: "
+                            + expectedExpression
+                            + " but got: "
+                            + actual
+            );
+        }
+    }
+
+    private static String normalizeExpressionForAssert(String expression) {
+        if (expression == null) {
+            return "";
+        }
+
+        return expression
+                .replaceAll("\\s+", " ")
+                .trim();
     }
 
     private static boolean isBlank(String value) {

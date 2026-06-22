@@ -13,21 +13,30 @@ public final class OnePassSqlParser {
      * Supported OnePass SQL form:
      *
      * SELECT * FROM wq3_alias ROOT c LIMIT 1000000
-     * SELECT c.c_custkey, o.o_orderkey, l.l_linenumber FROM wq3_alias ROOT c LIMIT 1000000
-     * SELECT c.c_custkey, o.o_orderkey FROM wq3_alias ROOT c WEIGHTED BY o.o_totalprice LIMIT 1000000
      *
-     * The query name after FROM must exist in the external catalog JSON.
+     * SELECT c.c_custkey, o.o_orderkey, l.l_linenumber
+     * FROM wq3_alias ROOT c LIMIT 1000000
+     *
+     * SELECT *
+     * FROM wq3_alias ROOT c
+     * WEIGHTED BY (
+     *     c.c_acctbal * o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))
+     * )
+     * LIMIT 1000000
+     *
+     * WEIGHTED BY is extracted before the main SQL regex runs.
      */
     private static final Pattern MAIN_PATTERN = Pattern.compile(
             "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+" +
                     "(?:ROOT\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+)?" +
-                    "(?:WEIGHTED\\s+BY\\s+(.+?)\\s+)?" +
                     "LIMIT\\s+(\\d+)\\s*$"
     );
 
     private static final Pattern COMMENT_PATTERN = Pattern.compile("(?s)/\\*(.*?)\\*/");
+
     private static final Pattern OPTION_QUOTED_PATTERN =
             Pattern.compile("([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*'([^']*)'");
+
     private static final Pattern OPTION_RAW_PATTERN =
             Pattern.compile("([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^,\\s]+)");
 
@@ -39,11 +48,20 @@ public final class OnePassSqlParser {
             throw new IllegalArgumentException("onePassSql is blank");
         }
 
-        String comment = extractComment(sql);
+        String weightedByExpression =
+                OnePassWeightedByParser.extractWeightedByExpression(sql);
+
+        String sqlWithoutWeightedBy =
+                OnePassWeightedByParser.removeWeightedByClause(sql);
+
+        String comment = extractComment(sqlWithoutWeightedBy);
         Map<String, String> options = parseOptions(comment);
 
-        String sqlWithoutComment = COMMENT_PATTERN.matcher(sql).replaceAll(" ");
-        String normalized = sqlWithoutComment.replaceAll("\\s+", " ").trim();
+        String sqlWithoutComment =
+                COMMENT_PATTERN.matcher(sqlWithoutWeightedBy).replaceAll(" ");
+
+        String normalized =
+                sqlWithoutComment.replaceAll("\\s+", " ").trim();
 
         Matcher matcher = MAIN_PATTERN.matcher(normalized);
 
@@ -51,7 +69,7 @@ public final class OnePassSqlParser {
             throw new IllegalArgumentException(
                     "Invalid OnePass SQL. Expected pattern: " +
                             "SELECT <projection|*> FROM <queryName> [ROOT <rootAlias>] " +
-                            "[WEIGHTED BY <expression>] LIMIT <n> " +
+                            "[WEIGHTED BY <factorized alias.field expression>] LIMIT <n> " +
                             "/* catalog='...', seed='...', scalefactor=1 */. Got: " + sql
             );
         }
@@ -59,11 +77,9 @@ public final class OnePassSqlParser {
         String projectionText = trimToNull(matcher.group(1));
         String queryName = matcher.group(2);
         String rootAlias = trimToNull(matcher.group(3));
-        String weightOverride = trimToNull(matcher.group(4));
-        int sampleSize = Integer.parseInt(matcher.group(5));
-        List<String> projection = parseProjection(projectionText);
+        int sampleSize = Integer.parseInt(matcher.group(4));
 
-        List<String> projectionOverride = parseProjection(projectionText);
+        List<String> projection = parseProjection(projectionText);
 
         String catalogRef = firstNonBlank(
                 options.get("catalog"),
@@ -74,6 +90,7 @@ public final class OnePassSqlParser {
         String seed = firstNonBlank(options.get("seed"), "test123");
 
         int scaleFactor = 1;
+
         String scaleFactorValue = firstNonBlank(
                 options.get("scalefactor"),
                 options.get("scaleFactor"),
@@ -88,7 +105,7 @@ public final class OnePassSqlParser {
                 projection,
                 queryName,
                 rootAlias,
-                weightOverride,
+                weightedByExpression,
                 sampleSize,
                 catalogRef,
                 seed,

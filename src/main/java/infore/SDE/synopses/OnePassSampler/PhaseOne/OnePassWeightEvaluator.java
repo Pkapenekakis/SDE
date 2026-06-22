@@ -1,53 +1,83 @@
 package infore.SDE.synopses.OnePassSampler.PhaseOne;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import infore.SDE.messages.Onepass.WeightSpec;
 import infore.SDE.synopses.OnePassSampler.OnePassTuple;
+import infore.SDE.synopses.OnePassSampler.TupleWeightExpressionEvaluator;
 
-import javax.script.Bindings;
-import javax.script.ScriptEngine;
-import javax.script.ScriptEngineManager;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
- * Takes a OnePassTuple and returns the tuple's base weight according to the
- * weight section of OnePassParams.
+ * Evaluates the base weight of one OnePassTuple.
  *
- * Supported:
- * - null / blank expression => 1.0
- * - numeric literal => that numeric value
- * - direct field reference => tuple[field]
- * - arithmetic JavaScript expression over numeric tuple fields
- * - alias-specific weights through WeightSpec.weightsByAlias
+ * Important:
+ * The One-pass* algorithm requires the final joined-row weight to be
+ * factorizable into base tuple weights:
+ *
+ *     w(join result) =
+ *         w(tuple from alias A)
+ *       * w(tuple from alias B)
+ *       * ...
+ *
+ * Therefore, this evaluator receives one tuple at a time and evaluates only
+ * the weight expression that belongs to that tuple's alias.
+ *
+ * Example SQL:
+ *
+ *     WEIGHTED BY (
+ *         (l1.l_extendedprice * (1 - l1.l_discount))
+ *         * o1.o_totalprice
+ *         * (l2.l_extendedprice * (1 - l2.l_discount))
+ *         * o2.o_totalprice
+ *     )
+ *
+ * should be compiled into WeightSpec.weightsByAlias:
+ *
+ *     l1 -> l_extendedprice * (1 - l_discount)
+ *     o1 -> o_totalprice
+ *     l2 -> l_extendedprice * (1 - l_discount)
+ *     o2 -> o_totalprice
+ *
+ * Then this evaluator evaluates only the local expression for the incoming
+ * tuple alias.
  */
 public class OnePassWeightEvaluator implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    private final String expression;
+    private final String globalExpression;
     private final List<String> variables;
     private final Map<String, String> weightsByAlias;
 
     public OnePassWeightEvaluator(WeightSpec weightSpec) {
-        this.expression = weightSpec == null ? null : weightSpec.getExpression();
+        this.globalExpression =
+                weightSpec == null ? null : weightSpec.getExpression();
+
         this.variables = new ArrayList<String>();
         this.weightsByAlias = new LinkedHashMap<String, String>();
 
         if (weightSpec != null && weightSpec.getVariables() != null) {
-            for (Object v : weightSpec.getVariables()) {
-                variables.add(String.valueOf(v));
+            for (Object variable : weightSpec.getVariables()) {
+                if (variable != null) {
+                    variables.add(String.valueOf(variable));
+                }
             }
         }
 
         if (weightSpec != null && weightSpec.getWeightsByAlias() != null) {
-            for (Map.Entry<String, String> entry : weightSpec.getWeightsByAlias().entrySet()) {
+            for (Map.Entry<String, String> entry
+                    : weightSpec.getWeightsByAlias().entrySet()) {
+
                 if (entry.getKey() != null && entry.getValue() != null) {
-                    weightsByAlias.put(entry.getKey(), entry.getValue());
+                    String alias = entry.getKey().trim();
+                    String expression = entry.getValue().trim();
+
+                    if (!alias.isEmpty() && !expression.isEmpty()) {
+                        weightsByAlias.put(alias, expression);
+                    }
                 }
             }
         }
@@ -58,71 +88,41 @@ public class OnePassWeightEvaluator implements Serializable {
             throw new IllegalArgumentException("tuple must not be null");
         }
 
-        String expr = expressionForTuple(tuple);
+        String expression = expressionForTuple(tuple);
 
-        if (expr == null || expr.trim().isEmpty()) {
+        if (expression == null || expression.trim().isEmpty()) {
             return 1.0d;
         }
 
-        expr = normalizeExpressionForTuple(expr.trim(), tuple.getTable());
+        /*
+         * The WEIGHTED BY parser should already convert:
+         *
+         *     l1.l_extendedprice * (1 - l1.l_discount)
+         *
+         * into:
+         *
+         *     l_extendedprice * (1 - l_discount)
+         *
+         * for alias l1.
+         *
+         * However, keeping this normalization makes the evaluator robust if
+         * catalog defaults or tests still use alias-qualified expressions.
+         */
+        String localExpression =
+                normalizeExpressionForTuple(
+                        expression.trim(),
+                        tuple.getTable()
+                );
 
-        Double literal = tryParseDouble(expr);
-        if (literal != null) {
-            return literal;
-        }
+        double value =
+                TupleWeightExpressionEvaluator.evaluate(
+                        localExpression,
+                        tuple.getRawJson()
+                );
 
-        if (tuple.hasField(expr)) {
-            JsonNode direct = tuple.getField(expr);
-            if (direct == null || direct.isNull() || !direct.isNumber()) {
-                throw new IllegalArgumentException(
-                        "Weight expression refers to non-numeric field '" + expr + "'");
-            }
-            return direct.asDouble();
-        }
+        validateWeight(value, tuple, localExpression);
 
-        ScriptEngine engine = new ScriptEngineManager().getEngineByName("JavaScript");
-        if (engine == null) {
-            throw new IllegalStateException(
-                    "No JavaScript engine available to evaluate weight expression: " + expr);
-        }
-
-        try {
-            Bindings bindings = engine.createBindings();
-
-            for (Object rawEntryObj : tuple.getFields().entrySet()) {
-                Map.Entry rawEntry = (Map.Entry) rawEntryObj;
-                String fieldName = String.valueOf(rawEntry.getKey());
-                JsonNode valueNode = (JsonNode) rawEntry.getValue();
-
-                if (valueNode != null && valueNode.isNumber()) {
-                    bindings.put(fieldName, valueNode.asDouble());
-                }
-            }
-
-            for (String variable : variables) {
-                String normalizedVariable = normalizeExpressionForTuple(variable, tuple.getTable());
-
-                if (!bindings.containsKey(normalizedVariable) && tuple.hasField(normalizedVariable)) {
-                    JsonNode valueNode = tuple.getField(normalizedVariable);
-
-                    if (valueNode != null && valueNode.isNumber()) {
-                        bindings.put(normalizedVariable, valueNode.asDouble());
-                    }
-                }
-            }
-
-            Object result = engine.eval(expr, bindings);
-
-            if (!(result instanceof Number)) {
-                throw new IllegalArgumentException(
-                        "Weight expression did not evaluate to a number: " + expr);
-            }
-
-            return ((Number) result).doubleValue();
-        } catch (Exception e) {
-            throw new IllegalArgumentException(
-                    "Failed to evaluate weight expression '" + expr + "' on tuple " + tuple, e);
-        }
+        return value;
     }
 
     private String expressionForTuple(OnePassTuple tuple) {
@@ -132,31 +132,78 @@ public class OnePassWeightEvaluator implements Serializable {
             return weightsByAlias.get(alias);
         }
 
-        return expression;
+        /*
+         * Backward compatibility:
+         * If no alias-specific expression exists, use the old global expression.
+         *
+         * In the new WEIGHTED BY design, this should usually be empty/null,
+         * because weights should come from weightsByAlias.
+         */
+        if (globalExpression != null && !globalExpression.trim().isEmpty()) {
+            return globalExpression;
+        }
+
+        return "1";
     }
 
-    private String normalizeExpressionForTuple(String expr, String alias) {
-        if (expr == null || alias == null || alias.trim().isEmpty()) {
-            return expr;
+    private static void validateWeight(
+            double value,
+            OnePassTuple tuple,
+            String expression) {
+
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            throw new IllegalArgumentException(
+                    "Weight expression produced invalid value for alias '"
+                            + tuple.getTable()
+                            + "': expression="
+                            + expression
+                            + ", value="
+                            + value
+            );
+        }
+
+        if (value < 0.0d) {
+            throw new IllegalArgumentException(
+                    "Weight expression produced negative value for alias '"
+                            + tuple.getTable()
+                            + "': expression="
+                            + expression
+                            + ", value="
+                            + value
+            );
+        }
+    }
+
+    private String normalizeExpressionForTuple(String expression, String alias) {
+        if (expression == null || alias == null || alias.trim().isEmpty()) {
+            return expression;
         }
 
         /*
-         * Allows both:
-         *   l_extendedprice
-         * and:
-         *   lineitem.l_extendedprice
+         * Remove only the current tuple alias prefix.
          *
-         * For the current tuple alias, remove "alias." so JavaScript can bind the
-         * local field name.
+         * Example:
+         *   alias = l1
+         *   l1.l_extendedprice * (1 - l1.l_discount)
+         *
+         * becomes:
+         *   l_extendedprice * (1 - l_discount)
          */
-        return expr.replaceAll("\\b" + Pattern.quote(alias) + "\\.", "");
+        return expression.replaceAll(
+                "\\b" + java.util.regex.Pattern.quote(alias) + "\\.",
+                ""
+        );
     }
 
-    private Double tryParseDouble(String s) {
-        try {
-            return Double.parseDouble(s);
-        } catch (Exception ignore) {
-            return null;
-        }
+    public Map<String, String> getWeightsByAliasForDebug() {
+        return new LinkedHashMap<String, String>(weightsByAlias);
+    }
+
+    public String getGlobalExpressionForDebug() {
+        return globalExpression;
+    }
+
+    public List<String> getVariablesForDebug() {
+        return new ArrayList<String>(variables);
     }
 }

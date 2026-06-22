@@ -9,10 +9,17 @@ import infore.SDE.messages.Onepass.WeightSpec;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class OnePassSqlCompiler {
+
+    private static final Pattern IDENTIFIER =
+            Pattern.compile("\\b[A-Za-z_][A-Za-z0-9_]*\\b");
 
     private OnePassSqlCompiler() {
     }
@@ -53,34 +60,73 @@ public final class OnePassSqlCompiler {
 
         params.setRelations(copyRelations(query.getRelations()));
         params.setJoins(copyJoins(query.getJoins()));
-        params.setWeight(buildWeightSpec(query, request.getWeightOverride()));
+
+        params.setWeight(
+                buildWeightSpec(
+                        query,
+                        request.getWeightOverride(),
+                        catalog
+                )
+        );
+
         params.setOutput(buildOutputSpec(query, request, catalog));
 
         return params;
     }
 
     private static WeightSpec buildWeightSpec(OnePassCatalog.CatalogQuery query,
-                                              String weightOverride) {
+                                              String weightOverride,
+                                              OnePassCatalog catalog) {
         WeightSpec weight = new WeightSpec();
 
         /*
-         * If no WEIGHTED BY override is supplied, use the catalog-defined
-         * alias-specific weights.
+         * Default fallback should be 1.
+         *
+         * In the new design, alias-specific weights are the real source of
+         * tuple weights. The global expression is only a backward-compatible
+         * fallback.
          */
-        if (isBlank(weightOverride)) {
-            weight.setExpression("1");
-            weight.setWeightsByAlias(copyStringMap(query.getDefaultWeightsByAlias()));
-            weight.setVariables(new ArrayList<String>());
-            return weight;
-        }
+        weight.setExpression("1");
+        weight.setVariables(new ArrayList<String>());
 
         /*
-         * A plain WEIGHTED BY expression becomes a global fallback expression.
-         * Alias-specific decomposed weights are intentionally not inferred here.
+         * Start from catalog defaults.
          */
-        weight.setExpression(weightOverride.trim());
-        weight.setWeightsByAlias(new LinkedHashMap<String, String>());
-        weight.setVariables(extractSimpleVariables(weightOverride));
+        Map<String, String> weightsByAlias =
+                copyStringMap(query.getDefaultWeightsByAlias());
+
+        /*
+         * SQL WEIGHTED BY overrides catalog defaults.
+         *
+         * Example:
+         *
+         * WEIGHTED BY (
+         *     c.c_acctbal
+         *     * o.o_totalprice
+         *     * (l.l_extendedprice * (1 - l.l_discount))
+         * )
+         *
+         * becomes:
+         *
+         * c -> c_acctbal
+         * o -> o_totalprice
+         * l -> l_extendedprice * (1 - l_discount)
+         */
+        if (!isBlank(weightOverride)) {
+            Set<String> validAliases = buildAliasSet(query);
+
+            weightsByAlias =
+                    OnePassWeightedByParser.parseWeightsByAlias(
+                            weightOverride,
+                            validAliases
+                    );
+
+            validateWeightExpressions(weightsByAlias, query, catalog);
+        } else {
+            validateWeightExpressions(weightsByAlias, query, catalog);
+        }
+
+        weight.setWeightsByAlias(weightsByAlias);
 
         return weight;
     }
@@ -160,6 +206,10 @@ public final class OnePassSqlCompiler {
         return tableByAlias;
     }
 
+    private static Set<String> buildAliasSet(OnePassCatalog.CatalogQuery query) {
+        return new LinkedHashSet<String>(buildTableByAlias(query).keySet());
+    }
+
     private static void validateProjectionItem(String item,
                                                Map<String, String> tableByAlias,
                                                OnePassCatalog catalog) {
@@ -193,11 +243,83 @@ public final class OnePassSqlCompiler {
             );
         }
 
+        validateFieldExists(alias, field, tableName, catalog, "Projection item '" + trimmed + "'");
+    }
+
+    private static void validateWeightExpressions(Map<String, String> weightsByAlias,
+                                                  OnePassCatalog.CatalogQuery query,
+                                                  OnePassCatalog catalog) {
+        if (weightsByAlias == null || weightsByAlias.isEmpty()) {
+            return;
+        }
+
+        Map<String, String> tableByAlias = buildTableByAlias(query);
+
+        for (Map.Entry<String, String> entry : weightsByAlias.entrySet()) {
+            String alias = entry.getKey();
+            String expression = entry.getValue();
+
+            if (isBlank(alias)) {
+                throw new IllegalArgumentException(
+                        "Weight expression contains a blank alias"
+                );
+            }
+
+            if (isBlank(expression)) {
+                throw new IllegalArgumentException(
+                        "Weight expression for alias '" + alias + "' is blank"
+                );
+            }
+
+            String tableName = tableByAlias.get(alias);
+
+            if (tableName == null) {
+                throw new IllegalArgumentException(
+                        "Weight expression uses unknown alias '" + alias + "'. " +
+                                "Available aliases are: " + tableByAlias.keySet()
+                );
+            }
+
+            validateLocalWeightExpressionFields(alias, tableName, expression, catalog);
+        }
+    }
+
+    private static void validateLocalWeightExpressionFields(String alias,
+                                                            String tableName,
+                                                            String expression,
+                                                            OnePassCatalog catalog) {
+        Matcher matcher = IDENTIFIER.matcher(expression);
+
+        while (matcher.find()) {
+            String token = matcher.group();
+
+            /*
+             * All identifiers inside alias-local expressions must be fields.
+             *
+             * Example:
+             *   l_extendedprice * (1 - l_discount)
+             */
+            validateFieldExists(
+                    alias,
+                    token,
+                    tableName,
+                    catalog,
+                    "Weight expression for alias '" + alias + "': " + expression
+            );
+        }
+    }
+
+    private static void validateFieldExists(String alias,
+                                            String field,
+                                            String tableName,
+                                            OnePassCatalog catalog,
+                                            String context) {
         if (catalog.getDataset() == null || catalog.getDataset().getTables() == null) {
             throw new IllegalArgumentException("Catalog dataset tables are missing");
         }
 
-        OnePassCatalog.CatalogTable table = catalog.getDataset().getTables().get(tableName);
+        OnePassCatalog.CatalogTable table =
+                catalog.getDataset().getTables().get(tableName);
 
         if (table == null) {
             throw new IllegalArgumentException(
@@ -210,7 +332,7 @@ public final class OnePassSqlCompiler {
 
         if (columns == null || !columns.contains(field)) {
             throw new IllegalArgumentException(
-                    "Projection item '" + trimmed + "' uses unknown field '" + field +
+                    context + " uses unknown field '" + field +
                             "' for alias '" + alias + "' / table '" + tableName + "'. " +
                             "Available columns are: " + columns
             );
@@ -271,48 +393,6 @@ public final class OnePassSqlCompiler {
         }
 
         return out;
-    }
-
-    private static List<String> extractSimpleVariables(String expression) {
-        List<String> out = new ArrayList<String>();
-
-        if (expression == null) {
-            return out;
-        }
-
-        String[] tokens = expression.split("[^A-Za-z0-9_\\.]+");
-
-        for (String token : tokens) {
-            if (isBlank(token)) {
-                continue;
-            }
-
-            if (isNumeric(token)) {
-                continue;
-            }
-
-            String normalized = token;
-
-            int dot = normalized.indexOf('.');
-            if (dot >= 0 && dot + 1 < normalized.length()) {
-                normalized = normalized.substring(dot + 1);
-            }
-
-            if (!out.contains(normalized)) {
-                out.add(normalized);
-            }
-        }
-
-        return out;
-    }
-
-    private static boolean isNumeric(String value) {
-        try {
-            Double.parseDouble(value);
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
     }
 
     private static String firstNonBlank(String first, String second) {
