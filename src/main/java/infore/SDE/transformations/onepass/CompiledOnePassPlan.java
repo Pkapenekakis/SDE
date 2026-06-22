@@ -39,8 +39,20 @@ public final class CompiledOnePassPlan implements Serializable {
     private final int datasetScaleFactor;
     private final String datasetSeed;
 
+    /*
+     * Full compiled weight specification.
+     *
+     * This is required by Phase 2 because rootOwnWeight must be evaluated from
+     * the same alias-local weight rules used by Phase 1.
+     */
+    private final WeightSpec weightSpec;
+
+    /*
+     * Kept as convenience/backwards-compatible accessors.
+     */
     private final String weightExpression;
     private final List<String> weightVariables;
+    private final Map<String, String> weightsByAlias;
 
     private final int sampleSize;
     private final List<String> projection;
@@ -63,8 +75,7 @@ public final class CompiledOnePassPlan implements Serializable {
             String datasetDbConfig,
             int datasetScaleFactor,
             String datasetSeed,
-            String weightExpression,
-            List<String> weightVariables,
+            WeightSpec weightSpec,
             int sampleSize,
             List<String> projection,
             Map<String, RelationNode> relationsByAlias,
@@ -84,8 +95,14 @@ public final class CompiledOnePassPlan implements Serializable {
         this.datasetScaleFactor = datasetScaleFactor;
         this.datasetSeed = datasetSeed;
 
-        this.weightExpression = weightExpression;
-        this.weightVariables = Collections.unmodifiableList(new ArrayList<String>(weightVariables));
+        this.weightSpec = copyWeightSpec(weightSpec);
+        this.weightExpression = this.weightSpec.getExpression();
+        this.weightVariables = Collections.unmodifiableList(
+                toStringList(this.weightSpec.getVariables())
+        );
+        this.weightsByAlias = Collections.unmodifiableMap(
+                copyStringMap(this.weightSpec.getWeightsByAlias())
+        );
 
         this.sampleSize = sampleSize;
         this.projection = Collections.unmodifiableList(new ArrayList<String>(projection));
@@ -223,8 +240,7 @@ public final class CompiledOnePassPlan implements Serializable {
                 dataset != null ? dataset.getDbConfig() : null,
                 dataset != null ? dataset.getScaleFactor() : 1,
                 dataset != null ? dataset.getSeed() : null,
-                weight != null ? weight.getExpression() : null,
-                toStringList(weight != null ? weight.getVariables() : null),
+                weight,
                 output != null ? output.getSampleSize() : 10,
                 toStringList(output != null ? output.getProjection() : null),
                 relationsByAlias,
@@ -237,7 +253,6 @@ public final class CompiledOnePassPlan implements Serializable {
                 leafAliases
         );
     }
-
 
     private static Map<String, RelationNode> compileRelations(OnePassParams params) {
         Map<String, RelationNode> relationsByAlias = new LinkedHashMap<String, RelationNode>();
@@ -336,6 +351,54 @@ public final class CompiledOnePassPlan implements Serializable {
         return out;
     }
 
+    private static Map<String, String> copyStringMap(Map raw) {
+        Map<String, String> out = new LinkedHashMap<String, String>();
+
+        if (raw == null) {
+            return out;
+        }
+
+        for (Object rawEntry : raw.entrySet()) {
+            Map.Entry entry = (Map.Entry) rawEntry;
+
+            if (entry.getKey() == null || entry.getValue() == null) {
+                continue;
+            }
+
+            String key = String.valueOf(entry.getKey()).trim();
+            String value = String.valueOf(entry.getValue()).trim();
+
+            if (!key.isEmpty() && !value.isEmpty()) {
+                out.put(key, value);
+            }
+        }
+
+        return out;
+    }
+
+    private static WeightSpec copyWeightSpec(WeightSpec source) {
+        WeightSpec copy = new WeightSpec();
+
+        if (source == null) {
+            copy.setExpression("1");
+            copy.setVariables(new ArrayList<String>());
+            copy.setWeightsByAlias(new LinkedHashMap<String, String>());
+            return copy;
+        }
+
+        String expression = source.getExpression();
+
+        if (expression == null || expression.trim().isEmpty()) {
+            expression = "1";
+        }
+
+        copy.setExpression(expression);
+        copy.setVariables(toStringList(source.getVariables()));
+        copy.setWeightsByAlias(copyStringMap(source.getWeightsByAlias()));
+
+        return copy;
+    }
+
     private static String requireNonBlank(String value, String fieldName) {
         if (value == null || value.trim().isEmpty()) {
             throw new IllegalArgumentException(fieldName + " must not be blank");
@@ -373,12 +436,26 @@ public final class CompiledOnePassPlan implements Serializable {
         return datasetSeed;
     }
 
+    /**
+     * Returns a defensive copy of the full compiled WeightSpec.
+     *
+     * Phase 1 and Phase 2 should use this instead of only getWeightExpression(),
+     * because WEIGHTED BY is now represented through weightsByAlias.
+     */
+    public WeightSpec getWeightSpec() {
+        return copyWeightSpec(weightSpec);
+    }
+
     public String getWeightExpression() {
         return weightExpression;
     }
 
     public List<String> getWeightVariables() {
         return weightVariables;
+    }
+
+    public Map<String, String> getWeightsByAlias() {
+        return weightsByAlias;
     }
 
     public int getSampleSize() {
@@ -488,6 +565,7 @@ public final class CompiledOnePassPlan implements Serializable {
                 ", aliases=" + relationsByAlias.keySet() +
                 ", rootToLeafOrder=" + rootToLeafOrder +
                 ", leafToRootOrder=" + leafToRootOrder +
+                ", weightsByAlias=" + weightsByAlias +
                 '}';
     }
 
