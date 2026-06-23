@@ -69,7 +69,7 @@ public class OnePassPhaseOneTest {
                     "FROM wq3_alias " +
                     "WEIGHTED BY (" +
                     "o.o_totalprice * " +
-                    "(l.l_extendedprice * (2 - l.l_discount))" +
+                    "(l.l_extendedprice * (1 - l.l_discount))" + //Change Line 906 or the test validation fails
                     ") " +
                     "LIMIT 1000000 " +
                     "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
@@ -903,7 +903,7 @@ public class OnePassPhaseOneTest {
          * )
          */
         assertCompiledWeight(weightsByAlias, "o", "o_totalprice");
-        assertCompiledWeight(weightsByAlias, "l", "l_extendedprice * (2 - l_discount)");
+        assertCompiledWeight(weightsByAlias, "l", "l_extendedprice * (1 - l_discount)");
 
         /*
          * Alias c is not explicitly present in the WEIGHTED BY expression.

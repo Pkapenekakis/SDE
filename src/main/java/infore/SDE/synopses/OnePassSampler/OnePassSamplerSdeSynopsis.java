@@ -64,6 +64,11 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
     @Override
     public void add(Object payload) {
+        if (lifecycle.getPhase() == OnePassSamplerSynopsis.Phase.DONE) {
+            System.out.println("[OnePassSamplerSdeSynopsis] Ignoring tuple because lifecycle is DONE.");
+            return;
+        }
+
         lifecycle.add(payload);
     }
 

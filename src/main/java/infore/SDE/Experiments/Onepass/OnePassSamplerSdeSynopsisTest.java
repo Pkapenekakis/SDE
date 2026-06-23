@@ -64,7 +64,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
 
     private static final String TEST_ONEPASS_SQL =
-            "SELECT * FROM wq3_alias ROOT c WEIGHTED BY (o.o_totalprice * " +
+            "SELECT * FROM wq3_alias WEIGHTED BY (o.o_totalprice * " +
                     "(l.l_extendedprice * (1 - l.l_discount))) LIMIT 100 "+
                     "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
@@ -214,6 +214,10 @@ public final class OnePassSamplerSdeSynopsisTest {
                     + " rows: " + rootRows);
             System.out.println();
 
+            //Temporary barrier
+            System.out.println("Waiting for SDE to consume PHASE_2 tuples...");
+            Thread.sleep(10000L);
+
             System.out.println("6. Sending FINISH_PHASE_2 request...");
             ObjectNode finishPhaseTwoRequest =
                     buildControlRequest(
@@ -259,9 +263,7 @@ public final class OnePassSamplerSdeSynopsisTest {
         }
     }
 
-    private static ObjectNode buildAddRequest(int uid,
-                                              String datasetKey,
-                                              String streamId) {
+    private static ObjectNode buildAddRequest(int uid, String datasetKey, String streamId) {
         ObjectNode request = MAPPER.createObjectNode();
 
         request.put("dataSetkey", datasetKey);
@@ -279,7 +281,7 @@ public final class OnePassSamplerSdeSynopsisTest {
          * If your parser uses parameters.onePassSql, this also works.
          */
         ArrayNode param = MAPPER.createArrayNode();
-        param.add(TEST_ONEPASS_SQL);
+        param.add("ONEPASS_SQL");
         request.set("param", param);
 
         ObjectNode parameters = MAPPER.createObjectNode();
