@@ -7,7 +7,7 @@ import java.util.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import infore.SDE.messages.Onepass.OnePassParams;
-import infore.SDE.synopses.OnePassSampler.OnePassPhaseTwo;
+import infore.SDE.synopses.OnePassSampler.OnePassSamplerSdeSynopsis;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOne;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
@@ -38,6 +38,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				ski.add(node.getValues());
 			}
 		M_Synopses.put(node.getKey(),Synopses);
+		} else{
+			System.out.println("[SDEcoFlatMap DATA] No synopsis found for datapoint key=" + node.getKey() +
+					", known keys=" + M_Synopses.keySet());
 		}
 		ArrayList<ContinuousSynopsis>  C_Synopses =  MC_Synopses.get(node.getKey());
 		if (C_Synopses != null) {
@@ -59,7 +62,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 	@Override
 	public void flatMap2(Request rq, Collector<Estimation> collector) throws Exception {
-
+		System.out.println("[SDEcoFlatMap REQUEST] requestID=" + rq.getRequestID()
+						+ ", synopsisID=" + rq.getSynopsisID() + ", uid=" + rq.getUID()
+						+ ", key=" + rq.getKey() + ", known keys=" + M_Synopses.keySet());
 		System.out.println(rq.toString());
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(rq.getKey());
 		ArrayList<ContinuousSynopsis>  C_Synopses =  MC_Synopses.get(rq.getKey());
@@ -228,37 +233,27 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 					sketch = new PastDFTSynopsis(rq.getUID(), rq.getParam());
 				Synopses.add(sketch);
 				break;
-			// One-Pass Phase 2
+			//One-Pass
 			case 30:
-				System.out.println("ADD -> OnePassPhaseTwo " + rq.toString());
-				/* Testing OnePass PhaseTwo, before JSON schema
-				System.out.println("ADD -> OnePassPhaseTwo " + rq.toString());
-				if (rq.getParam().length > 5) {   // Expect 6 params
-					sketch = new OnePassPhaseTwo(rq.getUID(), rq.getParam());
-					Synopses.add(sketch);
-				} else {
-					System.err.println("OnePassPhaseTwo: expected >= 6 parameters");
-				} */
-				sketch = new OnePassPhaseTwo(rq.getUID(), rq.getParam());
-				OnePassParams p = OnePassRequestParser.parse(rq);
-				System.out.println("Parsed OnePass queryName = " + p.getQueryName());
-				System.out.println("Parsed OnePass mainTable = " + p.getMainTable());
-				System.out.println("Parsed relations size = " + p.getRelations().size());
+				System.out.println("ADD -> OnePassSamplerSdeSynopsis " + rq.toString());
+				sketch = new OnePassSamplerSdeSynopsis(rq.getUID(), rq);
 				Synopses.add(sketch);
+
+				System.out.println("OnePassSamplerSdeSynopsis added for uid=" + rq.getUID() + ", key="+ rq.getKey());
+
 				break;
-			//Onepass* phase 1
 			case 31:
 				System.out.println("ADD -> OnePassPhaseOne " + rq.toString());
 
-				OnePassParams phase1Params = OnePassRequestParser.parse(rq);
-				CompiledOnePassPlan phase1Plan = CompiledOnePassPlan.from(phase1Params);
+				OnePassParams params = OnePassRequestParser.parse(rq);
+				CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
 
-				sketch = new OnePassPhaseOne(rq.getUID(), phase1Plan, phase1Params.getWeight());
+				sketch = new OnePassPhaseOne(rq.getUID(), plan, params.getWeight());
 				Synopses.add(sketch);
 
-				System.out.println("Parsed OnePass Phase1 queryName = " + phase1Params.getQueryName());
-				System.out.println("Parsed OnePass Phase1 mainTable = " + phase1Params.getMainTable());
-				System.out.println("Parsed OnePass Phase1 relations size = " + phase1Params.getRelations().size());
+				System.out.println("OnePassPhaseOne added for uid=" + rq.getUID() + ", key=" + rq.getKey() +
+						", queryName=" + params.getQueryName());
+
 				break;
 		}
 			M_Synopses.put(rq.getKey(),Synopses);
@@ -304,6 +299,77 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 					break;
 
 			}
+		}
+		// OnePass* UPDATE handling for Phase Transitions
+		else if (rq.getRequestID() == 7) {
+			if (Synopses == null) {
+				System.out.println("create Synopses first before OnePass UPDATE");
+				return;
+			}
+
+			boolean handled =
+					false;
+
+			String command =
+					"UNKNOWN";
+
+			if (rq.getParam() != null && rq.getParam().length > 0) {
+				command =
+						rq.getParam()[0];
+			}
+
+			for (Synopsis syn : Synopses) {
+				if (rq.getUID() == syn.getSynopsisID()) {
+					if (syn instanceof OnePassSamplerSdeSynopsis) {
+						OnePassSamplerSdeSynopsis onePass =
+								(OnePassSamplerSdeSynopsis) syn;
+
+						/*
+						 * This mutates the internal OnePass lifecycle:
+						 *
+						 *   FINISH_PHASE_1 -> internal transition to PHASE_2
+						 *   FINISH_PHASE_2 -> internal finalization
+						 *
+						 * We do NOT depend on the Kafka estimation output to carry
+						 * the OnePass internal result. Kafka output is only used as
+						 * a lightweight ACK for the test/client.
+						 */
+						Estimation internalResult =
+								onePass.handleControlRequest(rq);
+
+						Object payload = internalResult.getEstimation();
+
+						System.out.println("[OnePass UPDATE] command = " + command);
+						System.out.println("[OnePass UPDATE] internal payload = " + payload);
+
+						/*
+						 * Return only a simple ACK through the existing SDE Estimation path.
+						 * The current SDE Kafka writer serializes the request envelope, so
+						 * the test should wait for FINISH_PHASE_1 / FINISH_PHASE_2 in param[].
+						 */
+						Estimation ack = new Estimation(rq, "ACK_" + command, Integer.toString(rq.getUID()));
+						collector.collect(ack);
+
+						System.out.println("[OnePass UPDATE] collected ACK for uid=" + rq.getUID() +
+								", command=" + command);
+
+						handled = true;
+						break;
+					} else {
+						System.out.println("RequestID 7 is only supported for OnePassSamplerSdeSynopsis. uid="
+								+ rq.getUID());
+
+						handled = true;
+						break;
+					}
+				}
+			}
+
+			if (!handled) {
+				System.out.println("No synopsis found for OnePass UPDATE uid=" + rq.getUID() + ", key=" + rq.getKey());
+			}
+
+			M_Synopses.put(rq.getKey(), Synopses);
 		}
 		// Estimate - delete
 		else {
