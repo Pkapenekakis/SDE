@@ -1,4 +1,4 @@
-package infore.SDE.Experiments.Onepass;
+package Tests;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
