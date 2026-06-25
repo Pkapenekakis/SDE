@@ -7,6 +7,7 @@ import infore.SDE.synopses.OnePassSampler.OnePassTuple;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneState;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassWeightEvaluator;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleInstance;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampler;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
@@ -45,7 +46,7 @@ public class OnePassRootSamplerTest {
                     "FROM wq3_alias ROOT c " +
                     "WEIGHTED BY (" +
                     "o.o_totalprice * " +
-                    "(l.l_extendedprice * (1 - l.l_discount))" +
+                    "(l.l_extendedprice * (2 - l.l_discount))" +
                     ") " +
                     "LIMIT 100 " +
                     "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
@@ -102,7 +103,13 @@ public class OnePassRootSamplerTest {
         OnePassPhaseOneResult phaseOneResult = phaseOneState.exportResult();
 
         System.out.println();
-        System.out.println("2. Testing Phase 2 rootGroupWeight computation...");
+        System.out.println("2. Testing Phase 2 guard cases...");
+
+        validateWrongAliasIsRejected(phaseOneResult, params, plan, catalog);
+        validateZeroContinuationRoot(phaseOneResult, params, plan, catalog);
+
+        System.out.println();
+        System.out.println("3. Testing Phase 2 rootGroupWeight computation...");
 
         OnePassRootSampler rootSampler =
                 new OnePassRootSampler(
@@ -130,7 +137,7 @@ public class OnePassRootSamplerTest {
         OnePassRootSampleResult result = rootSampler.finish();
 
         System.out.println();
-        System.out.println("3. Phase 2 result:");
+        System.out.println("4. Phase 2 result:");
         System.out.println(result);
         System.out.println("Sample instances:");
         for (int i = 0; i < result.getSampleInstances().size(); i++) {
@@ -155,25 +162,215 @@ public class OnePassRootSamplerTest {
                 result.getTotalRootGroupWeight()
         );
 
-        if (rootStats.positiveRootRows > 0
-                && result.getSampleInstances().isEmpty()) {
+        validateSampleInstances(
+                result,
+                params.getOutput().getSampleSize()
+        );
+
+        System.out.println();
+        System.out.println("SUCCESS: OnePassRootSampler Phase 2 test passed.");
+    }
+
+
+    private static void validateWrongAliasIsRejected(OnePassPhaseOneResult phaseOneResult,
+                                                     OnePassParams params,
+                                                     CompiledOnePassPlan plan,
+                                                     OnePassCatalog catalog) throws Exception {
+        OnePassRootSampler sampler =
+                new OnePassRootSampler(
+                        phaseOneResult,
+                        params.getOutput().getSampleSize(),
+                        params.getDataset().getSeed()
+                );
+
+        ObjectNode wrongAliasJson =
+                firstRootTupleJson(catalog, plan);
+
+        wrongAliasJson.put("alias", plan.getRootAlias() + "_wrong");
+
+        OnePassTuple wrongAliasTuple =
+                OnePassTupleExtractor.extract(wrongAliasJson);
+
+        boolean rejected = false;
+
+        try {
+            sampler.computeRootGroupWeight(wrongAliasTuple);
+        } catch (IllegalArgumentException expected) {
+            rejected = true;
+        }
+
+        if (!rejected) {
             throw new IllegalStateException(
-                    "Expected non-empty sampleInstances because positive roots exist"
+                    "Expected computeRootGroupWeight() to reject non-root alias"
             );
         }
 
-        if (rootStats.positiveRootRows >= params.getOutput().getSampleSize()
-                && result.getSampleInstances().size() != params.getOutput().getSampleSize()) {
+        rejected = false;
+
+        try {
+            sampler.addRootTuple(wrongAliasTuple);
+        } catch (IllegalArgumentException expected) {
+            rejected = true;
+        }
+
+        if (!rejected) {
             throw new IllegalStateException(
-                    "Expected full sample of size "
-                            + params.getOutput().getSampleSize()
-                            + " but got "
+                    "Expected addRootTuple() to reject non-root alias"
+            );
+        }
+
+        System.out.println("Wrong-alias rejection validation passed.");
+    }
+
+    private static void validateZeroContinuationRoot(OnePassPhaseOneResult phaseOneResult,
+                                                     OnePassParams params,
+                                                     CompiledOnePassPlan plan,
+                                                     OnePassCatalog catalog) throws Exception {
+        OnePassRootSampler sampler =
+                new OnePassRootSampler(
+                        phaseOneResult,
+                        params.getOutput().getSampleSize(),
+                        params.getDataset().getSeed()
+                );
+
+        ObjectNode noContinuationJson =
+                firstRootTupleJson(catalog, plan);
+
+        /*
+         * Preserve the complete root tuple, including possible root weight fields,
+         * but replace the parent-side join fields with values that should not
+         * exist in the Phase 1 indexes.
+         */
+        for (CompiledOnePassPlan.DirectedJoinEdge childEdge :
+                plan.getChildEdges(plan.getRootAlias())) {
+
+            for (String parentField : childEdge.getParentFields()) {
+                noContinuationJson.put(parentField, -999999999999L);
+            }
+        }
+
+        OnePassTuple noContinuationRoot =
+                OnePassTupleExtractor.extract(noContinuationJson);
+
+        double rootGroupWeight =
+                sampler.computeRootGroupWeight(noContinuationRoot);
+
+        assertClose(
+                "zero-continuation rootGroupWeight",
+                0.0d,
+                rootGroupWeight
+        );
+
+        sampler.addRootTuple(noContinuationRoot);
+
+        OnePassRootSampleResult result =
+                sampler.finish();
+
+        assertEquals(
+                "zero-continuation rootTuplesSeen",
+                1L,
+                result.getRootTuplesSeen()
+        );
+
+        assertEquals(
+                "zero-continuation positiveRootCandidatesSeen",
+                0L,
+                result.getPositiveRootCandidatesSeen()
+        );
+
+        assertClose(
+                "zero-continuation totalRootGroupWeight",
+                0.0d,
+                result.getTotalRootGroupWeight()
+        );
+
+        if (!result.getSampleInstances().isEmpty()) {
+            throw new IllegalStateException(
+                    "Expected zero-continuation root to produce no sample instances"
+            );
+        }
+
+        System.out.println("Zero-continuation root validation passed.");
+    }
+
+    private static void validateSampleInstances(OnePassRootSampleResult result,
+                                                int expectedSampleSize) {
+        if (result.getPositiveRootCandidatesSeen() > 0L
+                && result.getSampleInstances().size() != expectedSampleSize) {
+            throw new IllegalStateException(
+                    "Expected full with-replacement sample of size "
+                            + expectedSampleSize
+                            + " because positive roots exist, but got "
                             + result.getSampleInstances().size()
             );
         }
 
-        System.out.println();
-        System.out.println("SUCCESS: OnePassRootSampler Phase 2 test passed.");
+        long expectedSampleInstanceId = 0L;
+
+        for (OnePassRootSampleInstance instance : result.getSampleInstances()) {
+            if (instance.getSampleInstanceId() != expectedSampleInstanceId) {
+                throw new IllegalStateException(
+                        "Unexpected sampleInstanceId. Expected "
+                                + expectedSampleInstanceId
+                                + " but got "
+                                + instance.getSampleInstanceId()
+                );
+            }
+
+            if (!result.getRootAlias().equals(instance.getRootAlias())) {
+                throw new IllegalStateException(
+                        "Sample instance root alias mismatch. Expected "
+                                + result.getRootAlias()
+                                + " but got "
+                                + instance.getRootAlias()
+                );
+            }
+
+            if (instance.getSourceCandidateId() < 0L) {
+                throw new IllegalStateException(
+                        "Sample instance has negative sourceCandidateId: "
+                                + instance.getSourceCandidateId()
+                );
+            }
+
+            if (Double.isNaN(instance.getRootGroupWeight())
+                    || Double.isInfinite(instance.getRootGroupWeight())
+                    || instance.getRootGroupWeight() <= 0.0d) {
+                throw new IllegalStateException(
+                        "Sample instance has invalid rootGroupWeight: "
+                                + instance.getRootGroupWeight()
+                );
+            }
+
+            expectedSampleInstanceId++;
+        }
+
+        System.out.println("Sample instance validation passed.");
+    }
+
+    private static ObjectNode firstRootTupleJson(OnePassCatalog catalog,
+                                                 CompiledOnePassPlan plan) throws Exception {
+        String rootAlias = plan.getRootAlias();
+
+        File tableFile = tableFileForAlias(catalog, plan, rootAlias);
+        List<String> columns = columnsForAlias(catalog, plan, rootAlias);
+        String separator = separatorForAlias(catalog, plan, rootAlias);
+
+        BufferedReader br = new BufferedReader(new FileReader(tableFile));
+
+        try {
+            String line = br.readLine();
+
+            if (line == null) {
+                throw new IllegalStateException(
+                        "Root table file is empty: " + tableFile.getAbsolutePath()
+                );
+            }
+
+            return tupleJsonFromLine(rootAlias, columns, separator, line);
+        } finally {
+            br.close();
+        }
     }
 
     private static long replayAliasIntoPhaseOne(OnePassPhaseOneState phaseOneState,

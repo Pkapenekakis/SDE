@@ -5,7 +5,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Onepass.OnePassParams;
+import infore.SDE.synopses.OnePassSampler.OnePassTuple;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassWeightEvaluator;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnlineMultinomialSample;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnlineMultinomialSampler;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
+import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 import infore.SDE.transformations.onepass.sql.OnePassCatalog;
 import infore.SDE.transformations.onepass.sql.OnePassQueryCatalogLoader;
 import infore.SDE.transformations.onepass.sql.OnePassSqlCompiler;
@@ -19,8 +25,11 @@ import org.apache.kafka.clients.producer.RecordMetadata;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.io.FileWriter;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.Future;
@@ -75,23 +84,60 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final long TEST_ROW_LIMIT = 5000L;
 
     private static final int SYNOPSIS_ID = 30;
+    private static final int PHASE1_DEBUG_SYNOPSIS_ID = 31;
     private static final int REQUEST_ADD = 1;
     private static final int REQUEST_ESTIMATE = 3;
     private static final int REQUEST_UPDATE = 7;
 
+    /*
+     * Keep this enabled while validating Phase 1 inside the combined
+     * OnePassSamplerSdeSynopsis lifecycle.
+     *
+     * The combined synopsis intentionally does not send full Phase 1 indexes
+     * in its status payload because those internal objects are heavy and may
+     * trigger Flink/Kryo serialization issues.
+     *
+     * Therefore, this test also creates a temporary synopsisID=31 Phase 1
+     * debug synopsis under the same dataset key. The same Phase 1 side tuples
+     * are delivered to both synopses. We then request debug-full-indexes from
+     * the Phase 1 debug synopsis and write the JSON file expected by the
+     * external Python validator.
+     */
+    private static final boolean EXPORT_PHASE1_FULL_INDEXES = true;
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private static final Map<String, Map<String, Double>> expectedIndexesByEdge =
+            new LinkedHashMap<String, Map<String, Double>>();
+
+    private static final Map<String, Long> sentRowsByAlias =
+            new LinkedHashMap<String, Long>();
+
+    private static long expectedRootTuplesSeen = 0L;
+    private static long expectedPositiveRootCandidatesSeen = 0L;
+    private static double expectedTotalRootGroupWeight = 0.0d;
 
     private OnePassSamplerSdeSynopsisTest() {
     }
 
     public static void main(String[] args) throws Exception {
         int uid = Math.abs(UUID.randomUUID().toString().hashCode());
+        int phaseOneDebugUid = uid == Integer.MAX_VALUE ? uid - 1 : uid + 1;
+
+        expectedIndexesByEdge.clear();
+        sentRowsByAlias.clear();
+        expectedRootTuplesSeen = 0L;
+        expectedPositiveRootCandidatesSeen = 0L;
+        expectedTotalRootGroupWeight = 0.0d;
+
+        runOnlineMultinomialSamplerDuplicateSelfTest();
 
         String datasetKey = Integer.toString(uid);//"onepass-sampler-wq3_alias-" + uid;
         String streamId = "onepass-sampler";
 
         System.out.println("=== OnePassSamplerSdeSynopsisTest ===");
         System.out.println("UID: " + uid);
+        System.out.println("Phase 1 debug UID: " + phaseOneDebugUid);
         System.out.println("datasetKey: " + datasetKey);
         System.out.println("streamId: " + streamId);
         System.out.println("SQL:");
@@ -102,6 +148,10 @@ public final class OnePassSamplerSdeSynopsisTest {
         CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
         OnePassCatalog catalog =
                 OnePassQueryCatalogLoader.load(params.getDataset().getDbConfig());
+
+        initializeExpectedIndexes(plan);
+        OnePassWeightEvaluator expectedWeightEvaluator =
+                new OnePassWeightEvaluator(params.getWeight());
 
         System.out.println("Compiled plan:");
         System.out.println(plan);
@@ -127,6 +177,23 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(addRequest));
             System.out.println();
 
+            if (EXPORT_PHASE1_FULL_INDEXES) {
+                System.out.println("1b. Sending ADD request for temporary Phase 1 debug synopsis...");
+                ObjectNode phaseOneDebugAddRequest =
+                        buildPhaseOneDebugAddRequest(
+                                phaseOneDebugUid,
+                                datasetKey,
+                                streamId
+                        );
+
+                sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneDebugAddRequest);
+                System.out.println(
+                        MAPPER.writerWithDefaultPrettyPrinter()
+                                .writeValueAsString(phaseOneDebugAddRequest)
+                );
+                System.out.println();
+            }
+
             /*
              * Give SDE a short moment to create the synopsis before sending tuples.
              */
@@ -137,14 +204,16 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             for (String alias : plan.getLeafToRootOrder()) {
                 long count = streamAlias(
-                                producer,
-                                DATA_TOPIC,
-                                datasetKey,
-                                streamId,
-                                catalog,
-                                plan,
-                                alias,
-                                TEST_ROW_LIMIT);
+                        producer,
+                        DATA_TOPIC,
+                        datasetKey,
+                        streamId,
+                        catalog,
+                        plan,
+                        alias,
+                        TEST_ROW_LIMIT,
+                        "PHASE1",
+                        expectedWeightEvaluator);
 
                 phaseOneRows += count;
 
@@ -195,6 +264,74 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             validateControlAck(phaseOneAck, "FINISH_PHASE_1");
 
+            System.out.println("4a. Requesting OnePassSamplerSdeSynopsis STATUS after FINISH_PHASE_1...");
+            ObjectNode phaseOneStatusRequest =
+                    buildStatusRequest(
+                            uid,
+                            datasetKey,
+                            streamId
+                    );
+
+            sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneStatusRequest);
+            producer.flush();
+
+            System.out.println(
+                    MAPPER.writerWithDefaultPrettyPrinter()
+                            .writeValueAsString(phaseOneStatusRequest)
+            );
+            System.out.println();
+
+            JsonNode phaseOneStatusEnvelope =
+                    waitForResponseContaining(
+                            consumer,
+                            uid,
+                            "PHASE_2",
+                            120000L
+                    );
+
+            System.out.println("PHASE_1 STATUS envelope:");
+            System.out.println(
+                    MAPPER.writerWithDefaultPrettyPrinter()
+                            .writeValueAsString(phaseOneStatusEnvelope)
+            );
+            System.out.println();
+
+            JsonNode phaseOneStatusPayload =
+                    extractEstimationPayload(phaseOneStatusEnvelope);
+
+            validatePhaseOneTransition(phaseOneStatusPayload, plan);
+
+            if (EXPORT_PHASE1_FULL_INDEXES) {
+                System.out.println("4b. Requesting full Phase 1 indexes from temporary debug synopsis...");
+
+                ObjectNode phaseOneDebugEstimateRequest =
+                        buildPhaseOneDebugEstimateRequest(
+                                phaseOneDebugUid,
+                                datasetKey,
+                                streamId
+                        );
+
+                sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneDebugEstimateRequest);
+                producer.flush();
+
+                System.out.println(
+                        MAPPER.writerWithDefaultPrettyPrinter()
+                                .writeValueAsString(phaseOneDebugEstimateRequest)
+                );
+                System.out.println();
+
+                JsonNode phaseOneFullIndexes =
+                        waitForPhaseOneDebugResult(
+                                consumer,
+                                phaseOneDebugUid,
+                                plan.getQueryName(),
+                                120000L
+                        );
+
+                validateFullIndexPayload(phaseOneFullIndexes);
+                writePhaseOneFullIndexFile(phaseOneFullIndexes, plan.getQueryName());
+            }
+
             System.out.println("5. Streaming PHASE_2 root alias...");
             long rootRows =
                     streamAlias(
@@ -205,7 +342,9 @@ public final class OnePassSamplerSdeSynopsisTest {
                             catalog,
                             plan,
                             plan.getRootAlias(),
-                            TEST_ROW_LIMIT
+                            TEST_ROW_LIMIT,
+                            "PHASE2",
+                            expectedWeightEvaluator
                     );
 
             producer.flush();
@@ -248,6 +387,49 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             validateControlAck(phaseTwoAck, "FINISH_PHASE_2");
 
+            System.out.println("7a. Requesting OnePassSamplerSdeSynopsis STATUS after FINISH_PHASE_2...");
+            ObjectNode phaseTwoStatusRequest =
+                    buildStatusRequest(
+                            uid,
+                            datasetKey,
+                            streamId
+                    );
+
+            sendJson(producer, REQUEST_TOPIC, datasetKey, phaseTwoStatusRequest);
+            producer.flush();
+
+            System.out.println(
+                    MAPPER.writerWithDefaultPrettyPrinter()
+                            .writeValueAsString(phaseTwoStatusRequest)
+            );
+            System.out.println();
+
+            JsonNode phaseTwoStatusEnvelope =
+                    waitForResponseContaining(
+                            consumer,
+                            uid,
+                            "DONE",
+                            120000L
+                    );
+
+            System.out.println("PHASE_2 STATUS envelope:");
+            System.out.println(
+                    MAPPER.writerWithDefaultPrettyPrinter()
+                            .writeValueAsString(phaseTwoStatusEnvelope)
+            );
+            System.out.println();
+
+            JsonNode phaseTwoStatusPayload =
+                    extractEstimationPayload(phaseTwoStatusEnvelope);
+
+            validatePhaseTwoResult(
+                    phaseTwoStatusPayload,
+                    plan.getSampleSize(),
+                    expectedRootTuplesSeen,
+                    expectedPositiveRootCandidatesSeen,
+                    expectedTotalRootGroupWeight
+            );
+
             System.out.println();
             System.out.println("SUCCESS: OnePassSamplerSdeSynopsis SDE test passed.");
         } finally {
@@ -287,6 +469,50 @@ public final class OnePassSamplerSdeSynopsisTest {
         ObjectNode parameters = MAPPER.createObjectNode();
         parameters.put("onePassSql", TEST_ONEPASS_SQL);
         request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static ObjectNode buildPhaseOneDebugAddRequest(int uid,
+                                                           String datasetKey,
+                                                           String streamId) {
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_ADD);
+        request.put("synopsisID", PHASE1_DEBUG_SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", 1);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("catalog-replay");
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassSql", TEST_ONEPASS_SQL);
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static ObjectNode buildPhaseOneDebugEstimateRequest(int uid,
+                                                                String datasetKey,
+                                                                String streamId) {
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_ESTIMATE);
+        request.put("synopsisID", PHASE1_DEBUG_SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", 1);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("debug-full-indexes");
+        request.set("param", param);
 
         return request;
     }
@@ -349,7 +575,9 @@ public final class OnePassSamplerSdeSynopsisTest {
                                     OnePassCatalog catalog,
                                     CompiledOnePassPlan plan,
                                     String alias,
-                                    long maxRows) throws Exception {
+                                    long maxRows,
+                                    String expectedUpdateMode,
+                                    OnePassWeightEvaluator expectedWeightEvaluator) throws Exception {
         File file = tableFileForAlias(catalog, plan, alias);
         List<String> columns = columnsForAlias(catalog, plan, alias);
         String separator = separatorForAlias(catalog, plan, alias);
@@ -374,6 +602,13 @@ public final class OnePassSamplerSdeSynopsisTest {
 
                 sendJsonAsync(producer, topic, datasetKey, datapoint);
 
+                updateExpectedState(
+                        plan,
+                        expectedWeightEvaluator,
+                        tuple,
+                        expectedUpdateMode
+                );
+
                 count++;
 
                 if (count % 1000 == 0) {
@@ -384,6 +619,8 @@ public final class OnePassSamplerSdeSynopsisTest {
         } finally {
             br.close();
         }
+
+        sentRowsByAlias.put(alias, count);
 
         return count;
     }
@@ -561,9 +798,9 @@ public final class OnePassSamplerSdeSynopsisTest {
         }
     }
 
-    private static void validatePhaseOneTransition(JsonNode response) {
-        JsonNode phaseNode =
-                findFirst(response, "phase");
+    private static void validatePhaseOneTransition(JsonNode payload,
+                                                   CompiledOnePassPlan plan) {
+        JsonNode phaseNode = findFirst(payload, "phase");
 
         if (phaseNode == null) {
             throw new IllegalStateException(
@@ -580,8 +817,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        JsonNode completeNode =
-                findFirst(response, "phaseOneComplete");
+        JsonNode completeNode = findFirst(payload, "phaseOneComplete");
 
         if (completeNode == null || !completeNode.asBoolean()) {
             throw new IllegalStateException(
@@ -589,20 +825,54 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        JsonNode edgeIndexes =
-                findFirst(response, "edgeIndexes");
+        JsonNode edgeIndexCountNode = findFirst(payload, "edgeIndexCount");
 
-        if (edgeIndexes == null || edgeIndexes.isNull()) {
+        if (edgeIndexCountNode == null || edgeIndexCountNode.asInt() <= 0) {
             throw new IllegalStateException(
-                    "FINISH_PHASE_1 response does not contain edgeIndexes"
+                    "Expected edgeIndexCount > 0 after FINISH_PHASE_1, got: "
+                            + edgeIndexCountNode
             );
         }
+
+        int expectedEdgeIndexCount = plan.getLeafToRootOrder().size();
+        int actualEdgeIndexCount = edgeIndexCountNode.asInt();
+
+        if (actualEdgeIndexCount != expectedEdgeIndexCount) {
+            throw new IllegalStateException(
+                    "Expected edgeIndexCount="
+                            + expectedEdgeIndexCount
+                            + " but got "
+                            + actualEdgeIndexCount
+            );
+        }
+
+        JsonNode edgeIndexIds = findFirst(payload, "edgeIndexIds");
+
+        if (edgeIndexIds == null || !edgeIndexIds.isArray()) {
+            throw new IllegalStateException(
+                    "Expected edgeIndexIds array after FINISH_PHASE_1, got: "
+                            + edgeIndexIds
+            );
+        }
+
+        System.out.println("Validated FINISH_PHASE_1 transition payload.");
     }
 
-    private static void validatePhaseTwoResult(JsonNode response,
-                                               int expectedSampleSize) {
-        JsonNode phaseTwoComplete =
-                findFirst(response, "phaseTwoComplete");
+    private static void validatePhaseTwoResult(JsonNode payload,
+                                               int expectedSampleSize,
+                                               long expectedRootRows,
+                                               long expectedPositiveCandidates,
+                                               double expectedTotalWeight) {
+        JsonNode phaseNode = findFirst(payload, "phase");
+
+        if (phaseNode == null || !"DONE".equals(phaseNode.asText())) {
+            throw new IllegalStateException(
+                    "Expected phase DONE after FINISH_PHASE_2, got: "
+                            + phaseNode
+            );
+        }
+
+        JsonNode phaseTwoComplete = findFirst(payload, "phaseTwoComplete");
 
         if (phaseTwoComplete == null || !phaseTwoComplete.asBoolean()) {
             throw new IllegalStateException(
@@ -610,40 +880,51 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        JsonNode rootTuplesSeen =
-                findFirst(response, "rootTuplesSeen");
+        JsonNode rootTuplesSeen = findFirst(payload, "rootTuplesSeen");
 
-        if (rootTuplesSeen == null || rootTuplesSeen.asLong() <= 0L) {
+        if (rootTuplesSeen == null) {
+            throw new IllegalStateException("Missing rootTuplesSeen");
+        }
+
+        if (rootTuplesSeen.asLong() != expectedRootRows) {
             throw new IllegalStateException(
-                    "Expected rootTuplesSeen > 0, got: "
-                            + rootTuplesSeen
+                    "rootTuplesSeen mismatch. Expected "
+                            + expectedRootRows
+                            + " but got "
+                            + rootTuplesSeen.asLong()
             );
         }
 
         JsonNode positiveRootCandidatesSeen =
-                findFirst(response, "positiveRootCandidatesSeen");
+                findFirst(payload, "positiveRootCandidatesSeen");
 
-        if (positiveRootCandidatesSeen == null
-                || positiveRootCandidatesSeen.asLong() <= 0L) {
+        if (positiveRootCandidatesSeen == null) {
+            throw new IllegalStateException("Missing positiveRootCandidatesSeen");
+        }
+
+        if (positiveRootCandidatesSeen.asLong() != expectedPositiveCandidates) {
             throw new IllegalStateException(
-                    "Expected positiveRootCandidatesSeen > 0, got: "
-                            + positiveRootCandidatesSeen
+                    "positiveRootCandidatesSeen mismatch. Expected "
+                            + expectedPositiveCandidates
+                            + " but got "
+                            + positiveRootCandidatesSeen.asLong()
             );
         }
 
         JsonNode totalRootGroupWeight =
-                findFirst(response, "totalRootGroupWeight");
+                findFirst(payload, "totalRootGroupWeight");
 
-        if (totalRootGroupWeight == null
-                || totalRootGroupWeight.asDouble() <= 0.0d) {
-            throw new IllegalStateException(
-                    "Expected totalRootGroupWeight > 0, got: "
-                            + totalRootGroupWeight
-            );
+        if (totalRootGroupWeight == null) {
+            throw new IllegalStateException("Missing totalRootGroupWeight");
         }
 
-        JsonNode sampleInstances =
-                findFirst(response, "sampleInstances");
+        assertClose(
+                "totalRootGroupWeight",
+                expectedTotalWeight,
+                totalRootGroupWeight.asDouble()
+        );
+
+        JsonNode sampleInstances = findFirst(payload, "sampleInstances");
 
         if (sampleInstances == null || !sampleInstances.isArray()) {
             throw new IllegalStateException(
@@ -652,7 +933,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        if (positiveRootCandidatesSeen.asLong() >= expectedSampleSize
+        if (expectedPositiveCandidates > 0L
                 && sampleInstances.size() != expectedSampleSize) {
             throw new IllegalStateException(
                     "Expected sampleInstances.size() = "
@@ -661,6 +942,415 @@ public final class OnePassSamplerSdeSynopsisTest {
                             + sampleInstances.size()
             );
         }
+
+        if (expectedPositiveCandidates == 1L && sampleInstances.size() > 1) {
+            JsonNode firstSource = sampleInstances.get(0).get("sourceCandidateId");
+
+            for (JsonNode sampleInstance : sampleInstances) {
+                JsonNode source = sampleInstance.get("sourceCandidateId");
+
+                if (source == null || !source.equals(firstSource)) {
+                    throw new IllegalStateException(
+                            "Single-positive-candidate test failed. "
+                                    + "All duplicate sample instances should have the same sourceCandidateId."
+                    );
+                }
+            }
+        }
+
+        System.out.println("Validated FINISH_PHASE_2 payload.");
+    }
+
+    private static void updateExpectedState(CompiledOnePassPlan plan,
+                                            OnePassWeightEvaluator expectedWeightEvaluator,
+                                            ObjectNode tuple,
+                                            String expectedUpdateMode) {
+        if (expectedUpdateMode == null) {
+            return;
+        }
+
+        if ("PHASE1".equalsIgnoreCase(expectedUpdateMode)) {
+            updateExpectedIndexes(plan, expectedWeightEvaluator, tuple);
+            return;
+        }
+
+        if ("PHASE2".equalsIgnoreCase(expectedUpdateMode)) {
+            updateExpectedRootStats(plan, expectedWeightEvaluator, tuple);
+        }
+    }
+
+    private static void initializeExpectedIndexes(CompiledOnePassPlan plan) {
+        for (String alias : plan.getLeafToRootOrder()) {
+            CompiledOnePassPlan.DirectedJoinEdge parentEdge =
+                    plan.getParentEdge(alias);
+
+            if (parentEdge != null
+                    && !expectedIndexesByEdge.containsKey(parentEdge.getEdgeId())) {
+                expectedIndexesByEdge.put(
+                        parentEdge.getEdgeId(),
+                        new LinkedHashMap<String, Double>()
+                );
+            }
+        }
+    }
+
+    private static void updateExpectedIndexes(CompiledOnePassPlan plan,
+                                              OnePassWeightEvaluator expectedWeightEvaluator,
+                                              ObjectNode tupleJson) {
+        OnePassTuple tuple = OnePassTupleExtractor.extract(tupleJson);
+        String alias = tuple.getTable();
+
+        if (plan.isRoot(alias)) {
+            return;
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge =
+                plan.getParentEdge(alias);
+
+        if (parentEdge == null) {
+            return;
+        }
+
+        double ownWeight = expectedWeightEvaluator.evaluate(tuple);
+        double continuationWeight = 1.0d;
+
+        for (CompiledOnePassPlan.DirectedJoinEdge childEdge
+                : plan.getChildEdges(alias)) {
+            String parentSideKey =
+                    joinKey(tuple, childEdge.getParentFields());
+
+            Map<String, Double> childIndex =
+                    expectedIndexesByEdge.get(childEdge.getEdgeId());
+
+            if (childIndex == null) {
+                throw new IllegalStateException(
+                        "Missing expected child index for edge "
+                                + childEdge.getEdgeId()
+                );
+            }
+
+            Double childWeight = childIndex.get(parentSideKey);
+
+            if (childWeight == null) {
+                childWeight = 0.0d;
+            }
+
+            continuationWeight *= childWeight.doubleValue();
+        }
+
+        double subtreeWeight = ownWeight * continuationWeight;
+
+        if (subtreeWeight == 0.0d) {
+            return;
+        }
+
+        String childSideKey = joinKey(tuple, parentEdge.getChildFields());
+
+        Map<String, Double> parentIndex =
+                expectedIndexesByEdge.get(parentEdge.getEdgeId());
+
+        if (parentIndex == null) {
+            throw new IllegalStateException(
+                    "Missing expected parent index for edge "
+                            + parentEdge.getEdgeId()
+            );
+        }
+
+        addToMap(parentIndex, childSideKey, subtreeWeight);
+    }
+
+    private static void updateExpectedRootStats(CompiledOnePassPlan plan,
+                                                OnePassWeightEvaluator expectedWeightEvaluator,
+                                                ObjectNode tupleJson) {
+        OnePassTuple tuple = OnePassTupleExtractor.extract(tupleJson);
+
+        if (!plan.isRoot(tuple.getTable())) {
+            return;
+        }
+
+        expectedRootTuplesSeen++;
+
+        double rootGroupWeight =
+                computeExpectedRootGroupWeight(plan, expectedWeightEvaluator, tuple);
+
+        if (rootGroupWeight > 0.0d) {
+            expectedPositiveRootCandidatesSeen++;
+            expectedTotalRootGroupWeight += rootGroupWeight;
+        }
+    }
+
+    private static double computeExpectedRootGroupWeight(
+            CompiledOnePassPlan plan,
+            OnePassWeightEvaluator expectedWeightEvaluator,
+            OnePassTuple rootTuple) {
+
+        double rootOwnWeight = expectedWeightEvaluator.evaluate(rootTuple);
+
+        if (rootOwnWeight == 0.0d) {
+            return 0.0d;
+        }
+
+        double continuationWeight = 1.0d;
+
+        for (CompiledOnePassPlan.DirectedJoinEdge childEdge
+                : plan.getChildEdges(plan.getRootAlias())) {
+            String parentSideKey =
+                    joinKey(rootTuple, childEdge.getParentFields());
+
+            Map<String, Double> childIndex =
+                    expectedIndexesByEdge.get(childEdge.getEdgeId());
+
+            if (childIndex == null) {
+                throw new IllegalStateException(
+                        "Missing expected root child index for edge "
+                                + childEdge.getEdgeId()
+                );
+            }
+
+            Double childWeight = childIndex.get(parentSideKey);
+
+            if (childWeight == null || childWeight.doubleValue() == 0.0d) {
+                return 0.0d;
+            }
+
+            continuationWeight *= childWeight.doubleValue();
+        }
+
+        return rootOwnWeight * continuationWeight;
+    }
+
+    private static String joinKey(OnePassTuple tuple, List<String> fields) {
+        return JoinValue.fromTuple(tuple, fields).toString();
+    }
+
+    private static void addToMap(Map<String, Double> map,
+                                 String key,
+                                 double delta) {
+        Double current = map.get(key);
+
+        if (current == null) {
+            current = 0.0d;
+        }
+
+        map.put(key, current + delta);
+    }
+
+    private static JsonNode waitForPhaseOneDebugResult(
+            KafkaConsumer<String, String> consumer,
+            int phaseOneDebugUid,
+            String queryName,
+            long timeoutMs) throws Exception {
+
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        int recordsSeen = 0;
+
+        while (System.currentTimeMillis() < deadline) {
+            ConsumerRecords<String, String> records = consumer.poll(1000);
+
+            for (ConsumerRecord<String, String> record : records) {
+                recordsSeen++;
+                String value = record.value();
+
+                if (value == null || value.trim().isEmpty()) {
+                    continue;
+                }
+
+                JsonNode envelope;
+
+                try {
+                    envelope = parseJsonLenient(value);
+                } catch (Exception ignored) {
+                    continue;
+                }
+
+                JsonNode uidNode = findFirst(envelope, "uid");
+                JsonNode synopsisIdNode = findFirst(envelope, "synopsisID");
+
+                if (uidNode == null || uidNode.asInt() != phaseOneDebugUid) {
+                    continue;
+                }
+
+                if (synopsisIdNode == null
+                        || synopsisIdNode.asInt() != PHASE1_DEBUG_SYNOPSIS_ID) {
+                    continue;
+                }
+
+                JsonNode payload = extractEstimationPayload(envelope);
+                JsonNode edgeIndexes = findFirst(payload, "edgeIndexes");
+
+                if (edgeIndexes == null || edgeIndexes.isNull()) {
+                    continue;
+                }
+
+                JsonNode queryNameNode = findFirst(payload, "queryName");
+
+                if (queryNameNode != null
+                        && !queryName.equals(queryNameNode.asText())) {
+                    throw new IllegalStateException(
+                            "Received Phase 1 debug result for query "
+                                    + queryNameNode.asText()
+                                    + " but expected "
+                                    + queryName
+                    );
+                }
+
+                System.out.println("Received Phase 1 debug full-index result.");
+                return payload;
+            }
+        }
+
+        throw new IllegalStateException(
+                "Timed out waiting for Phase 1 debug full-index result. "
+                        + "Records seen from estimationTopic: "
+                        + recordsSeen
+        );
+    }
+
+    private static void validateFullIndexPayload(JsonNode payload) {
+        JsonNode edgeIndexes = findFirst(payload, "edgeIndexes");
+
+        if (edgeIndexes == null || edgeIndexes.isNull()) {
+            throw new IllegalStateException("Missing edgeIndexes field");
+        }
+
+        for (Map.Entry<String, Map<String, Double>> expectedEdge
+                : expectedIndexesByEdge.entrySet()) {
+            String edgeId = expectedEdge.getKey();
+            Map<String, Double> expectedIndex = expectedEdge.getValue();
+
+            JsonNode actualIndex = edgeIndexes.get(edgeId);
+
+            if (actualIndex == null || actualIndex.isNull()) {
+                throw new IllegalStateException("Missing full index for edge " + edgeId);
+            }
+
+            if (actualIndex.size() != expectedIndex.size()) {
+                throw new IllegalStateException(
+                        edgeId + " key count expected "
+                                + expectedIndex.size()
+                                + " but got "
+                                + actualIndex.size()
+                );
+            }
+
+            for (Map.Entry<String, Double> expectedEntry
+                    : expectedIndex.entrySet()) {
+                String key = expectedEntry.getKey();
+                double expectedValue = expectedEntry.getValue();
+
+                JsonNode actualValueNode = actualIndex.get(key);
+
+                if (actualValueNode == null || actualValueNode.isNull()) {
+                    throw new IllegalStateException(
+                            edgeId + " missing key " + key
+                    );
+                }
+
+                double actualValue = actualValueNode.asDouble();
+                assertClose(edgeId + "[" + key + "]", expectedValue, actualValue);
+            }
+
+            System.out.println(
+                    "Full-index validation passed for "
+                            + edgeId
+                            + ". Keys checked: "
+                            + expectedIndex.size()
+            );
+        }
+    }
+
+    private static void writePhaseOneFullIndexFile(JsonNode payload,
+                                                   String queryName) throws Exception {
+        String path =
+                "/tmp/onepass_"
+                        + queryName
+                        + "_phase1_full_indexes.json";
+
+        writeJsonToFile(payload, path);
+    }
+
+    private static void writeJsonToFile(JsonNode json,
+                                        String path) throws Exception {
+        File outputFile = new File(path);
+        FileWriter writer = new FileWriter(outputFile);
+
+        try {
+            writer.write(
+                    MAPPER.writerWithDefaultPrettyPrinter()
+                            .writeValueAsString(json)
+            );
+            writer.write(System.lineSeparator());
+        } finally {
+            writer.close();
+        }
+
+        System.out.println("Wrote SDE result to: " + outputFile.getAbsolutePath());
+    }
+
+    private static double sum(Map<String, Double> map) {
+        double total = 0.0d;
+
+        for (Double value : map.values()) {
+            if (value != null) {
+                total += value.doubleValue();
+            }
+        }
+
+        return total;
+    }
+
+    private static void assertClose(String label,
+                                    double expected,
+                                    double actual) {
+        double absoluteTolerance = 0.000001d;
+        double relativeTolerance = 0.000000001d;
+
+        double diff = Math.abs(expected - actual);
+        double allowed =
+                Math.max(absoluteTolerance, Math.abs(expected) * relativeTolerance);
+
+        if (diff > allowed) {
+            throw new IllegalStateException(
+                    label + " mismatch. Expected "
+                            + expected
+                            + " but got "
+                            + actual
+                            + ". Difference "
+                            + diff
+                            + ", allowed "
+                            + allowed
+            );
+        }
+    }
+
+    private static void runOnlineMultinomialSamplerDuplicateSelfTest() {
+        OnlineMultinomialSampler<String> sampler =
+                new OnlineMultinomialSampler<String>(5, "single-positive-candidate-test");
+
+        sampler.add("only", 10.0d);
+
+        OnlineMultinomialSample<String> sample = sampler.finish();
+
+        if (sample.getSamples().size() != 5) {
+            throw new IllegalStateException(
+                    "OnlineMultinomialSampler duplicate self-test failed: expected 5 samples, got "
+                            + sample.getSamples().size()
+            );
+        }
+
+        for (String item : sample.getSamples()) {
+            if (!"only".equals(item)) {
+                throw new IllegalStateException(
+                        "OnlineMultinomialSampler duplicate self-test failed: unexpected item "
+                                + item
+                );
+            }
+        }
+
+        System.out.println(
+                "OnlineMultinomialSampler duplicate self-test passed: "
+                        + sample.getSamples()
+        );
     }
 
     private static JsonNode waitForResponseContaining(KafkaConsumer<String, String> consumer,
@@ -748,17 +1438,18 @@ public final class OnePassSamplerSdeSynopsisTest {
 
                 if (!rawHasUid && !payloadHasUid) {
                     System.out.println(
-                            "Warning: estimationTopic record does not contain uid="
+                            "Skipping estimationTopic record because it does not contain uid="
                                     + uid
-                                    + ". With clean topics this may still be the current "
-                                    + "test response; matching will be based on payload text."
                     );
                     System.out.println();
+                    continue;
                 }
 
                 if (rawHasRequiredText || payloadHasRequiredText) {
                     System.out.println(
-                            "Matched estimationTopic record for expected text: "
+                            "Matched estimationTopic record for uid="
+                                    + uid
+                                    + " and expected text: "
                                     + requiredText
                     );
                     System.out.println();
