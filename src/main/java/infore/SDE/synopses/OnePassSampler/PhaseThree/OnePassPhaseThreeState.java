@@ -47,6 +47,7 @@ public final class OnePassPhaseThreeState implements Serializable {
     private String activeAlias;
     private CompiledOnePassPlan.DirectedJoinEdge activeParentEdge;
     private Map<Long, OnePassExtensionChoice> activeChoicesBySampleId;
+    private Map<JoinValue, List<Long>> activeSampleIdsByParentKey;
 
     public OnePassPhaseThreeState(OnePassPhaseOneResult phaseOneResult,
                                   OnePassRootSampleResult phaseTwoResult,
@@ -71,6 +72,8 @@ public final class OnePassPhaseThreeState implements Serializable {
         this.activeAlias = null;
         this.activeParentEdge = null;
         this.activeChoicesBySampleId = null;
+
+        this.activeSampleIdsByParentKey = null;
 
         initializeFromPhaseTwoRoots();
     }
@@ -230,6 +233,7 @@ public final class OnePassPhaseThreeState implements Serializable {
         this.activeAlias = alias;
         this.activeParentEdge = parentEdge;
         this.activeChoicesBySampleId = initializeChoicesForAlias(alias, parentEdge);
+        this.activeSampleIdsByParentKey = initializeSampleIdsByParentKey(alias, parentEdge);
     }
 
     public void addTuple(OnePassTuple childTuple) {
@@ -257,34 +261,18 @@ public final class OnePassPhaseThreeState implements Serializable {
 
         JoinValue childSideKey = JoinValue.fromTuple(childTuple, activeParentEdge.getChildFields());
 
-        for (OnePassPartialSample partial : partialSamplesById.values()) {
+        List<Long> matchingSampleIds = activeSampleIdsByParentKey.get(childSideKey);
 
-            if (partial.hasAlias(activeAlias)) {
-                continue;
-            }
+        if (matchingSampleIds == null || matchingSampleIds.isEmpty()) {
+            return;
+        }
 
-            OnePassTuple parentTuple = partial.getTuple(activeParentEdge.getParentAlias());
-
-            if (parentTuple == null) {
-                /*
-                 * This means the caller is replaying aliases in the wrong order.
-                 * startAlias(...) usually catches this earlier through
-                 * initializeChoicesForAlias(...)
-                 */
-                continue;
-            }
-
-            JoinValue parentSideKey = JoinValue.fromTuple(parentTuple, activeParentEdge.getParentFields());
-
-            if (!parentSideKey.equals(childSideKey)) {
-                continue;
-            }
-
-            OnePassExtensionChoice choice = activeChoicesBySampleId.get(partial.getSampleInstanceId());
+        for (Long sampleId : matchingSampleIds) {
+            OnePassExtensionChoice choice = activeChoicesBySampleId.get(sampleId);
 
             if (choice == null) {
-                throw new IllegalStateException("Missing extension choice for sample " +
-                        partial.getSampleInstanceId() + " and alias " + activeAlias);
+                throw new IllegalStateException("Missing extension choice for sample " + sampleId
+                                + " and alias " + activeAlias);
             }
 
             choice.consider(childTuple, candidateWeight, random);
@@ -522,6 +510,36 @@ public final class OnePassPhaseThreeState implements Serializable {
         return h;
     }
 
+    private Map<JoinValue, List<Long>> initializeSampleIdsByParentKey(String alias,
+            CompiledOnePassPlan.DirectedJoinEdge parentEdge) {
+
+        Map<JoinValue, List<Long>> out = new LinkedHashMap<JoinValue, List<Long>>();
+
+        for (OnePassPartialSample partial : partialSamplesById.values()) {
+            if (partial.hasAlias(alias)) {
+                continue;
+            }
+
+            OnePassTuple parentTuple = partial.getTuple(parentEdge.getParentAlias());
+
+            if (parentTuple == null) {
+                throw new IllegalStateException("Cannot build Phase 3 parent-key index for alias '" + alias
+                                + "' because sample " + partial.getSampleInstanceId()
+                                + " does not yet contain parent alias '" + parentEdge.getParentAlias()
+                                + "'. Replay aliases in root-to-leaf order."
+                );
+            }
+
+            JoinValue parentSideKey = JoinValue.fromTuple(parentTuple, parentEdge.getParentFields());
+
+            List<Long> sampleIds = out.computeIfAbsent(parentSideKey, k -> new ArrayList<Long>());
+
+            sampleIds.add(partial.getSampleInstanceId());
+        }
+
+        return out;
+    }
+
     public boolean isAliasActive() {
         return activeAlias != null;
     }
@@ -534,5 +552,6 @@ public final class OnePassPhaseThreeState implements Serializable {
         this.activeAlias = null;
         this.activeParentEdge = null;
         this.activeChoicesBySampleId = null;
+        this.activeSampleIdsByParentKey = null;
     }
 }
