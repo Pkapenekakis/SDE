@@ -9,6 +9,7 @@ import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
 import infore.SDE.synopses.Synopsis;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
+import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -35,6 +36,9 @@ import java.util.Map;
  *   UPDATE, requestID = 7:
  *       FINISH_PHASE_1
  *       FINISH_PHASE_2
+ *       START_PHASE_3_ALIAS
+ *       FINISH_PHASE_3_ALIAS
+ *       FINISH_PHASE_3
  *       STATUS
  *
  *   ESTIMATE, requestID = 3 or 6:
@@ -48,6 +52,9 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
     public static final String COMMAND_FINISH_PHASE_1 = "FINISH_PHASE_1";
     public static final String COMMAND_FINISH_PHASE_2 = "FINISH_PHASE_2";
+    public static final String COMMAND_START_PHASE_3_ALIAS = "START_PHASE_3_ALIAS";
+    public static final String COMMAND_FINISH_PHASE_3_ALIAS = "FINISH_PHASE_3_ALIAS";
+    public static final String COMMAND_FINISH_PHASE_3 = "FINISH_PHASE_3";
     public static final String COMMAND_STATUS = "STATUS";
 
     private final OnePassParams params;
@@ -98,17 +105,47 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             return buildEstimation(request);
         }
 
+        /*
+         * Accept both:
+         *
+         *   START_PHASE_3_ALIAS
+         *
+         * and compact forms such as:
+         *
+         *   START_PHASE_3_ALIAS:o
+         *   START_PHASE_3_ALIAS=o
+         */
+        if (isStartPhaseThreeAliasCommand(command)) {
+            String alias = resolvePhaseThreeAlias(request, command);
+            lifecycle.startPhaseThreeAlias(alias);
+            return buildEstimation(request);
+        }
+
+        if (COMMAND_FINISH_PHASE_3_ALIAS.equalsIgnoreCase(command)) {
+            lifecycle.finishPhaseThreeAlias();
+            return buildEstimation(request);
+        }
+
+        if (COMMAND_FINISH_PHASE_3.equalsIgnoreCase(command)) {
+            lifecycle.finishPhaseThree();
+            return buildEstimation(request);
+        }
+
         if (COMMAND_STATUS.equalsIgnoreCase(command)) {
             return buildEstimation(request);
         }
 
         throw new IllegalArgumentException(
-                "Unknown OnePass control command: "
-                        + command
-                        + ". Expected one of: "
+                "Unknown OnePass control command: " + command + ". Expected one of: "
                         + COMMAND_FINISH_PHASE_1
                         + ", "
                         + COMMAND_FINISH_PHASE_2
+                        + ", "
+                        + COMMAND_START_PHASE_3_ALIAS
+                        + ", "
+                        + COMMAND_FINISH_PHASE_3_ALIAS
+                        + ", "
+                        + COMMAND_FINISH_PHASE_3
                         + ", "
                         + COMMAND_STATUS
         );
@@ -160,6 +197,101 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return COMMAND_STATUS;
     }
 
+    private boolean isStartPhaseThreeAliasCommand(String command) {
+        if (command == null) {
+            return false;
+        }
+
+        String trimmed = command.trim();
+
+        return COMMAND_START_PHASE_3_ALIAS.equalsIgnoreCase(trimmed)
+                || trimmed.toUpperCase().startsWith(COMMAND_START_PHASE_3_ALIAS + ":")
+                || trimmed.toUpperCase().startsWith(COMMAND_START_PHASE_3_ALIAS + "=");
+    }
+
+    private String resolvePhaseThreeAlias(Request request, String command) {
+        /*
+         * Preferred JSON form:
+         *
+         *   "parameters": {
+         *       "onePassCommand": "START_PHASE_3_ALIAS",
+         *       "onePassAlias": "o"
+         *   }
+         *
+         * or:
+         *
+         *   "parameters": {
+         *       "onePassCommand": "START_PHASE_3_ALIAS",
+         *       "phaseThreeAlias": "o"
+         *   }
+         */
+        JsonNode parameters = request.getParameters();
+
+        if (parameters != null && !parameters.isNull()) {
+            JsonNode aliasNode = parameters.get("onePassAlias");
+
+            if (aliasNode == null || aliasNode.isNull()) {
+                aliasNode = parameters.get("phaseThreeAlias");
+            }
+
+            if (aliasNode != null && !aliasNode.isNull()) {
+                String alias = aliasNode.asText();
+
+                if (alias != null && !alias.trim().isEmpty()) {
+                    return alias.trim();
+                }
+            }
+        }
+
+        /*
+         * Compact command form:
+         *   START_PHASE_3_ALIAS:o
+         *   START_PHASE_3_ALIAS=o
+         */
+        if (command != null) {
+            String trimmed = command.trim();
+
+            int colon = trimmed.indexOf(':');
+
+            int equals = trimmed.indexOf('=');
+
+            int separator = -1;
+
+            if (colon >= 0) {
+                separator = colon;
+            } else if (equals >= 0) {
+                separator = equals;
+            }
+
+            if (separator >= 0 && separator + 1 < trimmed.length()) {
+                String alias = trimmed.substring(separator + 1).trim();
+
+                if (!alias.isEmpty()) {
+                    return alias;
+                }
+            }
+        }
+
+        /*
+         * Backwards/simple param form:
+         *
+         *   "param": ["START_PHASE_3_ALIAS", "o"]
+         */
+        String[] param = request.getParam();
+
+        if (param != null && param.length > 1) {
+            String alias = param[1];
+
+            if (alias != null && !alias.trim().isEmpty()) {
+                return alias.trim();
+            }
+        }
+
+        throw new IllegalArgumentException("Missing Phase 3 alias for command " + command +
+                ". Use parameters.onePassAlias, parameters.phaseThreeAlias, " +
+                "param[1], or compact command START_PHASE_3_ALIAS:<alias>.");
+    }
+
     private String buildStatusJson() {
         try {
             return MAPPER.writeValueAsString(buildStatusPayload());
@@ -172,8 +304,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
     }
 
     private Map<String, Object> buildStatusPayload() {
-        Map<String, Object> out =
-                new LinkedHashMap<String, Object>();
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
 
         out.put("queryName", plan.getQueryName());
         out.put("rootAlias", plan.getRootAlias());
@@ -183,33 +314,18 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         /*
          * Always copy plan collections into normal mutable JDK containers.
          */
-        out.put(
-                "leafToRootOrder",
-                new ArrayList<String>(plan.getLeafToRootOrder())
-        );
+        out.put("leafToRootOrder", new ArrayList<String>(plan.getLeafToRootOrder()));
 
-        out.put(
-                "rootToLeafOrder",
-                new ArrayList<String>(plan.getRootToLeafOrder())
-        );
+        out.put("rootToLeafOrder", new ArrayList<String>(plan.getRootToLeafOrder()));
 
-        out.put(
-                "weightsByAlias",
-                new LinkedHashMap<String, String>(plan.getWeightsByAlias())
-        );
+        out.put("weightsByAlias", new LinkedHashMap<String, String>(plan.getWeightsByAlias()));
 
-        OnePassPhaseOneResult phaseOneResult =
-                lifecycle.getPhaseOneResult();
+        OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
 
         if (phaseOneResult != null) {
             out.put("phaseOneComplete", true);
 
-            out.put(
-                    "seenTuplesByAlias",
-                    new LinkedHashMap<String, Long>(
-                            phaseOneResult.getSeenTuplesByAlias()
-                    )
-            );
+            out.put("seenTuplesByAlias", new LinkedHashMap<String, Long>(phaseOneResult.getSeenTuplesByAlias()));
 
             /*
              * Do NOT put Phase1LinkWeightIndex objects in the Estimation.
@@ -221,8 +337,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
              * The standalone Phase 1 debug test can remain responsible for
              * exporting full index contents.
              */
-            Map rawIndexes =
-                    phaseOneResult.copyRawIndexesByEdgeId();
+            Map rawIndexes = phaseOneResult.copyRawIndexesByEdgeId();
 
             out.put("edgeIndexCount", rawIndexes.size());
             out.put("edgeIndexIds", new ArrayList(rawIndexes.keySet()));
@@ -232,38 +347,52 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             out.put("edgeIndexIds", new ArrayList());
         }
 
-        OnePassRootSampleResult phaseTwoResult =
-                lifecycle.getPhaseTwoResult();
+        OnePassRootSampleResult phaseTwoResult = lifecycle.getPhaseTwoResult();
 
         if (phaseTwoResult != null) {
             out.put("phaseTwoComplete", true);
 
             out.put("rootTuplesSeen", phaseTwoResult.getRootTuplesSeen());
-            out.put(
-                    "positiveRootCandidatesSeen",
-                    phaseTwoResult.getPositiveRootCandidatesSeen()
-            );
-            out.put(
-                    "totalRootGroupWeight",
-                    phaseTwoResult.getTotalRootGroupWeight()
-            );
+            out.put("positiveRootCandidatesSeen", phaseTwoResult.getPositiveRootCandidatesSeen());
+            out.put("totalRootGroupWeight", phaseTwoResult.getTotalRootGroupWeight());
 
             /*
              * This is safe because buildStatusJson() serializes it to String
              * before Flink/Kryo sees the Estimation payload.
              */
-            out.put(
-                    "sampleInstances",
-                    new ArrayList(
-                            phaseTwoResult.getSampleInstances()
-                    )
-            );
+            out.put("sampleInstances", new ArrayList(phaseTwoResult.getSampleInstances()));
         } else {
             out.put("phaseTwoComplete", false);
             out.put("rootTuplesSeen", 0L);
             out.put("positiveRootCandidatesSeen", 0L);
             out.put("totalRootGroupWeight", 0.0d);
             out.put("sampleInstances", new ArrayList());
+        }
+
+        OnePassPhaseThreeResult phaseThreeResult = lifecycle.getPhaseThreeResult();
+
+        out.put("phaseThreeAliasActive", lifecycle.isPhaseThreeAliasActive());
+        out.put("phaseThreeActiveAlias", lifecycle.getPhaseThreeActiveAlias());
+
+        if (phaseThreeResult != null) {
+            out.put("phaseThreeComplete", true);
+
+            out.put("completedSampleCount", phaseThreeResult.getCompletedSamples().size());
+            out.put("requestedPhaseThreeSampleSize", phaseThreeResult.getRequestedSampleSize());
+
+            /*
+             * Safe because buildStatusJson() serializes the payload to a String
+             * before it enters the SDE Estimation object.
+             *
+             * Keep this for tests. Later, if output becomes too large, replace this
+             * with projected samples or a sample preview.
+             */
+            out.put("completedSamples", new ArrayList(phaseThreeResult.getCompletedSamples()));
+        } else {
+            out.put("phaseThreeComplete", false);
+            out.put("completedSampleCount", 0);
+            out.put("requestedPhaseThreeSampleSize", plan.getSampleSize());
+            out.put("completedSamples", new ArrayList());
         }
 
         return out;

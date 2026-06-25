@@ -3,6 +3,8 @@ package infore.SDE.synopses.OnePassSampler;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneState;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassWeightEvaluator;
+import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
+import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
@@ -54,6 +56,9 @@ public final class OnePassSamplerSynopsis implements Serializable {
     private OnePassPhaseTwoState phaseTwoState;
     private OnePassRootSampleResult phaseTwoResult;
 
+    private OnePassPhaseThreeState phaseThreeState;
+    private OnePassPhaseThreeResult phaseThreeResult;
+
     public OnePassSamplerSynopsis(CompiledOnePassPlan plan) {
         if (plan == null) {
             throw new IllegalArgumentException("plan must not be null");
@@ -77,6 +82,8 @@ public final class OnePassSamplerSynopsis implements Serializable {
         this.phaseOneResult = null;
         this.phaseTwoState = null;
         this.phaseTwoResult = null;
+        this.phaseThreeState = null;
+        this.phaseThreeResult = null;
     }
 
     /**
@@ -105,28 +112,25 @@ public final class OnePassSamplerSynopsis implements Serializable {
             return;
         }
 
+        if (phase == Phase.PHASE_3) {
+            addPhaseThreeTuple(tuple);
+            return;
+        }
+
         throw new IllegalStateException(
-                "Cannot add tuple while OnePassSamplerSynopsis is in phase "
-                        + phase
-        );
+                "Cannot add tuple while OnePassSamplerSynopsis is in phase " + phase);
     }
 
     private void addPhaseOneTuple(OnePassTuple tuple) {
         String alias = tuple.getTable();
 
         if (rootAlias.equals(alias)) {
-            throw new IllegalArgumentException(
-                    "Received root alias '"
-                            + rootAlias
-                            + "' during PHASE_1. "
-                            + "Root tuples must be processed only during PHASE_2."
-            );
+            throw new IllegalArgumentException("Received root alias '" + rootAlias + "' during PHASE_1. "
+                    + "Root tuples must be processed only during PHASE_2.");
         }
 
         if (!plan.containsAlias(alias)) {
-            throw new IllegalArgumentException(
-                    "Unknown alias during PHASE_1: " + alias
-            );
+            throw new IllegalArgumentException("Unknown alias during PHASE_1: " + alias);
         }
 
         phaseOneState.addTuple(tuple);
@@ -137,14 +141,19 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
         if (!rootAlias.equals(alias)) {
             throw new IllegalArgumentException(
-                    "Received non-root alias '"
-                            + alias
-                            + "' during PHASE_2. "
-                            + "Expected root alias '" + rootAlias + "'."
-            );
+                    "Received non-root alias '" + alias + "' during PHASE_2. " +
+                            "Expected root alias '" + rootAlias + "'.");
         }
 
         phaseTwoState.addTuple(tuple);
+    }
+
+    private void addPhaseThreeTuple(OnePassTuple tuple) {
+        if (phaseThreeState == null) {
+            throw new IllegalStateException("Phase 3 state has not been initialized");
+        }
+
+        phaseThreeState.addTuple(tuple);
     }
 
     /**
@@ -187,24 +196,80 @@ public final class OnePassSamplerSynopsis implements Serializable {
     public OnePassRootSampleResult finishPhaseTwo() {
         if (phase != Phase.PHASE_2) {
             throw new IllegalStateException(
-                    "finishPhaseTwo() is only valid during PHASE_2. Current phase: "
-                            + phase
-            );
+                    "finishPhaseTwo() is only valid during PHASE_2. Current phase: "+ phase);
         }
 
         this.phaseTwoResult = phaseTwoState.exportResult();
 
-        /*
-         * Later this should become:
-         *
-         *   phaseThreeState = new OnePassPhaseThreeState(...);
-         *   phase = Phase.PHASE_3;
-         *
-         * For now Phase 3 is not implemented, so the lifecycle stops here.
-         */
-        this.phase = Phase.DONE;
+        this.phaseThreeState = new OnePassPhaseThreeState(phaseOneResult, phaseTwoResult, plan.getDatasetSeed());
+        this.phase = Phase.PHASE_3;
 
         return phaseTwoResult;
+    }
+
+    public void startPhaseThreeAlias(String alias) {
+        if (phase != Phase.PHASE_3) {
+            throw new IllegalStateException(
+                    "startPhaseThreeAlias() is only valid during PHASE_3. Current phase: "
+                            + phase
+            );
+        }
+
+        if (phaseThreeState == null) {
+            throw new IllegalStateException(
+                    "Phase 3 state has not been initialized"
+            );
+        }
+
+        phaseThreeState.startAlias(alias);
+    }
+
+    public void finishPhaseThreeAlias() {
+        if (phase != Phase.PHASE_3) {
+            throw new IllegalStateException(
+                    "finishPhaseThreeAlias() is only valid during PHASE_3. Current phase: "
+                            + phase
+            );
+        }
+
+        if (phaseThreeState == null) {
+            throw new IllegalStateException(
+                    "Phase 3 state has not been initialized"
+            );
+        }
+
+        phaseThreeState.finishAlias();
+    }
+
+    public OnePassPhaseThreeResult finishPhaseThree() {
+        if (phase != Phase.PHASE_3) {
+            throw new IllegalStateException(
+                    "finishPhaseThree() is only valid during PHASE_3. Current phase: "
+                            + phase
+            );
+        }
+
+        if (phaseThreeState == null) {
+            throw new IllegalStateException(
+                    "Phase 3 state has not been initialized"
+            );
+        }
+
+        if (phaseThreeState.isAliasActive()) {
+            throw new IllegalStateException(
+                    "Cannot finish Phase 3 while alias '"
+                            + phaseThreeState.getActiveAlias()
+                            + "' is still active. Call finishPhaseThreeAlias() first."
+            );
+        }
+
+        this.phaseThreeResult =
+                phaseThreeState.finish();
+
+        this.phase =
+                Phase.DONE;
+
+        return phaseThreeResult;
     }
 
     public double computeRootGroupWeight(Object payload) {
@@ -263,6 +328,22 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
     public boolean isPhaseTwoComplete() {
         return phaseTwoResult != null;
+    }
+
+    public OnePassPhaseThreeResult getPhaseThreeResult() {
+        return phaseThreeResult;
+    }
+
+    public boolean isPhaseThreeComplete() {
+        return phaseThreeResult != null;
+    }
+
+    public boolean isPhaseThreeAliasActive() {
+        return phaseThreeState != null && phaseThreeState.isAliasActive();
+    }
+
+    public String getPhaseThreeActiveAlias() {
+        return phaseThreeState == null ? null : phaseThreeState.getActiveAlias();
     }
 
     @Override
