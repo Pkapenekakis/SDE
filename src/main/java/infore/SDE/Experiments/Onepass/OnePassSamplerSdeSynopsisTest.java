@@ -89,7 +89,7 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final String TEST_ONEPASS_SQL =
             "SELECT * FROM w_two_lineitems WEIGHTED BY ("+
                     "o.o_totalprice * l1.l_extendedprice * (4 - l2.l_discount))" +
-                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+                    "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     /*
      * Use 5000 first while testing wiring.
@@ -98,7 +98,7 @@ public final class OnePassSamplerSdeSynopsisTest {
      * Important:
      * Phase 3 must replay the same side-stream subset that Phase 1 indexed.
      */
-    private static final long TEST_ROW_LIMIT = -1;
+    private static final long TEST_ROW_LIMIT = 1000000;
 
     private static final int SYNOPSIS_ID = 30;
     private static final int PHASE1_DEBUG_SYNOPSIS_ID = 31;
@@ -125,12 +125,21 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final Map<String, Map<String, Double>> expectedIndexesByEdge =
             new LinkedHashMap<String, Map<String, Double>>();
 
-    private static final Map<String, Long> sentRowsByAlias =
-            new LinkedHashMap<String, Long>();
+    private static final Map<String, Long> sentRowsByAlias = new LinkedHashMap<String, Long>();
 
     private static long expectedRootTuplesSeen = 0L;
     private static long expectedPositiveRootCandidatesSeen = 0L;
     private static double expectedTotalRootGroupWeight = 0.0d;
+
+    private static final Map<String, Long> benchmarkNanos = new LinkedHashMap<String, Long>();
+    /*
+     * Keep normal benchmark output compact for comparison with the original
+     * standalone One-pass* implementation.
+     *
+     * Set to true only when debugging the SDE/Kafka synchronization barriers
+     * or individual ACK/status waits.
+     */
+    private static final boolean PRINT_DETAILED_BENCHMARK_TIMINGS = false;
 
     private OnePassSamplerSdeSynopsisTest() {
     }
@@ -141,6 +150,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
         expectedIndexesByEdge.clear();
         sentRowsByAlias.clear();
+        benchmarkNanos.clear();
         expectedRootTuplesSeen = 0L;
         expectedPositiveRootCandidatesSeen = 0L;
         expectedTotalRootGroupWeight = 0.0d;
@@ -166,12 +176,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
         initializeExpectedIndexes(plan);
 
-        /*
-         * Use the compiled plan WeightSpec, because alias-specific weights are
-         * represented there.
-         */
-        OnePassWeightEvaluator expectedWeightEvaluator =
-                new OnePassWeightEvaluator(plan.getWeightSpec());
+        OnePassWeightEvaluator expectedWeightEvaluator = new OnePassWeightEvaluator(plan.getWeightSpec());
 
         System.out.println("Compiled plan:");
         System.out.println(plan);
@@ -188,6 +193,13 @@ public final class OnePassSamplerSdeSynopsisTest {
 
         try {
             drainConsumer(consumer);
+
+            /*
+             * Start benchmark timing after local test setup/SQL compilation.
+             * This keeps the measurement focused on the SDE/Kafka One-pass*
+             * lifecycle that will be compared against the original code.
+             */
+            long totalStartNanos = tic();
 
             System.out.println("1. Sending ADD request for OnePassSamplerSdeSynopsis...");
             ObjectNode addRequest = buildAddRequest(uid, datasetKey, streamId);
@@ -208,9 +220,15 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             /*
              * Give SDE a short moment to create the synopsis before sending tuples.
+             * This is an artificial synchronization wait, so it is excluded from
+             * adjusted benchmark time.
              */
+            long initialAddWaitStartNanos = tic();
             Thread.sleep(1500L);
+            recordDuration("total_artificial_wait", initialAddWaitStartNanos);
+            recordDetailedDuration("initial_add_wait", initialAddWaitStartNanos);
 
+            long phaseOneStreamStartNanos = tic(); //TIMING PHASE1
             System.out.println("2. Streaming PHASE_1 side aliases...");
             long phaseOneRows = 0L;
 
@@ -234,6 +252,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             }
 
             producer.flush();
+            recordDuration("phase1_stream_send", phaseOneStreamStartNanos); //TIMING PHASE1 END
 
             System.out.println("Total PHASE_1 rows sent: " + phaseOneRows);
             System.out.println();
@@ -244,9 +263,14 @@ public final class OnePassSamplerSdeSynopsisTest {
              * This gives SDE time to consume PHASE_1 tuples before FINISH_PHASE_1.
              */
             System.out.println("Waiting for SDE to consume PHASE_1 side tuples...");
+            long phaseOneBarrierStartNanos = tic();
             Thread.sleep(10000L);
+            recordDuration("total_artificial_wait", phaseOneBarrierStartNanos);
+            recordDetailedDuration("phase1_barrier_sleep", phaseOneBarrierStartNanos);
 
             System.out.println("3. Sending FINISH_PHASE_1 request...");
+            long phaseOneFinishAckStartNanos = tic();
+
             ObjectNode finishPhaseOneRequest =
                     buildControlRequest(
                             uid,
@@ -262,27 +286,19 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println();
 
             System.out.println("4. Waiting for FINISH_PHASE_1 ACK...");
-            JsonNode phaseOneAck =
-                    waitForResponseContaining(
-                            consumer,
-                            uid,
-                            COMMAND_FINISH_PHASE_1,
-                            120000L
-                    );
+            JsonNode phaseOneAck = waitForResponseContaining(consumer, uid, COMMAND_FINISH_PHASE_1, 120000L);
 
             System.out.println("FINISH_PHASE_1 ACK envelope:");
             System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(phaseOneAck));
             System.out.println();
 
             validateControlAck(phaseOneAck, COMMAND_FINISH_PHASE_1);
+            recordDuration("phase1_finish_ack", phaseOneFinishAckStartNanos);
+            recordDetailedDuration("phase1_finish_ack_detail", phaseOneFinishAckStartNanos);
 
             System.out.println("4a. Requesting OnePassSamplerSdeSynopsis STATUS after FINISH_PHASE_1...");
-            ObjectNode phaseOneStatusRequest =
-                    buildStatusRequest(
-                            uid,
-                            datasetKey,
-                            streamId
-                    );
+            long phaseOneStatusStartNanos = tic();
+            ObjectNode phaseOneStatusRequest = buildStatusRequest(uid, datasetKey, streamId);
 
             sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneStatusRequest);
             producer.flush();
@@ -293,68 +309,58 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
             System.out.println();
 
-            JsonNode phaseOneStatusEnvelope =
-                    waitForResponseContaining(
-                            consumer,
-                            uid,
-                            "PHASE_2",
-                            120000L
-                    );
+            JsonNode phaseOneStatusEnvelope = waitForResponseContaining(consumer, uid, "PHASE_2",
+                            120000L);
 
             System.out.println("PHASE_1 STATUS envelope:");
             printPayloadSummary(extractEstimationPayload(phaseOneStatusEnvelope));
             System.out.println();
 
-            JsonNode phaseOneStatusPayload =
-                    extractEstimationPayload(phaseOneStatusEnvelope);
+            JsonNode phaseOneStatusPayload = extractEstimationPayload(phaseOneStatusEnvelope);
+
+            recordDuration("phase1_status", phaseOneStatusStartNanos);
+            recordDetailedDuration("phase1_status_detail", phaseOneStatusStartNanos);
 
             validatePhaseOneTransition(phaseOneStatusPayload, plan);
 
             if (EXPORT_PHASE1_FULL_INDEXES) {
                 System.out.println("4b. Requesting full Phase 1 indexes from temporary debug synopsis...");
+                long phaseOneDebugExportStartNanos = tic();
 
-                ObjectNode phaseOneDebugEstimateRequest =
-                        buildPhaseOneDebugEstimateRequest(
-                                phaseOneDebugUid,
-                                datasetKey,
-                                streamId
-                        );
+                ObjectNode phaseOneDebugEstimateRequest = buildPhaseOneDebugEstimateRequest(
+                                phaseOneDebugUid, datasetKey, streamId);
 
                 sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneDebugEstimateRequest);
                 producer.flush();
 
-                System.out.println(
-                        MAPPER.writerWithDefaultPrettyPrinter()
-                                .writeValueAsString(phaseOneDebugEstimateRequest)
-                );
+                System.out.println(MAPPER.writerWithDefaultPrettyPrinter().
+                        writeValueAsString(phaseOneDebugEstimateRequest));
                 System.out.println();
 
-                JsonNode phaseOneFullIndexes =
-                        waitForPhaseOneDebugResult(
-                                consumer,
-                                phaseOneDebugUid,
-                                plan.getQueryName(),
-                                120000L
-                        );
+                JsonNode phaseOneFullIndexes = waitForPhaseOneDebugResult(consumer, phaseOneDebugUid,
+                        plan.getQueryName(), 120000L);
 
                 validateFullIndexPayload(phaseOneFullIndexes);
                 writePhaseOneFullIndexFile(phaseOneFullIndexes, plan.getQueryName());
+                recordDetailedDuration("phase1_debug_full_index_export", phaseOneDebugExportStartNanos);
             }
 
+            long phaseTwoStreamStartNanos = tic(); //TIMING PHASE2
             System.out.println("5. Streaming PHASE_2 root alias...");
             long rootRows = streamAlias(
-                            producer,
-                            DATA_TOPIC,
-                            datasetKey,
-                            streamId,
-                            catalog,
-                            plan,
-                            plan.getRootAlias(),
-                            TEST_ROW_LIMIT,
-                            "PHASE2",
-                            expectedWeightEvaluator);
+                    producer,
+                    DATA_TOPIC,
+                    datasetKey,
+                    streamId,
+                    catalog,
+                    plan,
+                    plan.getRootAlias(),
+                    TEST_ROW_LIMIT,
+                    "PHASE2",
+                    expectedWeightEvaluator);
 
             producer.flush();
+            recordDuration("phase2_root_stream_send", phaseTwoStreamStartNanos);//TIMING PHASE2 END
 
             System.out.println("PHASE_2 root alias " + plan.getRootAlias() + " rows: " + rootRows);
             System.out.println();
@@ -363,11 +369,16 @@ public final class OnePassSamplerSdeSynopsisTest {
              * Temporary barrier.
              */
             System.out.println("Waiting for SDE to consume PHASE_2 tuples...");
+            long phaseTwoBarrierStartNanos = tic();
             Thread.sleep(10000L);
+            recordDuration("total_artificial_wait", phaseTwoBarrierStartNanos);
+            recordDetailedDuration("phase2_barrier_sleep", phaseTwoBarrierStartNanos);
 
             System.out.println("6. Sending FINISH_PHASE_2 request...");
+            long phaseTwoFinishAckStartNanos = tic();
+
             ObjectNode finishPhaseTwoRequest = buildControlRequest(uid, datasetKey, streamId,
-                            COMMAND_FINISH_PHASE_2);
+                    COMMAND_FINISH_PHASE_2);
 
             sendJson(producer, REQUEST_TOPIC, datasetKey, finishPhaseTwoRequest);
             producer.flush();
@@ -377,43 +388,28 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             System.out.println("7. Waiting for FINISH_PHASE_2 ACK...");
             JsonNode phaseTwoAck =
-                    waitForResponseContaining(
-                            consumer,
-                            uid,
-                            COMMAND_FINISH_PHASE_2,
-                            120000L
-                    );
+                    waitForResponseContaining(consumer, uid, COMMAND_FINISH_PHASE_2, 120000L);
 
             System.out.println("FINISH_PHASE_2 ACK envelope:");
             System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(phaseTwoAck));
             System.out.println();
 
             validateControlAck(phaseTwoAck, COMMAND_FINISH_PHASE_2);
+            recordDuration("phase2_finish_ack", phaseTwoFinishAckStartNanos);
+            recordDetailedDuration("phase2_finish_ack_detail", phaseTwoFinishAckStartNanos);
 
             System.out.println("7a. Requesting OnePassSamplerSdeSynopsis STATUS after FINISH_PHASE_2...");
-            ObjectNode phaseTwoStatusRequest =
-                    buildStatusRequest(
-                            uid,
-                            datasetKey,
-                            streamId
-                    );
+            long phaseTwoStatusStartNanos = tic();
+            ObjectNode phaseTwoStatusRequest = buildStatusRequest(uid, datasetKey, streamId);
 
             sendJson(producer, REQUEST_TOPIC, datasetKey, phaseTwoStatusRequest);
             producer.flush();
 
-            System.out.println(
-                    MAPPER.writerWithDefaultPrettyPrinter()
-                            .writeValueAsString(phaseTwoStatusRequest)
-            );
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(phaseTwoStatusRequest));
             System.out.println();
 
             JsonNode phaseTwoStatusEnvelope =
-                    waitForResponseContaining(
-                            consumer,
-                            uid,
-                            "PHASE_3",
-                            120000L
-                    );
+                    waitForResponseContaining(consumer, uid, "PHASE_3", 120000L);
 
             System.out.println("PHASE_2 STATUS envelope:");
             printPayloadSummary(extractEstimationPayload(phaseTwoStatusEnvelope));
@@ -421,6 +417,9 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             JsonNode phaseTwoStatusPayload =
                     extractEstimationPayload(phaseTwoStatusEnvelope);
+
+            recordDuration("phase2_status", phaseTwoStatusStartNanos);
+            recordDetailedDuration("phase2_status_detail", phaseTwoStatusStartNanos);
 
             validatePhaseTwoTransitionToPhaseThree(
                     phaseTwoStatusPayload,
@@ -432,9 +431,16 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             /*
              * Phase 3.
-             *
              * Replay side aliases in root-to-leaf order, skipping the root.
+             *
+             * Timing is split into:
+             *   - start control + ACK
+             *   - stream/send only
+             *   - artificial barrier sleep
+             *   - finish control + ACK
+             *   - total alias wall-clock time
              */
+            long phaseThreeReplayStartNanos = tic();
             System.out.println("8. Streaming PHASE_3 side aliases in root-to-leaf order...");
 
             for (String alias : plan.getRootToLeafOrder()) {
@@ -442,73 +448,75 @@ public final class OnePassSamplerSdeSynopsisTest {
                     continue;
                 }
 
+                long phaseThreeAliasTotalStartNanos = tic();
+
                 System.out.println("8a. Starting PHASE_3 alias: " + alias);
 
-                ObjectNode startAliasRequest =
-                        buildStartPhaseThreeAliasRequest(
-                                uid,
-                                datasetKey,
-                                streamId,
-                                alias
-                        );
+                long phaseThreeAliasStartControlStartNanos = tic();
+
+                ObjectNode startAliasRequest = buildStartPhaseThreeAliasRequest(uid, datasetKey, streamId, alias);
 
                 sendJson(producer, REQUEST_TOPIC, datasetKey, startAliasRequest);
                 producer.flush();
 
-                System.out.println(
-                        MAPPER.writerWithDefaultPrettyPrinter()
-                                .writeValueAsString(startAliasRequest)
-                );
+                System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(startAliasRequest));
                 System.out.println();
 
-                JsonNode startAliasAck =
-                        waitForResponseContaining(
-                                consumer,
-                                uid,
-                                COMMAND_START_PHASE_3_ALIAS,
-                                120000L
-                        );
+                JsonNode startAliasAck = waitForResponseContaining(consumer, uid,
+                        COMMAND_START_PHASE_3_ALIAS, 120000L);
+
+                recordDuration("phase3_control_ack_total", phaseThreeAliasStartControlStartNanos);
+                recordDetailedDuration("phase3_alias_" + alias + "_start_ack", phaseThreeAliasStartControlStartNanos);
 
                 System.out.println("START_PHASE_3_ALIAS ACK envelope:");
-                System.out.println(
-                        MAPPER.writerWithDefaultPrettyPrinter()
-                                .writeValueAsString(startAliasAck)
-                );
+                System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(startAliasAck));
                 System.out.println();
 
                 validateControlAck(startAliasAck, COMMAND_START_PHASE_3_ALIAS);
 
                 System.out.println("8b. Streaming PHASE_3 alias " + alias + "...");
 
-                long phaseThreeAliasRows =
-                        streamAlias(
-                                producer,
-                                DATA_TOPIC,
-                                datasetKey,
-                                streamId,
-                                catalog,
-                                plan,
-                                alias,
-                                TEST_ROW_LIMIT,
-                                null,
-                                expectedWeightEvaluator
-                        );
+                long phaseThreeAliasStreamStartNanos = tic();
+
+                long phaseThreeAliasRows = streamAlias(
+                        producer,
+                        DATA_TOPIC,
+                        datasetKey,
+                        streamId,
+                        catalog,
+                        plan,
+                        alias,
+                        TEST_ROW_LIMIT,
+                        null,
+                        expectedWeightEvaluator);
 
                 producer.flush();
+
+                recordDuration("phase3_side_stream_send_total", phaseThreeAliasStreamStartNanos);
+                recordDetailedDuration("phase3_alias_" + alias + "_stream_send", phaseThreeAliasStreamStartNanos);
 
                 System.out.println("PHASE_3 alias " + alias + " rows: " + phaseThreeAliasRows);
                 System.out.println();
 
                 /*
                  * Temporary barrier before finishing this Phase 3 alias.
+                 * Keep it timed separately so it does not pollute stream/algorithm timing.
                  */
                 System.out.println("Waiting for SDE to consume PHASE_3 alias " + alias + " tuples...");
+
+                long phaseThreeAliasBarrierStartNanos = tic();
+
                 Thread.sleep(10000L);
+
+                recordDuration("total_artificial_wait", phaseThreeAliasBarrierStartNanos);
+                recordDetailedDuration("phase3_alias_" + alias + "_barrier_sleep", phaseThreeAliasBarrierStartNanos);
 
                 System.out.println("8c. Finishing PHASE_3 alias: " + alias);
 
+                long phaseThreeAliasFinishControlStartNanos = tic();
+
                 ObjectNode finishAliasRequest = buildControlRequest(uid, datasetKey, streamId,
-                                COMMAND_FINISH_PHASE_3_ALIAS);
+                        COMMAND_FINISH_PHASE_3_ALIAS);
 
                 sendJson(producer, REQUEST_TOPIC, datasetKey, finishAliasRequest);
                 producer.flush();
@@ -516,11 +524,11 @@ public final class OnePassSamplerSdeSynopsisTest {
                 System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(finishAliasRequest));
                 System.out.println();
 
-                JsonNode finishAliasAck = waitForResponseContaining(
-                                consumer,
-                                uid,
-                                COMMAND_FINISH_PHASE_3_ALIAS,
-                                120000L);
+                JsonNode finishAliasAck = waitForResponseContaining(consumer, uid,
+                        COMMAND_FINISH_PHASE_3_ALIAS, 120000L);
+
+                recordDuration("phase3_control_ack_total", phaseThreeAliasFinishControlStartNanos);
+                recordDetailedDuration("phase3_alias_" + alias + "_finish_ack", phaseThreeAliasFinishControlStartNanos);
 
                 System.out.println("FINISH_PHASE_3_ALIAS ACK envelope:");
                 System.out.println(
@@ -530,25 +538,21 @@ public final class OnePassSamplerSdeSynopsisTest {
                 System.out.println();
 
                 validateControlAck(finishAliasAck, COMMAND_FINISH_PHASE_3_ALIAS);
+
+                recordDetailedDuration("phase3_alias_" + alias + "_total", phaseThreeAliasTotalStartNanos);
             }
 
-            System.out.println("9. Sending FINISH_PHASE_3 request...");
+            recordDetailedDuration("phase3_side_replay_total", phaseThreeReplayStartNanos);//TIMING Phase3 END
 
-            ObjectNode finishPhaseThreeRequest =
-                    buildControlRequest(
-                            uid,
-                            datasetKey,
-                            streamId,
-                            COMMAND_FINISH_PHASE_3
-                    );
+            System.out.println("9. Sending FINISH_PHASE_3 request...");
+            long phaseThreeFinishAckStartNanos = tic();
+
+            ObjectNode finishPhaseThreeRequest = buildControlRequest(uid, datasetKey, streamId, COMMAND_FINISH_PHASE_3);
 
             sendJson(producer, REQUEST_TOPIC, datasetKey, finishPhaseThreeRequest);
             producer.flush();
 
-            System.out.println(
-                    MAPPER.writerWithDefaultPrettyPrinter()
-                            .writeValueAsString(finishPhaseThreeRequest)
-            );
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(finishPhaseThreeRequest));
             System.out.println();
 
             System.out.println("10. Waiting for FINISH_PHASE_3 ACK...");
@@ -568,8 +572,11 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println();
 
             validateControlAck(phaseThreeAck, COMMAND_FINISH_PHASE_3);
+            recordDuration("phase3_finish_ack", phaseThreeFinishAckStartNanos);
+            recordDetailedDuration("phase3_finish_ack_detail", phaseThreeFinishAckStartNanos);
 
             System.out.println("10a. Requesting OnePassSamplerSdeSynopsis STATUS after FINISH_PHASE_3...");
+            long phaseThreeStatusStartNanos = tic();
             ObjectNode phaseThreeStatusRequest =
                     buildStatusRequest(
                             uid,
@@ -580,19 +587,11 @@ public final class OnePassSamplerSdeSynopsisTest {
             sendJson(producer, REQUEST_TOPIC, datasetKey, phaseThreeStatusRequest);
             producer.flush();
 
-            System.out.println(
-                    MAPPER.writerWithDefaultPrettyPrinter()
-                            .writeValueAsString(phaseThreeStatusRequest)
-            );
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(phaseThreeStatusRequest));
             System.out.println();
 
-            JsonNode phaseThreeStatusEnvelope =
-                    waitForResponseContaining(
-                            consumer,
-                            uid,
-                            "phaseThreeComplete",
-                            120000L
-                    );
+            JsonNode phaseThreeStatusEnvelope = waitForResponseContaining(consumer, uid,
+                    "phaseThreeComplete", 120000L);
 
             System.out.println("PHASE_3 STATUS envelope:");
             printPayloadSummary(extractEstimationPayload(phaseThreeStatusEnvelope));
@@ -601,11 +600,21 @@ public final class OnePassSamplerSdeSynopsisTest {
             JsonNode phaseThreeStatusPayload =
                     extractEstimationPayload(phaseThreeStatusEnvelope);
 
+            recordDuration("phase3_status", phaseThreeStatusStartNanos);
+            recordDetailedDuration("phase3_status_detail", phaseThreeStatusStartNanos);
+
+            long phaseThreeValidationStartNanos = tic();
+
             validatePhaseThreeResult(
                     phaseThreeStatusPayload,
                     phaseTwoStatusPayload,
                     plan
             );
+
+            recordDetailedDuration("phase3_validation", phaseThreeValidationStartNanos);
+
+            recordDuration("total_end_to_end_observed", totalStartNanos);
+            printBenchmarkSummary(plan);
 
             System.out.println();
             System.out.println("SUCCESS: OnePassSamplerSdeSynopsis SDE Phase 1/2/3 test passed.");
@@ -1153,31 +1162,43 @@ public final class OnePassSamplerSdeSynopsisTest {
             }
         }
 
+        JsonNode sampleInstancesIncludedNode = findFirst(payload, "sampleInstancesIncluded");
+
+        boolean sampleInstancesIncluded =
+                sampleInstancesIncludedNode == null || sampleInstancesIncludedNode.asBoolean();
+
+        JsonNode sampleInstanceCountNode =
+                findFirst(payload, "sampleInstanceCount");
+
+        if (sampleInstanceCountNode != null) {
+            if (sampleInstanceCountNode.asInt() != expectedSampleSize) {
+                throw new IllegalStateException("Expected sampleInstanceCount = " + expectedSampleSize + ", got " +
+                                sampleInstanceCountNode.asInt());
+            }
+        }
+
         JsonNode sampleInstances = findFirst(payload, "sampleInstances");
 
         if (sampleInstances == null || !sampleInstances.isArray()) {
-            throw new IllegalStateException(
-                    "Expected sampleInstances array, got: "
-                            + sampleInstances
-            );
+            throw new IllegalStateException("Expected sampleInstances array, got: " + sampleInstances);
         }
 
-        if (sampleInstances.size() != expectedSampleSize) {
-            throw new IllegalStateException(
-                    "Expected sampleInstances.size() = "
-                            + expectedSampleSize
-                            + ", got "
-                            + sampleInstances.size()
-            );
+        if (sampleInstancesIncluded) {
+            if (sampleInstances.size() != expectedSampleSize) {
+                throw new IllegalStateException(
+                        "Expected sampleInstances.size() = " + expectedSampleSize + ", got " + sampleInstances.size());
+            }
+        } else {
+            System.out.println("Validated compact FINISH_PHASE_2 payload: sampleInstanceCount=" + expectedSampleSize
+                            + ". Full sampleInstances omitted from status because sample size is large.");
         }
 
         /*
          * This special duplicate-root check only makes sense in exact
          * small-test mode, because it depends on expectedPositiveCandidates.
          */
-        if (RUN_EXACT_EXPECTED_VALIDATION
-                && expectedPositiveCandidates == 1L
-                && sampleInstances.size() > 1) {
+        if (sampleInstancesIncluded && RUN_EXACT_EXPECTED_VALIDATION && expectedPositiveCandidates == 1L &&
+                sampleInstances.size() > 1) {
 
             JsonNode firstSource = sampleInstances.get(0).get("sourceCandidateId");
 
@@ -1233,10 +1254,44 @@ public final class OnePassSamplerSdeSynopsisTest {
         JsonNode completedSamples = findFirst(phaseThreePayload, "completedSamples");
 
         if (completedSamples == null || !completedSamples.isArray()) {
+            throw new IllegalStateException("Expected completedSamples array, got: " + completedSamples);
+        }
+
+        JsonNode completedSamplesIncludedNode = findFirst(phaseThreePayload, "completedSamplesIncluded");
+
+        boolean completedSamplesIncluded = completedSamplesIncludedNode == null ||
+                completedSamplesIncludedNode.asBoolean();
+
+        JsonNode phaseTwoSampleInstances = findFirst(phaseTwoPayload, "sampleInstances");
+
+        JsonNode phaseTwoSampleInstanceCountNode = findFirst(phaseTwoPayload, "sampleInstanceCount");
+
+        int expectedPhaseTwoSampleCount;
+
+        if (phaseTwoSampleInstanceCountNode != null) {
+            expectedPhaseTwoSampleCount = phaseTwoSampleInstanceCountNode.asInt();
+        } else if (phaseTwoSampleInstances != null && phaseTwoSampleInstances.isArray()) {
+            expectedPhaseTwoSampleCount = phaseTwoSampleInstances.size();
+        } else {
             throw new IllegalStateException(
-                    "Expected completedSamples array, got: "
-                            + completedSamples
-            );
+                    "Could not find Phase 2 sampleInstances or sampleInstanceCount for Phase 3 validation");
+        }
+
+        if (completedSampleCount.asInt() != expectedPhaseTwoSampleCount) {
+            throw new IllegalStateException("Phase 3 completed sample count does not match Phase 2 sample count. " +
+                    "completedSampleCount=" + completedSampleCount.asInt() + ", Phase 2 sample count=" +
+                    expectedPhaseTwoSampleCount);
+        }
+
+        boolean phaseTwoSamplesAvailable = phaseTwoSampleInstances != null && phaseTwoSampleInstances.isArray()
+                        && phaseTwoSampleInstances.size() == expectedPhaseTwoSampleCount;
+
+        if (!completedSamplesIncluded) {
+            System.out.println(
+                    "Validated compact FINISH_PHASE_3 payload: completedSampleCount="
+                            + completedSampleCount.asInt()
+                            + ". Full completedSamples omitted from status because sample size is large.");
+            return;
         }
 
         if (completedSampleCount.asInt() != completedSamples.size()) {
@@ -1248,37 +1303,33 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        JsonNode phaseTwoSampleInstances = findFirst(phaseTwoPayload, "sampleInstances");
-
-        if (phaseTwoSampleInstances == null || !phaseTwoSampleInstances.isArray()) {
+        if (completedSamples.size() != expectedPhaseTwoSampleCount) {
             throw new IllegalStateException(
-                    "Could not find Phase 2 sampleInstances for Phase 3 validation"
-            );
-        }
-
-        if (completedSamples.size() != phaseTwoSampleInstances.size()) {
-            throw new IllegalStateException(
-                    "Phase 3 completed sample count does not match Phase 2 sample instance count. "
+                    "Phase 3 completed sample count does not match Phase 2 sample count. "
                             + "Phase 3 completedSamples.size()="
                             + completedSamples.size()
-                            + ", Phase 2 sampleInstances.size()="
-                            + phaseTwoSampleInstances.size()
+                            + ", Phase 2 sample count="
+                            + expectedPhaseTwoSampleCount
             );
         }
 
-        Set<Long> phaseTwoSampleIds =
-                collectSampleIds(phaseTwoSampleInstances);
+        if (phaseTwoSamplesAvailable) {
+            Set<Long> phaseTwoSampleIds = collectSampleIds(phaseTwoSampleInstances);
 
-        Set<Long> phaseThreeSampleIds =
-                collectSampleIds(completedSamples);
+            Set<Long> phaseThreeSampleIds = collectSampleIds(completedSamples);
 
-        if (!phaseTwoSampleIds.equals(phaseThreeSampleIds)) {
-            throw new IllegalStateException(
-                    "Phase 3 sample ids do not match Phase 2 sample ids. "
-                            + "Phase 2 ids="
-                            + phaseTwoSampleIds
-                            + ", Phase 3 ids="
-                            + phaseThreeSampleIds
+            if (!phaseTwoSampleIds.equals(phaseThreeSampleIds)) {
+                throw new IllegalStateException(
+                        "Phase 3 sample ids do not match Phase 2 sample ids. "
+                                + "Phase 2 ids="
+                                + phaseTwoSampleIds
+                                + ", Phase 3 ids="
+                                + phaseThreeSampleIds
+                );
+            }
+        } else {
+            System.out.println(
+                    "Skipping exact Phase 2/Phase 3 sample-id equality check because Phase 2 sampleInstances were compacted."
             );
         }
 
@@ -2289,5 +2340,95 @@ public final class OnePassSamplerSdeSynopsisTest {
 
     private static String arraySizeOrNull(JsonNode node) {
         return node == null || !node.isArray() ? "null" : Integer.toString(node.size());
+    }
+
+    private static long tic() {
+        return System.nanoTime();
+    }
+
+    private static void recordDuration(String label, long startNanos) {
+        long elapsed = System.nanoTime() - startNanos;
+
+        benchmarkNanos.merge(label, elapsed, Long::sum);
+    }
+
+    private static void recordDetailedDuration(String label, long startNanos) {
+        if (PRINT_DETAILED_BENCHMARK_TIMINGS) {
+            recordDuration(label, startNanos);
+        }
+    }
+
+    private static long nanosFor(String label) {
+        Long value = benchmarkNanos.get(label);
+        return value == null ? 0L : value;
+    }
+
+    private static double secondsFor(String label) {
+        return nanosFor(label) / 1_000_000_000.0d;
+    }
+
+    private static void printTimingLine(String label, double seconds) {
+        System.out.printf(
+                "%-45s %12.3f s%n",
+                label,
+                seconds
+        );
+    }
+
+    private static void printBenchmarkSummary(CompiledOnePassPlan plan) {
+        double phase1Stream = secondsFor("phase1_stream_send");
+        double phase2Stream = secondsFor("phase2_root_stream_send");
+        double phase3Stream = secondsFor("phase3_side_stream_send_total");
+        double dataStreamTotal = phase1Stream + phase2Stream + phase3Stream;
+
+        double phase1ControlStatus = secondsFor("phase1_finish_ack") + secondsFor("phase1_status");
+
+        double phase2ControlStatus = secondsFor("phase2_finish_ack") + secondsFor("phase2_status");
+
+        double phase3ControlStatus = secondsFor("phase3_control_ack_total") +
+                secondsFor("phase3_finish_ack") + secondsFor("phase3_status");
+
+        double controlStatusTotal = phase1ControlStatus + phase2ControlStatus + phase3ControlStatus;
+
+        double observedEndToEnd = secondsFor("total_end_to_end_observed");
+
+        double adjustedEndToEnd = observedEndToEnd - secondsFor("total_artificial_wait");
+
+        if (adjustedEndToEnd < 0.0d) {
+            adjustedEndToEnd = 0.0d;
+        }
+
+        System.out.println();
+        System.out.println("=== OnePass comparison benchmark ===");
+        System.out.println("TEST_ROW_LIMIT:            " + formatRowLimit(TEST_ROW_LIMIT));
+        System.out.println("phase2_sample_count_LIMIT: " + plan.getSampleSize());
+        printTimingLine("phase1_stream_send", phase1Stream);
+        printTimingLine("phase2_root_stream_send", phase2Stream);
+        printTimingLine("phase3_side_stream_send_total", phase3Stream);
+        printTimingLine("data_stream_send_total", dataStreamTotal);
+        printTimingLine("control_status_total", controlStatusTotal);
+        printTimingLine("adjusted_end_to_end_no_artificial_wait", adjustedEndToEnd);
+        printTimingLine("observed_end_to_end_with_test_waits", observedEndToEnd);
+        System.out.println("====================================");
+        System.out.println();
+
+        if (PRINT_DETAILED_BENCHMARK_TIMINGS) {
+            System.out.println("=== Detailed OnePass benchmark timings ===");
+
+            for (Map.Entry<String, Long> entry : benchmarkNanos.entrySet()) {
+                printTimingLine(entry.getKey(), entry.getValue() / 1_000_000_000.0d);
+            }
+
+            System.out.println("===========================================");
+            System.out.println();
+        }
+    }
+
+    private static String formatRowLimit(long rowLimit) {
+        if (rowLimit < 0L) {
+            return "FULL";
+        }
+
+        return Long.toString(rowLimit);
     }
 }
