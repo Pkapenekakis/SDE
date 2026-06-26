@@ -61,6 +61,9 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
     private final CompiledOnePassPlan plan;
     private final OnePassSamplerSynopsis lifecycle;
 
+    private static final int FULL_COMPLETED_SAMPLES_STATUS_LIMIT = 200;
+    private static final int COMPLETED_SAMPLES_PREVIEW_LIMIT = 5;
+
     public OnePassSamplerSdeSynopsis(int uid, Request request) {
         super(uid, "-1", "-1");
 
@@ -350,23 +353,50 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         OnePassRootSampleResult phaseTwoResult = lifecycle.getPhaseTwoResult();
 
         if (phaseTwoResult != null) {
+            int sampleInstanceCount = phaseTwoResult.getSampleInstances().size();
+
             out.put("phaseTwoComplete", true);
 
             out.put("rootTuplesSeen", phaseTwoResult.getRootTuplesSeen());
             out.put("positiveRootCandidatesSeen", phaseTwoResult.getPositiveRootCandidatesSeen());
             out.put("totalRootGroupWeight", phaseTwoResult.getTotalRootGroupWeight());
 
-            /*
-             * This is safe because buildStatusJson() serializes it to String
-             * before Flink/Kryo sees the Estimation payload.
-             */
-            out.put("sampleInstances", new ArrayList(phaseTwoResult.getSampleInstances()));
+            out.put("sampleInstanceCount", sampleInstanceCount);
+            out.put("requestedPhaseTwoSampleSize", phaseTwoResult.getRequestedSampleSize());
+
+            boolean includeFullSampleInstances = sampleInstanceCount <= FULL_COMPLETED_SAMPLES_STATUS_LIMIT;
+
+            out.put("sampleInstancesIncluded", includeFullSampleInstances);
+            out.put("sampleInstancesTruncated", !includeFullSampleInstances);
+
+            if (includeFullSampleInstances) {
+                out.put("sampleInstances", new ArrayList(phaseTwoResult.getSampleInstances()));
+                out.put("sampleInstancesPreview", new ArrayList());
+            } else {
+                /*
+                 * Benchmark / large-sample mode:
+                 * Do not send thousands of full root sample tuples through Kafka.
+                 * Keep the exact count and a tiny preview only.
+                 */
+                out.put("sampleInstances", new ArrayList());
+
+                int previewSize = Math.min(COMPLETED_SAMPLES_PREVIEW_LIMIT, sampleInstanceCount);
+
+                out.put("sampleInstancesPreview", new ArrayList(phaseTwoResult.getSampleInstances()
+                                        .subList(0, previewSize)));
+            }
         } else {
             out.put("phaseTwoComplete", false);
             out.put("rootTuplesSeen", 0L);
             out.put("positiveRootCandidatesSeen", 0L);
             out.put("totalRootGroupWeight", 0.0d);
+
+            out.put("sampleInstanceCount", 0);
+            out.put("requestedPhaseTwoSampleSize", plan.getSampleSize());
+            out.put("sampleInstancesIncluded", true);
+            out.put("sampleInstancesTruncated", false);
             out.put("sampleInstances", new ArrayList());
+            out.put("sampleInstancesPreview", new ArrayList());
         }
 
         OnePassPhaseThreeResult phaseThreeResult = lifecycle.getPhaseThreeResult();
@@ -375,26 +405,43 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         out.put("phaseThreeActiveAlias", lifecycle.getPhaseThreeActiveAlias());
 
         if (phaseThreeResult != null) {
-            out.put("phaseThreeComplete", true);
+            int completedCount = phaseThreeResult.getCompletedSamples().size();
 
-            out.put("completedSampleCount", phaseThreeResult.getCompletedSamples().size());
+            out.put("phaseThreeComplete", true);
+            out.put("completedSampleCount", completedCount);
             out.put("requestedPhaseThreeSampleSize", phaseThreeResult.getRequestedSampleSize());
 
-            /*
-             * Safe because buildStatusJson() serializes the payload to a String
-             * before it enters the SDE Estimation object.
-             *
-             * Keep this for tests. Later, if output becomes too large, replace this
-             * with projected samples or a sample preview.
-             */
-            out.put("completedSamples", new ArrayList(phaseThreeResult.getCompletedSamples()));
+            boolean includeFullCompletedSamples = completedCount <= FULL_COMPLETED_SAMPLES_STATUS_LIMIT;
+
+            out.put("completedSamplesIncluded", includeFullCompletedSamples);
+            out.put("completedSamplesTruncated", !includeFullCompletedSamples);
+
+            if (includeFullCompletedSamples) {
+                out.put("completedSamples", new ArrayList(phaseThreeResult.getCompletedSamples()));
+                out.put("completedSamplesPreview", new ArrayList());
+            } else {
+                /*
+                 * Benchmark mode:
+                 * Do not send thousands of full joined samples through Kafka.
+                 * Keep only a tiny preview for debugging and keep the count exact.
+                 */
+                out.put("completedSamples", new ArrayList());
+
+                int previewSize = Math.min(COMPLETED_SAMPLES_PREVIEW_LIMIT, completedCount);
+
+                out.put(
+                        "completedSamplesPreview",
+                        new ArrayList(phaseThreeResult.getCompletedSamples().subList(0, previewSize)));
+            }
         } else {
             out.put("phaseThreeComplete", false);
             out.put("completedSampleCount", 0);
             out.put("requestedPhaseThreeSampleSize", plan.getSampleSize());
+            out.put("completedSamplesIncluded", true);
+            out.put("completedSamplesTruncated", false);
             out.put("completedSamples", new ArrayList());
+            out.put("completedSamplesPreview", new ArrayList());
         }
-
         return out;
     }
 
