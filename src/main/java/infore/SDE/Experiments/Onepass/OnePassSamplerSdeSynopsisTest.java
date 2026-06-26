@@ -81,10 +81,15 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final String TEST_TPCH_DIR =
             "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
 
+    //private static final String TEST_ONEPASS_SQL =
+    //        "SELECT * FROM wq3_alias WEIGHTED BY (o.o_totalprice * " +
+    //                "(l.l_extendedprice * (1 - l.l_discount))) LIMIT 100 " +
+    //               "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+
     private static final String TEST_ONEPASS_SQL =
-            "SELECT * FROM wq3_alias WEIGHTED BY (o.o_totalprice * " +
-                    "(l.l_extendedprice * (1 - l.l_discount))) LIMIT 100 " +
-                    "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+            "SELECT * FROM w_two_lineitems WEIGHTED BY ("+
+                    "o.o_totalprice * l1.l_extendedprice * (4 - l2.l_discount))" +
+                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     /*
      * Use 5000 first while testing wiring.
@@ -93,7 +98,7 @@ public final class OnePassSamplerSdeSynopsisTest {
      * Important:
      * Phase 3 must replay the same side-stream subset that Phase 1 indexed.
      */
-    private static final long TEST_ROW_LIMIT = 5000L;
+    private static final long TEST_ROW_LIMIT = -1;
 
     private static final int SYNOPSIS_ID = 30;
     private static final int PHASE1_DEBUG_SYNOPSIS_ID = 31;
@@ -109,21 +114,11 @@ public final class OnePassSamplerSdeSynopsisTest {
 
     private static final boolean PRINT_FULL_KAFKA_RECORDS = false;
     private static final boolean PRINT_FULL_STATUS_PAYLOADS = false;
-    /*
-     * Keep this enabled while validating Phase 1 inside the combined
-     * OnePassSamplerSdeSynopsis lifecycle.
-     *
-     * The combined synopsis intentionally does not send full Phase 1 indexes
-     * in its status payload because those internal objects are heavy and may
-     * trigger Flink/Kryo serialization issues.
-     *
-     * Therefore, this test also creates a temporary synopsisID=31 Phase 1
-     * debug synopsis under the same dataset key. The same Phase 1 side tuples
-     * are delivered to both synopses. We then request debug-full-indexes from
-     * the Phase 1 debug synopsis and write the JSON file expected by the
-     * external Python validator.
-     */
-    private static final boolean EXPORT_PHASE1_FULL_INDEXES = true;
+
+    private static final long FULL_VALIDATION_MAX_ROW_LIMIT = 15000L;
+    private static final boolean RUN_EXACT_EXPECTED_VALIDATION =
+            TEST_ROW_LIMIT >= 0L && TEST_ROW_LIMIT <= FULL_VALIDATION_MAX_ROW_LIMIT;
+    private static final boolean EXPORT_PHASE1_FULL_INDEXES = RUN_EXACT_EXPECTED_VALIDATION;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -347,8 +342,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             }
 
             System.out.println("5. Streaming PHASE_2 root alias...");
-            long rootRows =
-                    streamAlias(
+            long rootRows = streamAlias(
                             producer,
                             DATA_TOPIC,
                             datasetKey,
@@ -358,13 +352,11 @@ public final class OnePassSamplerSdeSynopsisTest {
                             plan.getRootAlias(),
                             TEST_ROW_LIMIT,
                             "PHASE2",
-                            expectedWeightEvaluator
-                    );
+                            expectedWeightEvaluator);
 
             producer.flush();
 
-            System.out.println("PHASE_2 root alias " + plan.getRootAlias()
-                    + " rows: " + rootRows);
+            System.out.println("PHASE_2 root alias " + plan.getRootAlias() + " rows: " + rootRows);
             System.out.println();
 
             /*
@@ -374,13 +366,8 @@ public final class OnePassSamplerSdeSynopsisTest {
             Thread.sleep(10000L);
 
             System.out.println("6. Sending FINISH_PHASE_2 request...");
-            ObjectNode finishPhaseTwoRequest =
-                    buildControlRequest(
-                            uid,
-                            datasetKey,
-                            streamId,
-                            COMMAND_FINISH_PHASE_2
-                    );
+            ObjectNode finishPhaseTwoRequest = buildControlRequest(uid, datasetKey, streamId,
+                            COMMAND_FINISH_PHASE_2);
 
             sendJson(producer, REQUEST_TOPIC, datasetKey, finishPhaseTwoRequest);
             producer.flush();
@@ -509,8 +496,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
                 producer.flush();
 
-                System.out.println("PHASE_3 alias " + alias + " rows: "
-                        + phaseThreeAliasRows);
+                System.out.println("PHASE_3 alias " + alias + " rows: " + phaseThreeAliasRows);
                 System.out.println();
 
                 /*
@@ -521,30 +507,20 @@ public final class OnePassSamplerSdeSynopsisTest {
 
                 System.out.println("8c. Finishing PHASE_3 alias: " + alias);
 
-                ObjectNode finishAliasRequest =
-                        buildControlRequest(
-                                uid,
-                                datasetKey,
-                                streamId,
-                                COMMAND_FINISH_PHASE_3_ALIAS
-                        );
+                ObjectNode finishAliasRequest = buildControlRequest(uid, datasetKey, streamId,
+                                COMMAND_FINISH_PHASE_3_ALIAS);
 
                 sendJson(producer, REQUEST_TOPIC, datasetKey, finishAliasRequest);
                 producer.flush();
 
-                System.out.println(
-                        MAPPER.writerWithDefaultPrettyPrinter()
-                                .writeValueAsString(finishAliasRequest)
-                );
+                System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(finishAliasRequest));
                 System.out.println();
 
-                JsonNode finishAliasAck =
-                        waitForResponseContaining(
+                JsonNode finishAliasAck = waitForResponseContaining(
                                 consumer,
                                 uid,
                                 COMMAND_FINISH_PHASE_3_ALIAS,
-                                120000L
-                        );
+                                120000L);
 
                 System.out.println("FINISH_PHASE_3_ALIAS ACK envelope:");
                 System.out.println(
@@ -1099,49 +1075,31 @@ public final class OnePassSamplerSdeSynopsisTest {
         System.out.println("Validated FINISH_PHASE_1 transition payload.");
     }
 
-    private static void validatePhaseTwoTransitionToPhaseThree(JsonNode payload,
-                                                               int expectedSampleSize,
-                                                               long expectedRootRows,
-                                                               long expectedPositiveCandidates,
+    private static void validatePhaseTwoTransitionToPhaseThree(JsonNode payload, int expectedSampleSize,
+                                                               long expectedRootRows, long expectedPositiveCandidates,
                                                                double expectedTotalWeight) {
         JsonNode phaseNode = findFirst(payload, "phase");
 
         if (phaseNode == null || !"PHASE_3".equals(phaseNode.asText())) {
-            throw new IllegalStateException(
-                    "Expected phase PHASE_3 after FINISH_PHASE_2, got: "
-                            + phaseNode
-            );
+            throw new IllegalStateException("Expected phase PHASE_3 after FINISH_PHASE_2, got: " + phaseNode);
         }
 
         JsonNode phaseTwoComplete = findFirst(payload, "phaseTwoComplete");
 
         if (phaseTwoComplete == null || !phaseTwoComplete.asBoolean()) {
-            throw new IllegalStateException(
-                    "Expected phaseTwoComplete = true after FINISH_PHASE_2"
-            );
+            throw new IllegalStateException("Expected phaseTwoComplete = true after FINISH_PHASE_2");
         }
 
         JsonNode phaseThreeComplete = findFirst(payload, "phaseThreeComplete");
 
         if (phaseThreeComplete != null && phaseThreeComplete.asBoolean()) {
-            throw new IllegalStateException(
-                    "Expected phaseThreeComplete = false immediately after FINISH_PHASE_2"
-            );
+            throw new IllegalStateException("Expected phaseThreeComplete = false immediately after FINISH_PHASE_2");
         }
 
         JsonNode rootTuplesSeen = findFirst(payload, "rootTuplesSeen");
 
         if (rootTuplesSeen == null) {
             throw new IllegalStateException("Missing rootTuplesSeen");
-        }
-
-        if (rootTuplesSeen.asLong() != expectedRootRows) {
-            throw new IllegalStateException(
-                    "rootTuplesSeen mismatch. Expected "
-                            + expectedRootRows
-                            + " but got "
-                            + rootTuplesSeen.asLong()
-            );
         }
 
         JsonNode positiveRootCandidatesSeen =
@@ -1151,15 +1109,6 @@ public final class OnePassSamplerSdeSynopsisTest {
             throw new IllegalStateException("Missing positiveRootCandidatesSeen");
         }
 
-        if (positiveRootCandidatesSeen.asLong() != expectedPositiveCandidates) {
-            throw new IllegalStateException(
-                    "positiveRootCandidatesSeen mismatch. Expected "
-                            + expectedPositiveCandidates
-                            + " but got "
-                            + positiveRootCandidatesSeen.asLong()
-            );
-        }
-
         JsonNode totalRootGroupWeight =
                 findFirst(payload, "totalRootGroupWeight");
 
@@ -1167,11 +1116,42 @@ public final class OnePassSamplerSdeSynopsisTest {
             throw new IllegalStateException("Missing totalRootGroupWeight");
         }
 
-        assertClose(
-                "totalRootGroupWeight",
-                expectedTotalWeight,
-                totalRootGroupWeight.asDouble()
-        );
+        /*
+         * Small correctness mode:
+         *   compare exact expected values built by the test.
+         *
+         * Full-scale/runtime mode:
+         *   expected values are intentionally not built, so only check
+         *   that the real SDE payload is positive and structurally valid.
+         */
+        if (RUN_EXACT_EXPECTED_VALIDATION) {
+            if (rootTuplesSeen.asLong() != expectedRootRows) {
+                throw new IllegalStateException("rootTuplesSeen mismatch. Expected " +
+                        expectedRootRows + " but got " + rootTuplesSeen.asLong());
+            }
+
+            if (positiveRootCandidatesSeen.asLong() != expectedPositiveCandidates) {
+                throw new IllegalStateException("positiveRootCandidatesSeen mismatch. Expected " +
+                        expectedPositiveCandidates + " but got " + positiveRootCandidatesSeen.asLong());
+            }
+
+            assertClose("totalRootGroupWeight", expectedTotalWeight, totalRootGroupWeight.asDouble());
+        } else {
+            if (rootTuplesSeen.asLong() <= 0L) {
+                throw new IllegalStateException("Expected rootTuplesSeen > 0 in scale mode, got " +
+                        rootTuplesSeen.asLong());
+            }
+
+            if (positiveRootCandidatesSeen.asLong() <= 0L) {
+                throw new IllegalStateException("Expected positiveRootCandidatesSeen > 0 in scale mode, got " +
+                        positiveRootCandidatesSeen.asLong());
+            }
+
+            if (totalRootGroupWeight.asDouble() <= 0.0d) {
+                throw new IllegalStateException("Expected totalRootGroupWeight > 0 in scale mode, got " +
+                        totalRootGroupWeight.asDouble());
+            }
+        }
 
         JsonNode sampleInstances = findFirst(payload, "sampleInstances");
 
@@ -1182,8 +1162,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        if (expectedPositiveCandidates > 0L
-                && sampleInstances.size() != expectedSampleSize) {
+        if (sampleInstances.size() != expectedSampleSize) {
             throw new IllegalStateException(
                     "Expected sampleInstances.size() = "
                             + expectedSampleSize
@@ -1192,7 +1171,14 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
         }
 
-        if (expectedPositiveCandidates == 1L && sampleInstances.size() > 1) {
+        /*
+         * This special duplicate-root check only makes sense in exact
+         * small-test mode, because it depends on expectedPositiveCandidates.
+         */
+        if (RUN_EXACT_EXPECTED_VALIDATION
+                && expectedPositiveCandidates == 1L
+                && sampleInstances.size() > 1) {
+
             JsonNode firstSource = sampleInstances.get(0).get("sourceCandidateId");
 
             for (JsonNode sampleInstance : sampleInstances) {
@@ -1529,6 +1515,11 @@ public final class OnePassSamplerSdeSynopsisTest {
                                             OnePassWeightEvaluator expectedWeightEvaluator,
                                             ObjectNode tuple,
                                             String expectedUpdateMode) {
+
+        if (!RUN_EXACT_EXPECTED_VALIDATION) {
+            return;
+        }
+
         if (expectedUpdateMode == null) {
             return;
         }
