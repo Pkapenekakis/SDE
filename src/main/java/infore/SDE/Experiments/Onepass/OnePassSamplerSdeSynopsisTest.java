@@ -112,15 +112,6 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final String COMMAND_FINISH_PHASE_3_ALIAS = "FINISH_PHASE_3_ALIAS";
     private static final String COMMAND_FINISH_PHASE_3 = "FINISH_PHASE_3";
 
-    private static final boolean PRINT_FULL_KAFKA_RECORDS = false;
-    private static final boolean PRINT_FULL_STATUS_PAYLOADS = false;
-    private static final int FINAL_SAMPLE_PREVIEW_LIMIT = 5;
-
-    private static final long FULL_VALIDATION_MAX_ROW_LIMIT = 15000L;
-    private static final boolean RUN_EXACT_EXPECTED_VALIDATION =
-            TEST_ROW_LIMIT >= 0L && TEST_ROW_LIMIT <= FULL_VALIDATION_MAX_ROW_LIMIT;
-    private static final boolean EXPORT_PHASE1_FULL_INDEXES = RUN_EXACT_EXPECTED_VALIDATION;
-
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final Map<String, Map<String, Double>> expectedIndexesByEdge =
@@ -132,15 +123,21 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static long expectedPositiveRootCandidatesSeen = 0L;
     private static double expectedTotalRootGroupWeight = 0.0d;
 
+    //Debug Flags
+    private static final boolean PRINT_FULL_KAFKA_RECORDS = false;
+    private static final boolean PRINT_FULL_STATUS_PAYLOADS = false;
+    private static final int FINAL_SAMPLE_PREVIEW_LIMIT = 5;
+
+    private static final long FULL_VALIDATION_MAX_ROW_LIMIT = 15000L;
+    private static final boolean RUN_EXACT_EXPECTED_VALIDATION =
+            TEST_ROW_LIMIT >= 0L && TEST_ROW_LIMIT <= FULL_VALIDATION_MAX_ROW_LIMIT;
+    private static final boolean EXPORT_PHASE1_FULL_INDEXES = RUN_EXACT_EXPECTED_VALIDATION;
+
+    //Timing/Benchmark flags
     private static final Map<String, Long> benchmarkNanos = new LinkedHashMap<String, Long>();
-    /*
-     * Keep normal benchmark output compact for comparison with the original
-     * standalone One-pass* implementation.
-     *
-     * Set to true only when debugging the SDE/Kafka synchronization barriers
-     * or individual ACK/status waits.
-     */
     private static final boolean PRINT_DETAILED_BENCHMARK_TIMINGS = false;
+    private static final boolean WRITE_BENCHMARK_CSV = true;
+    private static final String BENCHMARK_CSV_PATH = "/home/vboxuser/Desktop/Thesis/onepass_sde_benchmark.csv";
 
     private OnePassSamplerSdeSynopsisTest() {
     }
@@ -617,6 +614,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
             recordDuration("total_end_to_end_observed", totalStartNanos);
             printBenchmarkSummary(plan);
+            writeBenchmarkCsv(plan, "SDE_KAFKA");
 
             System.out.println();
             System.out.println("SUCCESS: OnePassSamplerSdeSynopsis SDE Phase 1/2/3 test passed.");
@@ -2463,11 +2461,126 @@ public final class OnePassSamplerSdeSynopsisTest {
     }
 
     private static void printTimingLine(String label, double seconds) {
-        System.out.printf(
-                "%-45s %12.3f s%n",
-                label,
-                seconds
-        );
+        System.out.printf("%-45s %12.3f s%n", label, seconds);
+    }
+
+    private static void writeBenchmarkCsv(CompiledOnePassPlan plan, String implementation) throws Exception {
+        if (!WRITE_BENCHMARK_CSV) {
+            return;
+        }
+
+        double phase1Stream = secondsFor("phase1_stream_send");
+        double phase2Stream = secondsFor("phase2_root_stream_send");
+        double phase3Stream = secondsFor("phase3_side_stream_send_total");
+
+        double dataStreamTotal =
+                phase1Stream + phase2Stream + phase3Stream;
+
+        double phase1ControlStatus = secondsFor("phase1_finish_ack") + secondsFor("phase1_status");
+
+        double phase2ControlStatus = secondsFor("phase2_finish_ack") + secondsFor("phase2_status");
+
+        double phase3ControlStatus = secondsFor("phase3_control_ack_total") +
+                secondsFor("phase3_finish_ack") + secondsFor("phase3_status");
+
+        double controlStatusTotal = phase1ControlStatus + phase2ControlStatus + phase3ControlStatus;
+
+        double artificialWait =
+                secondsFor("total_artificial_wait");
+
+        double observedEndToEnd =
+                secondsFor("total_end_to_end_observed");
+
+        double adjustedEndToEnd =
+                observedEndToEnd - artificialWait;
+
+        if (adjustedEndToEnd < 0.0d) {
+            adjustedEndToEnd = 0.0d;
+        }
+
+        File csvFile = new File(BENCHMARK_CSV_PATH);
+        boolean writeHeader = !csvFile.exists() || csvFile.length() == 0L;
+
+        FileWriter writer = new FileWriter(csvFile, true);
+
+        try {
+            if (writeHeader) {
+                writer.write(
+                        "timestamp_ms,"
+                                + "implementation,"
+                                + "query_name,"
+                                + "seed,"
+                                + "test_row_limit,"
+                                + "sample_size_limit,"
+                                + "root_alias,"
+                                + "leaf_to_root_order,"
+                                + "root_to_leaf_order,"
+                                + "projection,"
+                                + "phase1_stream_send_s,"
+                                + "phase2_root_stream_send_s,"
+                                + "phase3_side_stream_send_total_s,"
+                                + "data_stream_send_total_s,"
+                                + "phase1_control_status_s,"
+                                + "phase2_control_status_s,"
+                                + "phase3_control_status_s,"
+                                + "control_status_total_s,"
+                                + "artificial_wait_s,"
+                                + "adjusted_end_to_end_no_artificial_wait_s,"
+                                + "observed_end_to_end_with_test_waits_s"
+                                + System.lineSeparator()
+                );
+            }
+
+            writer.write(
+                    Long.toString(System.currentTimeMillis())
+                            + "," + csv(implementation)
+                            + "," + csv(plan.getQueryName())
+                            + "," + csv(plan.getDatasetSeed())
+                            + "," + csv(formatRowLimit(TEST_ROW_LIMIT))
+                            + "," + plan.getSampleSize()
+                            + "," + csv(plan.getRootAlias())
+                            + "," + csv(String.valueOf(plan.getLeafToRootOrder()))
+                            + "," + csv(String.valueOf(plan.getRootToLeafOrder()))
+                            + "," + csv(String.valueOf(plan.getProjection()))
+                            + "," + doubleCsv(phase1Stream)
+                            + "," + doubleCsv(phase2Stream)
+                            + "," + doubleCsv(phase3Stream)
+                            + "," + doubleCsv(dataStreamTotal)
+                            + "," + doubleCsv(phase1ControlStatus)
+                            + "," + doubleCsv(phase2ControlStatus)
+                            + "," + doubleCsv(phase3ControlStatus)
+                            + "," + doubleCsv(controlStatusTotal)
+                            + "," + doubleCsv(artificialWait)
+                            + "," + doubleCsv(adjustedEndToEnd)
+                            + "," + doubleCsv(observedEndToEnd)
+                            + System.lineSeparator()
+            );
+        } finally {
+            writer.close();
+        }
+
+        System.out.println("Benchmark CSV appended to: " + csvFile.getAbsolutePath());
+    }
+
+    private static String doubleCsv(double value) {
+        return Double.toString(value);
+    }
+
+    private static String csv(String value) {
+        if (value == null) {
+            return "";
+        }
+        String escaped = value.replace("\"", "\"\"");
+
+        return "\"" + escaped + "\"";
+    }
+
+    private static String formatRowLimit(long rowLimit) {
+        if (rowLimit < 0L) {
+            return "FULL";
+        }
+
+        return Long.toString(rowLimit);
     }
 
     private static void printBenchmarkSummary(CompiledOnePassPlan plan) {
@@ -2517,13 +2630,5 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println("===========================================");
             System.out.println();
         }
-    }
-
-    private static String formatRowLimit(long rowLimit) {
-        if (rowLimit < 0L) {
-            return "FULL";
-        }
-
-        return Long.toString(rowLimit);
     }
 }
