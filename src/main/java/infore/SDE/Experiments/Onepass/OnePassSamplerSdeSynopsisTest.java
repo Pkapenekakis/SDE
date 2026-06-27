@@ -87,9 +87,9 @@ public final class OnePassSamplerSdeSynopsisTest {
     //               "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     private static final String TEST_ONEPASS_SQL =
-            "SELECT * FROM w_two_lineitems WEIGHTED BY ("+
+            "SELECT o.o_orderkey, l1.l_linenumber FROM w_two_lineitems WEIGHTED BY ("+
                     "o.o_totalprice * l1.l_extendedprice * (4 - l2.l_discount))" +
-                    "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     /*
      * Use 5000 first while testing wiring.
@@ -98,7 +98,7 @@ public final class OnePassSamplerSdeSynopsisTest {
      * Important:
      * Phase 3 must replay the same side-stream subset that Phase 1 indexed.
      */
-    private static final long TEST_ROW_LIMIT = 1000000;
+    private static final long TEST_ROW_LIMIT = 14000;
 
     private static final int SYNOPSIS_ID = 30;
     private static final int PHASE1_DEBUG_SYNOPSIS_ID = 31;
@@ -114,6 +114,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
     private static final boolean PRINT_FULL_KAFKA_RECORDS = false;
     private static final boolean PRINT_FULL_STATUS_PAYLOADS = false;
+    private static final int FINAL_SAMPLE_PREVIEW_LIMIT = 5;
 
     private static final long FULL_VALIDATION_MAX_ROW_LIMIT = 15000L;
     private static final boolean RUN_EXACT_EXPECTED_VALIDATION =
@@ -597,19 +598,20 @@ public final class OnePassSamplerSdeSynopsisTest {
             printPayloadSummary(extractEstimationPayload(phaseThreeStatusEnvelope));
             System.out.println();
 
-            JsonNode phaseThreeStatusPayload =
-                    extractEstimationPayload(phaseThreeStatusEnvelope);
+            JsonNode phaseThreeStatusPayload = extractEstimationPayload(phaseThreeStatusEnvelope);
 
             recordDuration("phase3_status", phaseThreeStatusStartNanos);
             recordDetailedDuration("phase3_status_detail", phaseThreeStatusStartNanos);
 
+            /*
+             * Print a few final SELECT-projected samples so we can manually inspect
+             * that projection is applied correctly.
+             */
+            printProjectedCompletedSamplesPreview(phaseThreeStatusPayload, FINAL_SAMPLE_PREVIEW_LIMIT);
+
             long phaseThreeValidationStartNanos = tic();
 
-            validatePhaseThreeResult(
-                    phaseThreeStatusPayload,
-                    phaseTwoStatusPayload,
-                    plan
-            );
+            validatePhaseThreeResult(phaseThreeStatusPayload, phaseTwoStatusPayload, plan);
 
             recordDetailedDuration("phase3_validation", phaseThreeValidationStartNanos);
 
@@ -1217,32 +1219,24 @@ public final class OnePassSamplerSdeSynopsisTest {
         System.out.println("Validated FINISH_PHASE_2 transition payload.");
     }
 
-    private static void validatePhaseThreeResult(JsonNode phaseThreePayload,
-                                                 JsonNode phaseTwoPayload,
+    private static void validatePhaseThreeResult(JsonNode phaseThreePayload, JsonNode phaseTwoPayload,
                                                  CompiledOnePassPlan plan) {
         JsonNode phaseNode = findFirst(phaseThreePayload, "phase");
 
         if (phaseNode == null || !"DONE".equals(phaseNode.asText())) {
-            throw new IllegalStateException(
-                    "Expected phase DONE after FINISH_PHASE_3, got: "
-                            + phaseNode
-            );
+            throw new IllegalStateException("Expected phase DONE after FINISH_PHASE_3, got: " + phaseNode);
         }
 
         JsonNode phaseTwoComplete = findFirst(phaseThreePayload, "phaseTwoComplete");
 
         if (phaseTwoComplete == null || !phaseTwoComplete.asBoolean()) {
-            throw new IllegalStateException(
-                    "Expected phaseTwoComplete = true after FINISH_PHASE_3"
-            );
+            throw new IllegalStateException("Expected phaseTwoComplete = true after FINISH_PHASE_3");
         }
 
         JsonNode phaseThreeComplete = findFirst(phaseThreePayload, "phaseThreeComplete");
 
         if (phaseThreeComplete == null || !phaseThreeComplete.asBoolean()) {
-            throw new IllegalStateException(
-                    "Expected phaseThreeComplete = true after FINISH_PHASE_3"
-            );
+            throw new IllegalStateException("Expected phaseThreeComplete = true after FINISH_PHASE_3");
         }
 
         JsonNode completedSampleCount = findFirst(phaseThreePayload, "completedSampleCount");
@@ -1250,6 +1244,8 @@ public final class OnePassSamplerSdeSynopsisTest {
         if (completedSampleCount == null) {
             throw new IllegalStateException("Missing completedSampleCount");
         }
+
+        validateProjectedCompletedSamplesIfPresent(phaseThreePayload, completedSampleCount.asInt(), plan);
 
         JsonNode completedSamples = findFirst(phaseThreePayload, "completedSamples");
 
@@ -2340,6 +2336,105 @@ public final class OnePassSamplerSdeSynopsisTest {
 
     private static String arraySizeOrNull(JsonNode node) {
         return node == null || !node.isArray() ? "null" : Integer.toString(node.size());
+    }
+
+    private static void validateProjectedCompletedSamplesIfPresent(JsonNode phaseThreePayload,
+                                                                   int expectedCompletedSampleCount,
+                                                                   CompiledOnePassPlan plan) {
+
+        JsonNode projectedSamplesIncludedNode = findFirst(phaseThreePayload, "projectedSamplesIncluded");
+
+        boolean projectedSamplesIncluded = projectedSamplesIncludedNode == null ||
+                projectedSamplesIncludedNode.asBoolean();
+
+        JsonNode projectedCompletedSamples = findFirst(phaseThreePayload, "projectedCompletedSamples");
+
+        if (projectedCompletedSamples == null || !projectedCompletedSamples.isArray()) {
+            throw new IllegalStateException("Expected projectedCompletedSamples array, got: " +
+                    projectedCompletedSamples);
+        }
+
+        if (!projectedSamplesIncluded) {
+            System.out.println("Projected completed samples are compacted in this run. " +
+                    "Full projected output omitted because sample size is large.");
+            return;
+        }
+
+        if (projectedCompletedSamples.size() != expectedCompletedSampleCount) {
+            throw new IllegalStateException("projectedCompletedSamples size mismatch. Expected " +
+                    expectedCompletedSampleCount + ", got " + projectedCompletedSamples.size());
+        }
+
+        for (JsonNode sample : projectedCompletedSamples) {
+            JsonNode projected = sample.get("projected");
+
+            if (projected == null || !projected.isObject()) {
+                throw new IllegalStateException("Projected sample is missing projected object: " + sample);
+            }
+
+            for (String projectionItem : plan.getProjection()) {
+                if (projectionItem == null) {
+                    continue;
+                }
+
+                String trimmed = projectionItem.trim();
+
+                if (trimmed.isEmpty() || "*".equals(trimmed)) {
+                    continue;
+                }
+
+                if (!projected.has(trimmed)) {
+                    throw new IllegalStateException("Projected sample is missing field " + trimmed +
+                            ". Sample: " + sample);
+                }
+            }
+        }
+
+        System.out.println("Validated projected completed sample output.");
+    }
+
+    private static void printProjectedCompletedSamplesPreview(JsonNode phaseThreePayload, int limit)
+            throws Exception {
+        if (phaseThreePayload == null || phaseThreePayload.isNull()) {
+            System.out.println("No Phase 3 payload available for projected sample preview.");
+            return;
+        }
+
+        JsonNode projectedSamples = findFirst(phaseThreePayload, "projectedCompletedSamples");
+        String sourceField = "projectedCompletedSamples";
+
+        /*
+         * In large benchmark runs, the full projectedCompletedSamples array may be
+         * intentionally empty and only projectedCompletedSamplesPreview is sent.
+         */
+        if (projectedSamples == null || !projectedSamples.isArray() | projectedSamples.size() == 0) {
+
+            projectedSamples = findFirst(phaseThreePayload, "projectedCompletedSamplesPreview");
+            sourceField = "projectedCompletedSamplesPreview";
+        }
+
+        if (projectedSamples == null || !projectedSamples.isArray()) {
+            System.out.println("No projected completed samples found in Phase 3 payload. "
+                            + "Expected projectedCompletedSamples or projectedCompletedSamplesPreview.");
+            return;
+        }
+
+        int count = Math.min(limit, projectedSamples.size());
+
+        System.out.println();
+        System.out.println("=== Projected final sample preview ===");
+        System.out.println("sourceField: " + sourceField);
+        System.out.println("showing: " + count + " of " + projectedSamples.size());
+        System.out.println();
+
+        for (int i = 0; i < count; i++) {
+            System.out.println("Projected sample #" + (i + 1) + ":");
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(projectedSamples.get(i)));
+            System.out.println();
+        }
+
+        System.out.println("======================================");
+        System.out.println();
     }
 
     private static long tic() {

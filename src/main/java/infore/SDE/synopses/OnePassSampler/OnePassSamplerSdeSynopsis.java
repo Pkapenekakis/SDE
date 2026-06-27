@@ -10,11 +10,12 @@ import infore.SDE.synopses.Synopsis;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
-
+import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassCompletedSample;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -318,11 +319,9 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
          * Always copy plan collections into normal mutable JDK containers.
          */
         out.put("leafToRootOrder", new ArrayList<String>(plan.getLeafToRootOrder()));
-
         out.put("rootToLeafOrder", new ArrayList<String>(plan.getRootToLeafOrder()));
-
         out.put("weightsByAlias", new LinkedHashMap<String, String>(plan.getWeightsByAlias()));
-
+        out.put("projection", new ArrayList<String>(plan.getProjection()));
         OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
 
         if (phaseOneResult != null) {
@@ -417,30 +416,64 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             out.put("completedSamplesTruncated", !includeFullCompletedSamples);
 
             if (includeFullCompletedSamples) {
+                /*
+                 * Debug/correctness mode:
+                 * Keep full joined samples so tests can validate join conditions.
+                 */
                 out.put("completedSamples", new ArrayList(phaseThreeResult.getCompletedSamples()));
                 out.put("completedSamplesPreview", new ArrayList());
             } else {
                 /*
                  * Benchmark mode:
                  * Do not send thousands of full joined samples through Kafka.
-                 * Keep only a tiny preview for debugging and keep the count exact.
                  */
                 out.put("completedSamples", new ArrayList());
 
                 int previewSize = Math.min(COMPLETED_SAMPLES_PREVIEW_LIMIT, completedCount);
 
-                out.put(
-                        "completedSamplesPreview",
-                        new ArrayList(phaseThreeResult.getCompletedSamples().subList(0, previewSize)));
+                out.put("completedSamplesPreview", new ArrayList(phaseThreeResult.getCompletedSamples().
+                        subList(0, previewSize)));
+            }
+
+            /*
+             * Final SELECT-projected output.
+             *
+             * This is the output that should be compared with the original
+             * standalone One-pass* implementation.
+             */
+            out.put("projectedOutput", true);
+
+            boolean includeProjectedSamples = completedCount <= FULL_COMPLETED_SAMPLES_STATUS_LIMIT;
+
+            out.put("projectedSamplesIncluded", includeProjectedSamples);
+            out.put("projectedSamplesTruncated", !includeProjectedSamples);
+
+            if (includeProjectedSamples) {
+                out.put("projectedCompletedSamples", projectCompletedSamples(phaseThreeResult.getCompletedSamples()));
+                out.put("projectedCompletedSamplesPreview", new ArrayList());
+            } else {
+                out.put("projectedCompletedSamples", new ArrayList());
+
+                int previewSize = Math.min(COMPLETED_SAMPLES_PREVIEW_LIMIT, completedCount);
+
+                out.put("projectedCompletedSamplesPreview",
+                        projectCompletedSamples(phaseThreeResult.getCompletedSamples().subList(0, previewSize)));
             }
         } else {
             out.put("phaseThreeComplete", false);
             out.put("completedSampleCount", 0);
             out.put("requestedPhaseThreeSampleSize", plan.getSampleSize());
+
             out.put("completedSamplesIncluded", true);
             out.put("completedSamplesTruncated", false);
             out.put("completedSamples", new ArrayList());
             out.put("completedSamplesPreview", new ArrayList());
+
+            out.put("projectedOutput", true);
+            out.put("projectedSamplesIncluded", true);
+            out.put("projectedSamplesTruncated", false);
+            out.put("projectedCompletedSamples", new ArrayList());
+            out.put("projectedCompletedSamplesPreview", new ArrayList());
         }
         return out;
     }
@@ -471,4 +504,84 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
          */
         return null;
     }
+
+    private List<Map<String, Object>> projectCompletedSamples(List<OnePassCompletedSample> completedSamples) {
+
+        List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+
+        if (completedSamples == null || completedSamples.isEmpty()) {
+            return out;
+        }
+
+        for (OnePassCompletedSample completedSample : completedSamples) {
+            out.add(projectCompletedSample(completedSample));
+        }
+
+        return out;
+    }
+
+    private Map<String, Object> projectCompletedSample(OnePassCompletedSample completedSample) {
+
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+
+        out.put("sampleInstanceId", completedSample.getSampleInstanceId());
+        out.put("sourceRootCandidateId", completedSample.getSourceRootCandidateId());
+
+        Map<String, Object> projected = new LinkedHashMap<String, Object>();
+
+        for (String projectionItem : plan.getProjection()) {
+            if (projectionItem == null) {
+                continue;
+            }
+
+            String trimmed = projectionItem.trim();
+
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+
+            /*
+             * SELECT * should normally already be resolved by the compiler into
+             * the catalog projection. Keep this fallback only for robustness.
+             */
+            if ("*".equals(trimmed)) {
+                projected.put("*", completedSample.getTuplesByAlias());
+                continue;
+            }
+
+            int dot = trimmed.indexOf('.');
+
+            if (dot <= 0 || dot == trimmed.length() - 1) {
+                throw new IllegalStateException("Invalid compiled projection item: " + trimmed
+                                + ". Expected alias.field");
+            }
+
+            String alias = trimmed.substring(0, dot);
+            String field = trimmed.substring(dot + 1);
+
+            OnePassTuple tuple = completedSample.getTuple(alias);
+
+            if (tuple == null) {
+                throw new IllegalStateException("Cannot project field " + trimmed + " because completed sample " +
+                                completedSample.getSampleInstanceId() + " has no tuple for alias " + alias);
+            }
+
+            JsonNode value = tuple.getField(field);
+
+            if (value == null || value.isNull()) {
+                projected.put(trimmed, null);
+            } else {
+                /*
+                 * Keep the JsonNode value so Jackson preserves numeric/boolean/string
+                 * types when serializing the status payload.
+                 */
+                projected.put(trimmed, value);
+            }
+        }
+
+        out.put("projected", projected);
+
+        return out;
+    }
+
 }
