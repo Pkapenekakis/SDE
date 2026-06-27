@@ -6,6 +6,8 @@ import java.net.URLClassLoader;
 import java.util.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.synopses.OnePassSampler.OnePassSamplerSdeSynopsis;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOne;
@@ -27,12 +29,28 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	private HashMap<String,ArrayList<Synopsis>> M_Synopses = new HashMap<>();
 	private HashMap<String,ArrayList<ContinuousSynopsis>> MC_Synopses = new HashMap<>();
 	private int pId;
+	private static final ObjectMapper MAPPER = new ObjectMapper();
+	private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
+	private static final int ONEPASS_DATA_BARRIER_REQUEST_ID = 70;
+	private static final int ONEPASS_SYNOPSIS_ID = 30;
 
 	@Override
 	public void flatMap1(Datapoint node, Collector<Estimation> collector) throws JsonProcessingException {
-		//System.out.println(node.toString());
-		//System.out.println(MC_Synopses.size());
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(node.getKey());
+
+		/*
+		 * One-pass* data-path barrier.
+		 *
+		 * The test sends this marker through dataTopic after all tuples of a phase
+		 * or Phase 3 alias. Since it goes through the same data path, receiving this
+		 * ACK means all earlier records for the same Kafka key/partition have reached
+		 * this operator.
+		 */
+		if (isOnePassDataBarrier(node)) {
+			handleOnePassDataBarrier(node, Synopses, collector);
+			return;
+		}
+
 		if (Synopses != null) {
 			for (Synopsis ski : Synopses) {
 				ski.add(node.getValues());
@@ -430,6 +448,126 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	}
 	public void open(Configuration config)  {
 	 	pId = getRuntimeContext().getIndexOfThisSubtask();
+	}
+
+	private boolean isOnePassDataBarrier(Datapoint node) {
+		if (node == null || node.getValues() == null || node.getValues().isNull()) {
+			return false;
+		}
+
+		JsonNode values = node.getValues();
+		JsonNode barrierNode = values.get(ONEPASS_DATA_BARRIER_FIELD);
+		return barrierNode != null && barrierNode.asBoolean(false);
+	}
+
+	private void handleOnePassDataBarrier(Datapoint node, ArrayList<Synopsis> synopses,
+										  Collector<Estimation> collector) {
+		JsonNode values = node.getValues();
+
+		int uid = intField(values, "uid", -1);
+		String barrierId = textField(values, "barrierId", "unknown");
+		String phase = textField(values, "phase", "UNKNOWN");
+		String alias = textField(values, "alias", "");
+
+		int requestedExpectedWorkers = intField(values, "expectedWorkers", 1);
+
+		int actualParallelism = 1;
+
+		try {
+			actualParallelism =
+					getRuntimeContext().getNumberOfParallelSubtasks();
+		} catch (Exception ignored) {
+			actualParallelism = 1;
+		}
+
+		int expectedWorkers = requestedExpectedWorkers > 0 ? requestedExpectedWorkers : actualParallelism;
+
+		if (expectedWorkers <= 0) {
+			expectedWorkers = 1;
+		}
+
+		int workerId = pId;
+
+		boolean foundOnePassSynopsis = false;
+
+		if (synopses != null) {
+			for (Synopsis syn : synopses) {
+				if (syn instanceof OnePassSamplerSdeSynopsis
+						&& (uid < 0 || uid == syn.getSynopsisID())) {
+					foundOnePassSynopsis = true;
+					break;
+				}
+			}
+		}
+
+		String ackJson = buildOnePassDataBarrierAckJson(uid, barrierId, phase,alias, workerId, expectedWorkers,
+						actualParallelism, foundOnePassSynopsis);
+
+		String[] param = new String[] {"DATA_BARRIER_ACK", barrierId, phase, alias, Integer.toString(workerId),
+						Integer.toString(expectedWorkers)};
+
+		Estimation ack = new Estimation(uid, Integer.toString(uid), ONEPASS_DATA_BARRIER_REQUEST_ID, ONEPASS_SYNOPSIS_ID,
+						node.getKey(), ackJson, param, expectedWorkers);
+
+		collector.collect(ack);
+
+		System.out.println("[OnePass DATA BARRIER] " + "uid=" + uid + ", phase=" + phase + ", alias=" + alias
+				+ ", barrierId=" + barrierId + ", workerId=" + workerId + ", expectedWorkers=" + expectedWorkers
+				+ ", actualParallelism=" + actualParallelism + ", foundOnePassSynopsis=" + foundOnePassSynopsis);
+	}
+
+	private String buildOnePassDataBarrierAckJson(int uid, String barrierId, String phase, String alias,
+	                                              int workerId, int expectedWorkers, int actualParallelism,
+	                                              boolean foundOnePassSynopsis) {
+		Map<String, Object> ack = new LinkedHashMap<String, Object>();
+
+		ack.put("type", "DATA_BARRIER_ACK");
+		ack.put("barrierId", barrierId);
+		ack.put("phase", phase);
+		ack.put("alias", alias);
+		ack.put("uid", uid);
+		ack.put("workerId", workerId);
+		ack.put("expectedWorkers", expectedWorkers);
+		ack.put("actualParallelism", actualParallelism);
+		ack.put("foundOnePassSynopsis", foundOnePassSynopsis);
+
+		try {
+			return MAPPER.writeValueAsString(ack);
+		} catch (Exception e) {
+			throw new IllegalStateException("Could not serialize OnePass data barrier ACK", e);
+		}
+	}
+
+	private static String textField(JsonNode node, String fieldName, String defaultValue) {
+		if (node == null || node.isNull()) {
+			return defaultValue;
+		}
+
+		JsonNode field = node.get(fieldName);
+
+		if (field == null || field.isNull()) {
+			return defaultValue;
+		}
+
+		String value = field.asText();
+
+		if (value == null || value.trim().isEmpty()) {
+			return defaultValue;
+		}
+		return value.trim();
+	}
+
+	private static int intField(JsonNode node, String fieldName, int defaultValue) {
+		if (node == null || node.isNull()) {
+			return defaultValue;
+		}
+
+		JsonNode field = node.get(fieldName);
+
+		if (field == null || field.isNull()) {
+			return defaultValue;
+		}
+		return field.asInt(defaultValue);
 	}
 
 }

@@ -106,12 +106,6 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final int REQUEST_ESTIMATE = 3;
     private static final int REQUEST_UPDATE = 7;
 
-    private static final String COMMAND_FINISH_PHASE_1 = "FINISH_PHASE_1";
-    private static final String COMMAND_FINISH_PHASE_2 = "FINISH_PHASE_2";
-    private static final String COMMAND_START_PHASE_3_ALIAS = "START_PHASE_3_ALIAS";
-    private static final String COMMAND_FINISH_PHASE_3_ALIAS = "FINISH_PHASE_3_ALIAS";
-    private static final String COMMAND_FINISH_PHASE_3 = "FINISH_PHASE_3";
-
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final Map<String, Map<String, Double>> expectedIndexesByEdge =
@@ -119,6 +113,19 @@ public final class OnePassSamplerSdeSynopsisTest {
 
     private static final Map<String, Long> sentRowsByAlias = new LinkedHashMap<String, Long>();
 
+    //Commands
+    private static final String COMMAND_FINISH_PHASE_1 = "FINISH_PHASE_1";
+    private static final String COMMAND_FINISH_PHASE_2 = "FINISH_PHASE_2";
+    private static final String COMMAND_START_PHASE_3_ALIAS = "START_PHASE_3_ALIAS";
+    private static final String COMMAND_FINISH_PHASE_3_ALIAS = "FINISH_PHASE_3_ALIAS";
+    private static final String COMMAND_FINISH_PHASE_3 = "FINISH_PHASE_3";
+
+    //Barrier flags
+    private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
+    private static final long DATA_BARRIER_TIMEOUT_MS = 120000L;
+    private static final int EXPECTED_DATA_BARRIER_ACKS = 1;
+
+    //Validation flags
     private static long expectedRootTuplesSeen = 0L;
     private static long expectedPositiveRootCandidatesSeen = 0L;
     private static double expectedTotalRootGroupWeight = 0.0d;
@@ -260,11 +267,14 @@ public final class OnePassSamplerSdeSynopsisTest {
              * Kafka/Flink does not guarantee ordering across dataTopic and requestTopic.
              * This gives SDE time to consume PHASE_1 tuples before FINISH_PHASE_1.
              */
-            System.out.println("Waiting for SDE to consume PHASE_1 side tuples...");
+            System.out.println("Waiting for SDE data barrier after PHASE_1 side tuples...");
             long phaseOneBarrierStartNanos = tic();
-            Thread.sleep(10000L);
-            recordDuration("total_artificial_wait", phaseOneBarrierStartNanos);
-            recordDetailedDuration("phase1_barrier_sleep", phaseOneBarrierStartNanos);
+
+            sendDataBarrierAndWait(producer, consumer, datasetKey, streamId, uid, "PHASE1", null,
+                    EXPECTED_DATA_BARRIER_ACKS, DATA_BARRIER_TIMEOUT_MS);
+
+            recordDuration("phase1_data_barrier_ack", phaseOneBarrierStartNanos);
+            recordDetailedDuration("phase1_data_barrier_ack_detail", phaseOneBarrierStartNanos);
 
             System.out.println("3. Sending FINISH_PHASE_1 request...");
             long phaseOneFinishAckStartNanos = tic();
@@ -363,14 +373,14 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println("PHASE_2 root alias " + plan.getRootAlias() + " rows: " + rootRows);
             System.out.println();
 
-            /*
-             * Temporary barrier.
-             */
-            System.out.println("Waiting for SDE to consume PHASE_2 tuples...");
+            System.out.println("Waiting for SDE data barrier after PHASE_2 root tuples...");
             long phaseTwoBarrierStartNanos = tic();
-            Thread.sleep(10000L);
-            recordDuration("total_artificial_wait", phaseTwoBarrierStartNanos);
-            recordDetailedDuration("phase2_barrier_sleep", phaseTwoBarrierStartNanos);
+
+            sendDataBarrierAndWait(producer, consumer, datasetKey, streamId, uid, "PHASE2", plan.getRootAlias(),
+                    EXPECTED_DATA_BARRIER_ACKS, DATA_BARRIER_TIMEOUT_MS);
+
+            recordDuration("phase2_data_barrier_ack", phaseTwoBarrierStartNanos);
+            recordDetailedDuration("phase2_data_barrier_ack_detail", phaseTwoBarrierStartNanos);
 
             System.out.println("6. Sending FINISH_PHASE_2 request...");
             long phaseTwoFinishAckStartNanos = tic();
@@ -496,18 +506,13 @@ public final class OnePassSamplerSdeSynopsisTest {
                 System.out.println("PHASE_3 alias " + alias + " rows: " + phaseThreeAliasRows);
                 System.out.println();
 
-                /*
-                 * Temporary barrier before finishing this Phase 3 alias.
-                 * Keep it timed separately so it does not pollute stream/algorithm timing.
-                 */
-                System.out.println("Waiting for SDE to consume PHASE_3 alias " + alias + " tuples...");
-
+                System.out.println("Waiting for SDE data barrier after PHASE_3 alias " + alias + " tuples...");
                 long phaseThreeAliasBarrierStartNanos = tic();
+                sendDataBarrierAndWait(producer, consumer, datasetKey, streamId, uid, "PHASE3", alias,
+                        EXPECTED_DATA_BARRIER_ACKS, DATA_BARRIER_TIMEOUT_MS);
 
-                Thread.sleep(10000L);
-
-                recordDuration("total_artificial_wait", phaseThreeAliasBarrierStartNanos);
-                recordDetailedDuration("phase3_alias_" + alias + "_barrier_sleep", phaseThreeAliasBarrierStartNanos);
+                recordDuration("phase3_data_barrier_ack_total", phaseThreeAliasBarrierStartNanos);
+                recordDetailedDuration("phase3_alias_" + alias + "_data_barrier_ack", phaseThreeAliasBarrierStartNanos);
 
                 System.out.println("8c. Finishing PHASE_3 alias: " + alias);
 
@@ -2197,17 +2202,189 @@ public final class OnePassSamplerSdeSynopsisTest {
         return new KafkaConsumer<String, String>(props);
     }
 
-    private static void sendJsonAsync(KafkaProducer<String, String> producer,
-                                      String topic,
-                                      String key,
-                                      JsonNode json) {
-        producer.send(
-                new ProducerRecord<String, String>(
-                        topic,
-                        key,
-                        json.toString()
-                )
+    private static void sendDataBarrierAndWait(KafkaProducer<String, String> producer,
+                                               KafkaConsumer<String, String> consumer,
+                                               String datasetKey,
+                                               String streamId,
+                                               int uid,
+                                               String phase,
+                                               String alias,
+                                               int expectedAcks,
+                                               long timeoutMs) throws Exception {
+        String barrierId =
+                buildBarrierId(uid, phase, alias);
+
+        ObjectNode barrierDatapoint =
+                buildDataBarrierDatapoint(
+                        datasetKey,
+                        streamId,
+                        uid,
+                        phase,
+                        alias,
+                        barrierId,
+                        expectedAcks
+                );
+
+        System.out.println("Sending data barrier:"
+                + " phase=" + phase
+                + ", alias=" + alias
+                + ", barrierId=" + barrierId
+                + ", expectedAcks=" + expectedAcks);
+
+        sendJson(producer, DATA_TOPIC, datasetKey, barrierDatapoint);
+        producer.flush();
+
+        waitForDataBarrierAcks(
+                consumer,
+                uid,
+                barrierId,
+                expectedAcks,
+                timeoutMs
         );
+    }
+
+    private static ObjectNode buildDataBarrierDatapoint(String datasetKey,
+                                                        String streamId,
+                                                        int uid,
+                                                        String phase,
+                                                        String alias,
+                                                        String barrierId,
+                                                        int expectedWorkers) {
+        ObjectNode barrier =
+                MAPPER.createObjectNode();
+
+        barrier.put(ONEPASS_DATA_BARRIER_FIELD, true);
+        barrier.put("uid", uid);
+        barrier.put("phase", phase);
+        barrier.put("barrierId", barrierId);
+        barrier.put("expectedWorkers", expectedWorkers);
+
+        if (alias != null && !alias.trim().isEmpty()) {
+            barrier.put("alias", alias.trim());
+        }
+
+        ObjectNode datapoint =
+                MAPPER.createObjectNode();
+
+        datapoint.put("dataSetkey", datasetKey);
+        datapoint.put("streamID", streamId);
+        datapoint.set("values", barrier);
+
+        return datapoint;
+    }
+
+    private static void waitForDataBarrierAcks(KafkaConsumer<String, String> consumer, int uid, String barrierId,
+                                               int expectedAcks, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+
+        Set<Integer> workerIds = new LinkedHashSet<Integer>();
+
+        int recordsSeen = 0;
+
+        while (System.currentTimeMillis() < deadline) {
+            ConsumerRecords<String, String> records = consumer.poll(1000);
+
+            for (ConsumerRecord<String, String> record : records) {
+                recordsSeen++;
+
+                String value = record.value();
+
+                if (value == null || value.trim().isEmpty()) {
+                    continue;
+                }
+
+                JsonNode envelope;
+
+                try {
+                    envelope = parseJsonLenient(value);
+                } catch (Exception ignored) {
+                    continue;
+                }
+
+                JsonNode uidNode = findFirst(envelope, "uid");
+
+                if (uidNode == null || uidNode.asInt() != uid) {
+                    continue;
+                }
+
+                JsonNode ackPayload = extractDataBarrierAckPayload(envelope);
+
+                boolean rawMatches = value.contains("DATA_BARRIER_ACK") && value.contains(barrierId);
+
+                boolean payloadMatches = ackPayload != null
+                        && "DATA_BARRIER_ACK".equals(textOrNull(ackPayload.get("type")))
+                        && barrierId.equals(textOrNull(ackPayload.get("barrierId")));
+
+                if (!rawMatches && !payloadMatches) {
+                    continue;
+                }
+
+                int workerId = -1;
+
+                if (ackPayload != null && ackPayload.has("workerId")) {
+                    workerId = ackPayload.get("workerId").asInt();
+                }
+
+                workerIds.add(workerId);
+
+                System.out.println("Received DATA_BARRIER_ACK:" + " barrierId=" + barrierId + ", workerId=" + workerId
+                        + ", receivedAcks=" + workerIds.size() + "/" + expectedAcks);
+
+                if (workerIds.size() >= expectedAcks) {
+                    System.out.println("Data barrier completed: barrierId=" + barrierId + ", workers=" + workerIds);
+                    System.out.println();
+                    return;
+                }
+            }
+        }
+
+        throw new IllegalStateException("Timed out waiting for DATA_BARRIER_ACK barrierId=" + barrierId +
+                ". Received workers=" + workerIds + ", expectedAcks=" + expectedAcks + ", recordsSeen=" + recordsSeen);
+    }
+
+    private static JsonNode extractDataBarrierAckPayload(JsonNode envelope) {
+        if (envelope == null || envelope.isNull()) {
+            return null;
+        }
+
+        JsonNode estimation = envelope.get("estimation");
+
+        if (estimation == null || estimation.isNull()) {
+            return envelope;
+        }
+
+        if (estimation.isObject()) {
+            return estimation;
+        }
+
+        if (estimation.isTextual()) {
+            String text = estimation.asText();
+
+            if (text == null || text.trim().isEmpty()) {
+                return null;
+            }
+
+            try {
+                return MAPPER.readTree(text);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    private static String buildBarrierId(int uid, String phase, String alias) {
+        String cleanPhase = phase == null ? "UNKNOWN" : phase.replaceAll("[^A-Za-z0-9_]", "_");
+
+        String cleanAlias = alias == null || alias.trim().isEmpty() ? "none" :
+                alias.replaceAll("[^A-Za-z0-9_]", "_");
+
+        return cleanPhase + "_" + cleanAlias + "_" + uid + "_" + System.nanoTime();
+    }
+
+    private static void sendJsonAsync(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) {
+        producer.send(new ProducerRecord<String, String>(topic, key, json.toString()));
     }
 
     private static void sendJson(KafkaProducer<String, String> producer,
@@ -2473,26 +2650,22 @@ public final class OnePassSamplerSdeSynopsisTest {
         double phase2Stream = secondsFor("phase2_root_stream_send");
         double phase3Stream = secondsFor("phase3_side_stream_send_total");
 
-        double dataStreamTotal =
-                phase1Stream + phase2Stream + phase3Stream;
+        double phase1DataBarrier = secondsFor("phase1_data_barrier_ack");
+        double phase2DataBarrier = secondsFor("phase2_data_barrier_ack");
+        double phase3DataBarrier = secondsFor("phase3_data_barrier_ack_total");
+
+        double dataBarrierTotal = phase1DataBarrier + phase2DataBarrier + phase3DataBarrier;
+        double dataStreamTotal = phase1Stream + phase2Stream + phase3Stream;
 
         double phase1ControlStatus = secondsFor("phase1_finish_ack") + secondsFor("phase1_status");
-
         double phase2ControlStatus = secondsFor("phase2_finish_ack") + secondsFor("phase2_status");
-
         double phase3ControlStatus = secondsFor("phase3_control_ack_total") +
                 secondsFor("phase3_finish_ack") + secondsFor("phase3_status");
 
         double controlStatusTotal = phase1ControlStatus + phase2ControlStatus + phase3ControlStatus;
-
-        double artificialWait =
-                secondsFor("total_artificial_wait");
-
-        double observedEndToEnd =
-                secondsFor("total_end_to_end_observed");
-
-        double adjustedEndToEnd =
-                observedEndToEnd - artificialWait;
+        double artificialWait = secondsFor("total_artificial_wait");
+        double observedEndToEnd = secondsFor("total_end_to_end_observed");
+        double adjustedEndToEnd = observedEndToEnd - artificialWait;
 
         if (adjustedEndToEnd < 0.0d) {
             adjustedEndToEnd = 0.0d;
@@ -2520,6 +2693,10 @@ public final class OnePassSamplerSdeSynopsisTest {
                                 + "phase2_root_stream_send_s,"
                                 + "phase3_side_stream_send_total_s,"
                                 + "data_stream_send_total_s,"
+                                + "phase1_data_barrier_ack_s,"
+                                + "phase2_data_barrier_ack_s,"
+                                + "phase3_data_barrier_ack_total_s,"
+                                + "data_barrier_ack_total_s,"
                                 + "phase1_control_status_s,"
                                 + "phase2_control_status_s,"
                                 + "phase3_control_status_s,"
@@ -2546,6 +2723,10 @@ public final class OnePassSamplerSdeSynopsisTest {
                             + "," + doubleCsv(phase2Stream)
                             + "," + doubleCsv(phase3Stream)
                             + "," + doubleCsv(dataStreamTotal)
+                            + "," + doubleCsv(phase1DataBarrier)
+                            + "," + doubleCsv(phase2DataBarrier)
+                            + "," + doubleCsv(phase3DataBarrier)
+                            + "," + doubleCsv(dataBarrierTotal)
                             + "," + doubleCsv(phase1ControlStatus)
                             + "," + doubleCsv(phase2ControlStatus)
                             + "," + doubleCsv(phase3ControlStatus)
@@ -2589,17 +2770,21 @@ public final class OnePassSamplerSdeSynopsisTest {
         double phase3Stream = secondsFor("phase3_side_stream_send_total");
         double dataStreamTotal = phase1Stream + phase2Stream + phase3Stream;
 
+        double phase1DataBarrier = secondsFor("phase1_data_barrier_ack");
+        double phase2DataBarrier = secondsFor("phase2_data_barrier_ack");
+        double phase3DataBarrier = secondsFor("phase3_data_barrier_ack_total");
+
+        double dataBarrierTotal = secondsFor("phase1_data_barrier_ack") +
+                secondsFor("phase2_data_barrier_ack") +
+                secondsFor("phase3_data_barrier_ack_total");
+
         double phase1ControlStatus = secondsFor("phase1_finish_ack") + secondsFor("phase1_status");
-
         double phase2ControlStatus = secondsFor("phase2_finish_ack") + secondsFor("phase2_status");
-
         double phase3ControlStatus = secondsFor("phase3_control_ack_total") +
                 secondsFor("phase3_finish_ack") + secondsFor("phase3_status");
 
         double controlStatusTotal = phase1ControlStatus + phase2ControlStatus + phase3ControlStatus;
-
         double observedEndToEnd = secondsFor("total_end_to_end_observed");
-
         double adjustedEndToEnd = observedEndToEnd - secondsFor("total_artificial_wait");
 
         if (adjustedEndToEnd < 0.0d) {
@@ -2614,6 +2799,8 @@ public final class OnePassSamplerSdeSynopsisTest {
         printTimingLine("phase2_root_stream_send", phase2Stream);
         printTimingLine("phase3_side_stream_send_total", phase3Stream);
         printTimingLine("data_stream_send_total", dataStreamTotal);
+        printTimingLine("data_barrier_ack_total", dataBarrierTotal);
+        printTimingLine("data_barrier_ack_total", dataBarrierTotal);
         printTimingLine("control_status_total", controlStatusTotal);
         printTimingLine("adjusted_end_to_end_no_artificial_wait", adjustedEndToEnd);
         printTimingLine("observed_end_to_end_with_test_waits", observedEndToEnd);
