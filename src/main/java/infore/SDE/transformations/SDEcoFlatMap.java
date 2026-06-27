@@ -307,15 +307,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				return;
 			}
 
-			boolean handled =
-					false;
+			boolean handled = false;
 
-			String command =
-					"UNKNOWN";
+			String command = "UNKNOWN";
 
 			if (rq.getParam() != null && rq.getParam().length > 0) {
-				command =
-						rq.getParam()[0];
+				command = rq.getParam()[0];
 			}
 
 			for (Synopsis syn : Synopses) {
@@ -334,13 +331,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 						 * the OnePass internal result. Kafka output is only used as
 						 * a lightweight ACK for the test/client.
 						 */
-						Estimation internalResult =
-								onePass.handleControlRequest(rq);
+						Estimation internalResult = onePass.handleControlRequest(rq);
 
 						Object payload = internalResult.getEstimation();
 
 						System.out.println("[OnePass UPDATE] command = " + command);
-						System.out.println("[OnePass UPDATE] internal payload = " + payload);
+						//System.out.println("[OnePass UPDATE] internal payload = " + payload);
 
 						/*
 						 * Return only a simple ACK through the existing SDE Estimation path.
