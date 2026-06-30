@@ -77,28 +77,16 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final String REQUEST_TOPIC = "requestTopic";
     private static final String DATA_TOPIC = "dataTopic";
     private static final String ESTIMATION_TOPIC = "estimationTopic";
-
-    private static final String TEST_TPCH_DIR =
-            "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
-
-    //private static final String TEST_ONEPASS_SQL =
-    //        "SELECT * FROM wq3_alias WEIGHTED BY (o.o_totalprice * " +
-    //                "(l.l_extendedprice * (1 - l.l_discount))) LIMIT 100 " +
-    //               "/* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+    private static final String TEST_TPCH_DIR = "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
 
     private static final String TEST_ONEPASS_SQL =
-            "SELECT o.o_orderkey, l1.l_linenumber FROM w_two_lineitems WEIGHTED BY ("+
-                    "o.o_totalprice * l1.l_extendedprice * (4 - l2.l_discount))" +
-                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+            "SELECT o.o_orderkey, l.l_linenumber FROM wq3_alias WEIGHTED BY (" +
+                    "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
+                    "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
-    /*
-     * Use 5000 first while testing wiring.
-     * Use -1 for full TPC-H files.
-     *
-     * Important:
-     * Phase 3 must replay the same side-stream subset that Phase 1 indexed.
-     */
-    private static final long TEST_ROW_LIMIT = 14000;
+
+    //Use -1 for full TPC-H files.
+    private static final long TEST_ROW_LIMIT = 1000000;
 
     private static final int SYNOPSIS_ID = 30;
     private static final int PHASE1_DEBUG_SYNOPSIS_ID = 31;
@@ -108,8 +96,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private static final Map<String, Map<String, Double>> expectedIndexesByEdge =
-            new LinkedHashMap<String, Map<String, Double>>();
+    private static final Map<String, Map<String, Double>> expectedIndexesByEdge = new LinkedHashMap<String, Map<String, Double>>();
 
     private static final Map<String, Long> sentRowsByAlias = new LinkedHashMap<String, Long>();
 
@@ -145,6 +132,24 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final boolean PRINT_DETAILED_BENCHMARK_TIMINGS = false;
     private static final boolean WRITE_BENCHMARK_CSV = true;
     private static final String BENCHMARK_CSV_PATH = "/home/vboxuser/Desktop/Thesis/onepass_sde_benchmark.csv";
+    private static final Map<String, Long> benchmarkCounts = new LinkedHashMap<String, Long>();
+
+    private static JsonNode latestSdeStatusPayloadForBenchmark = null;
+
+    /*
+     * Scale correctness mode.
+     *
+     * This keeps compact expected summaries for large runs:
+     *   - Phase 1 edge key counts
+     *   - Phase 1 edge total weights
+     *   - Phase 2 root tuple counters and total root group weight
+     *
+     * It does NOT export or compare every Phase 1 key/value entry.
+     *
+     * Use this for one correctness/profiling run.
+     * For clean timing-only benchmark runs, set it to false.
+     */
+    private static final boolean RUN_SCALE_SHADOW_SUMMARY_VALIDATION = false;
 
     private OnePassSamplerSdeSynopsisTest() {
     }
@@ -156,6 +161,8 @@ public final class OnePassSamplerSdeSynopsisTest {
         expectedIndexesByEdge.clear();
         sentRowsByAlias.clear();
         benchmarkNanos.clear();
+        benchmarkCounts.clear();
+        latestSdeStatusPayloadForBenchmark = null;
         expectedRootTuplesSeen = 0L;
         expectedPositiveRootCandidatesSeen = 0L;
         expectedTotalRootGroupWeight = 0.0d;
@@ -260,6 +267,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             recordDuration("phase1_stream_send", phaseOneStreamStartNanos); //TIMING PHASE1 END
 
             System.out.println("Total PHASE_1 rows sent: " + phaseOneRows);
+            recordCount("phase1_rows_sent", phaseOneRows);
             System.out.println();
 
             /*
@@ -330,6 +338,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             recordDetailedDuration("phase1_status_detail", phaseOneStatusStartNanos);
 
             validatePhaseOneTransition(phaseOneStatusPayload, plan);
+            validatePhaseOneSummaryIfPresent(phaseOneStatusPayload, plan);
 
             if (EXPORT_PHASE1_FULL_INDEXES) {
                 System.out.println("4b. Requesting full Phase 1 indexes from temporary debug synopsis...");
@@ -371,6 +380,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             recordDuration("phase2_root_stream_send", phaseTwoStreamStartNanos);//TIMING PHASE2 END
 
             System.out.println("PHASE_2 root alias " + plan.getRootAlias() + " rows: " + rootRows);
+            recordCount("phase2_rows_sent", rootRows);
             System.out.println();
 
             System.out.println("Waiting for SDE data barrier after PHASE_2 root tuples...");
@@ -504,6 +514,8 @@ public final class OnePassSamplerSdeSynopsisTest {
                 recordDetailedDuration("phase3_alias_" + alias + "_stream_send", phaseThreeAliasStreamStartNanos);
 
                 System.out.println("PHASE_3 alias " + alias + " rows: " + phaseThreeAliasRows);
+                recordCount("phase3_rows_sent_total", phaseThreeAliasRows);
+                recordCount("phase3_alias_" + alias + "_rows_sent", phaseThreeAliasRows);
                 System.out.println();
 
                 System.out.println("Waiting for SDE data barrier after PHASE_3 alias " + alias + " tuples...");
@@ -512,7 +524,7 @@ public final class OnePassSamplerSdeSynopsisTest {
                         EXPECTED_DATA_BARRIER_ACKS, DATA_BARRIER_TIMEOUT_MS);
 
                 recordDuration("phase3_data_barrier_ack_total", phaseThreeAliasBarrierStartNanos);
-                recordDetailedDuration("phase3_alias_" + alias + "_data_barrier_ack", phaseThreeAliasBarrierStartNanos);
+                recordDuration("phase3_alias_" + alias + "_stream_send", phaseThreeAliasStreamStartNanos);
 
                 System.out.println("8c. Finishing PHASE_3 alias: " + alias);
 
@@ -531,7 +543,7 @@ public final class OnePassSamplerSdeSynopsisTest {
                         COMMAND_FINISH_PHASE_3_ALIAS, 120000L);
 
                 recordDuration("phase3_control_ack_total", phaseThreeAliasFinishControlStartNanos);
-                recordDetailedDuration("phase3_alias_" + alias + "_finish_ack", phaseThreeAliasFinishControlStartNanos);
+                recordDuration("phase3_alias_" + alias + "_data_barrier_ack", phaseThreeAliasBarrierStartNanos);
 
                 System.out.println("FINISH_PHASE_3_ALIAS ACK envelope:");
                 System.out.println(
@@ -542,7 +554,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
                 validateControlAck(finishAliasAck, COMMAND_FINISH_PHASE_3_ALIAS);
 
-                recordDetailedDuration("phase3_alias_" + alias + "_total", phaseThreeAliasTotalStartNanos);
+                recordDuration("phase3_alias_" + alias + "_total", phaseThreeAliasTotalStartNanos);
             }
 
             recordDetailedDuration("phase3_side_replay_total", phaseThreeReplayStartNanos);//TIMING Phase3 END
@@ -601,6 +613,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println();
 
             JsonNode phaseThreeStatusPayload = extractEstimationPayload(phaseThreeStatusEnvelope);
+            latestSdeStatusPayloadForBenchmark = phaseThreeStatusPayload;
 
             recordDuration("phase3_status", phaseThreeStatusStartNanos);
             recordDetailedDuration("phase3_status_detail", phaseThreeStatusStartNanos);
@@ -1029,52 +1042,38 @@ public final class OnePassSamplerSdeSynopsisTest {
         }
     }
 
-    private static void validatePhaseOneTransition(JsonNode payload,
-                                                   CompiledOnePassPlan plan) {
+    private static void validatePhaseOneTransition(JsonNode payload, CompiledOnePassPlan plan) {
         JsonNode phaseNode = findFirst(payload, "phase");
 
         if (phaseNode == null) {
-            throw new IllegalStateException(
-                    "FINISH_PHASE_1 response does not contain field 'phase'"
-            );
+            throw new IllegalStateException("FINISH_PHASE_1 response does not contain field 'phase'");
         }
 
         String phase = phaseNode.asText();
 
         if (!"PHASE_2".equals(phase)) {
-            throw new IllegalStateException(
-                    "Expected phase PHASE_2 after FINISH_PHASE_1, got: "
-                            + phase
-            );
+            throw new IllegalStateException("Expected phase PHASE_2 after FINISH_PHASE_1, got: " + phase);
         }
 
         JsonNode completeNode = findFirst(payload, "phaseOneComplete");
 
         if (completeNode == null || !completeNode.asBoolean()) {
-            throw new IllegalStateException(
-                    "Expected phaseOneComplete = true after FINISH_PHASE_1"
-            );
+            throw new IllegalStateException("Expected phaseOneComplete = true after FINISH_PHASE_1");
         }
 
         JsonNode edgeIndexCountNode = findFirst(payload, "edgeIndexCount");
 
         if (edgeIndexCountNode == null || edgeIndexCountNode.asInt() <= 0) {
             throw new IllegalStateException(
-                    "Expected edgeIndexCount > 0 after FINISH_PHASE_1, got: "
-                            + edgeIndexCountNode
-            );
+                    "Expected edgeIndexCount > 0 after FINISH_PHASE_1, got: " + edgeIndexCountNode);
         }
 
         int expectedEdgeIndexCount = plan.getLeafToRootOrder().size();
         int actualEdgeIndexCount = edgeIndexCountNode.asInt();
 
         if (actualEdgeIndexCount != expectedEdgeIndexCount) {
-            throw new IllegalStateException(
-                    "Expected edgeIndexCount="
-                            + expectedEdgeIndexCount
-                            + " but got "
-                            + actualEdgeIndexCount
-            );
+            throw new IllegalStateException("Expected edgeIndexCount=" + expectedEdgeIndexCount +
+                    " but got " + actualEdgeIndexCount);
         }
 
         JsonNode edgeIndexIds = findFirst(payload, "edgeIndexIds");
@@ -1087,6 +1086,83 @@ public final class OnePassSamplerSdeSynopsisTest {
         }
 
         System.out.println("Validated FINISH_PHASE_1 transition payload.");
+    }
+
+    private static void validatePhaseOneSummaryIfPresent(JsonNode payload, CompiledOnePassPlan plan) {
+        if (!RUN_EXACT_EXPECTED_VALIDATION && !RUN_SCALE_SHADOW_SUMMARY_VALIDATION) {
+            return;
+        }
+
+        JsonNode edgeSummaries = findFirst(payload, "phaseOneEdgeSummaries");
+
+        if (edgeSummaries == null || !edgeSummaries.isObject()) {
+            edgeSummaries = findFirst(payload, "edgeSummaries");
+        }
+
+        if (edgeSummaries == null || !edgeSummaries.isObject()) {
+            throw new IllegalStateException(
+                    "Missing Phase 1 edge summaries in SDE status payload. "
+                            + "Expected phaseOneEdgeSummaries or edgeSummaries."
+            );
+        }
+
+        for (Map.Entry<String, Map<String, Double>> expectedEdge : expectedIndexesByEdge.entrySet()) {
+            String edgeId = expectedEdge.getKey();
+
+            Map<String, Double> expectedIndex = expectedEdge.getValue();
+
+            JsonNode actualSummary = edgeSummaries.get(edgeId);
+
+            if (actualSummary == null || actualSummary.isNull()) {
+                throw new IllegalStateException("Missing Phase 1 summary for edge " + edgeId);
+            }
+
+            JsonNode numberOfKeysNode = actualSummary.get("numberOfKeys");
+
+            if (numberOfKeysNode == null || numberOfKeysNode.isNull()) {
+                numberOfKeysNode = actualSummary.get("keyCount");
+            }
+
+            if (numberOfKeysNode == null || numberOfKeysNode.isNull()) {
+                throw new IllegalStateException("Phase 1 summary for edge " + edgeId +
+                        " is missing numberOfKeys/keyCount: " + actualSummary);
+            }
+
+            int expectedKeyCount = expectedIndex.size();
+            int actualKeyCount = numberOfKeysNode.asInt();
+
+            if (actualKeyCount != expectedKeyCount) {
+                throw new IllegalStateException("Phase 1 summary key-count mismatch for edge " + edgeId +
+                        ". Expected " + expectedKeyCount + " but got " + actualKeyCount);
+            }
+
+            JsonNode totalWeightNode =
+                    actualSummary.get("totalWeight");
+
+            if (totalWeightNode == null || totalWeightNode.isNull()) {
+                throw new IllegalStateException(
+                        "Phase 1 summary for edge "
+                                + edgeId
+                                + " is missing totalWeight: "
+                                + actualSummary
+                );
+            }
+
+            double expectedTotalWeight =
+                    sum(expectedIndex);
+
+            double actualTotalWeight =
+                    totalWeightNode.asDouble();
+
+            assertClose(
+                    "phaseOneSummary[" + edgeId + "].totalWeight",
+                    expectedTotalWeight,
+                    actualTotalWeight
+            );
+
+            System.out.println("Validated Phase 1 compact summary for edge " + edgeId + ": keys="
+                            + actualKeyCount + ", totalWeight=" + actualTotalWeight);
+        }
     }
 
     private static void validatePhaseTwoTransitionToPhaseThree(JsonNode payload, int expectedSampleSize,
@@ -1138,7 +1214,7 @@ public final class OnePassSamplerSdeSynopsisTest {
          *   expected values are intentionally not built, so only check
          *   that the real SDE payload is positive and structurally valid.
          */
-        if (RUN_EXACT_EXPECTED_VALIDATION) {
+        if (RUN_EXACT_EXPECTED_VALIDATION || RUN_SCALE_SHADOW_SUMMARY_VALIDATION) {
             if (rootTuplesSeen.asLong() != expectedRootRows) {
                 throw new IllegalStateException("rootTuplesSeen mismatch. Expected " +
                         expectedRootRows + " but got " + rootTuplesSeen.asLong());
@@ -1566,7 +1642,7 @@ public final class OnePassSamplerSdeSynopsisTest {
                                             ObjectNode tuple,
                                             String expectedUpdateMode) {
 
-        if (!RUN_EXACT_EXPECTED_VALIDATION) {
+        if (!RUN_EXACT_EXPECTED_VALIDATION && !RUN_SCALE_SHADOW_SUMMARY_VALIDATION) {
             return;
         }
 
@@ -2641,6 +2717,26 @@ public final class OnePassSamplerSdeSynopsisTest {
         System.out.printf("%-45s %12.3f s%n", label, seconds);
     }
 
+    private static void printRateLine(String label, double rowsPerSecond) {
+        System.out.printf("%-45s %12.3f rows/s%n", label, rowsPerSecond);
+    }
+
+    private static void recordCount(String label, long value) {
+        benchmarkCounts.merge(label, value, Long::sum);
+    }
+
+    private static long countFor(String label) {
+        Long value = benchmarkCounts.get(label);
+        return value == null ? 0L : value.longValue();
+    }
+
+    private static double rowsPerSecond(long rows, double seconds) {
+        if (seconds <= 0.0d) {
+            return 0.0d;
+        }
+        return rows / seconds;
+    }
+
     private static void writeBenchmarkCsv(CompiledOnePassPlan plan, String implementation) throws Exception {
         if (!WRITE_BENCHMARK_CSV) {
             return;
@@ -2669,6 +2765,28 @@ public final class OnePassSamplerSdeSynopsisTest {
 
         if (adjustedEndToEnd < 0.0d) {
             adjustedEndToEnd = 0.0d;
+        }
+
+        long phase1RowsSent = countFor("phase1_rows_sent");
+        long phase2RowsSent = countFor("phase2_rows_sent");
+        long phase3RowsSent = countFor("phase3_rows_sent_total");
+
+        long totalRowsSent = phase1RowsSent + phase2RowsSent + phase3RowsSent;
+        double phase1SendRowsPerSecond = rowsPerSecond(phase1RowsSent, phase1Stream);
+        double phase2SendRowsPerSecond = rowsPerSecond(phase2RowsSent, phase2Stream);
+        double phase3SendRowsPerSecond = rowsPerSecond(phase3RowsSent, phase3Stream);
+
+        double phase1BackendRowsPerSecond = rowsPerSecond(phase1RowsSent, phase1DataBarrier);
+        double phase2BackendRowsPerSecond = rowsPerSecond(phase2RowsSent, phase2DataBarrier);
+        double phase3BackendRowsPerSecond = rowsPerSecond(phase3RowsSent, phase3DataBarrier);
+
+        double sdeAddTotal = sdeAddTotalSeconds();
+        double sdeAddRowsPerSecond = sdeAddRowsPerSecond();
+
+        double transportOrFrameworkGap = adjustedEndToEnd - sdeAddTotal;
+
+        if (transportOrFrameworkGap < 0.0d) {
+            transportOrFrameworkGap = 0.0d;
         }
 
         File csvFile = new File(BENCHMARK_CSV_PATH);
@@ -2704,6 +2822,27 @@ public final class OnePassSamplerSdeSynopsisTest {
                                 + "artificial_wait_s,"
                                 + "adjusted_end_to_end_no_artificial_wait_s,"
                                 + "observed_end_to_end_with_test_waits_s"
+                                + "observed_end_to_end_with_test_waits_s,"
+                                + "phase1_rows_sent,"
+                                + "phase2_rows_sent,"
+                                + "phase3_rows_sent_total,"
+                                + "total_rows_sent,"
+                                + "phase1_send_rows_per_sec,"
+                                + "phase2_send_rows_per_sec,"
+                                + "phase3_send_rows_per_sec,"
+                                + "phase1_backend_drain_rows_per_sec,"
+                                + "phase2_backend_drain_rows_per_sec,"
+                                + "phase3_backend_drain_rows_per_sec,"
+                                + "phase3_alias_rows_sent,"
+                                + "phase3_alias_stream_send_s,"
+                                + "phase3_alias_data_barrier_ack_s,"
+                                + "phase3_alias_send_rows_per_sec,"
+                                + "phase3_alias_backend_rows_per_sec,"
+                                + "sde_add_total_s,"
+                                + "sde_add_rows_per_sec,"
+                                + "transport_or_framework_gap_s,"
+                                + "sde_add_rows_by_phase_alias,"
+                                + "sde_add_seconds_by_phase_alias"
                                 + System.lineSeparator()
                 );
             }
@@ -2734,6 +2873,26 @@ public final class OnePassSamplerSdeSynopsisTest {
                             + "," + doubleCsv(artificialWait)
                             + "," + doubleCsv(adjustedEndToEnd)
                             + "," + doubleCsv(observedEndToEnd)
+                            + "," + phase1RowsSent
+                            + "," + phase2RowsSent
+                            + "," + phase3RowsSent
+                            + "," + totalRowsSent
+                            + "," + doubleCsv(phase1SendRowsPerSecond)
+                            + "," + doubleCsv(phase2SendRowsPerSecond)
+                            + "," + doubleCsv(phase3SendRowsPerSecond)
+                            + "," + doubleCsv(phase1BackendRowsPerSecond)
+                            + "," + doubleCsv(phase2BackendRowsPerSecond)
+                            + "," + doubleCsv(phase3BackendRowsPerSecond)
+                            + "," + csv(String.valueOf(phase3AliasRowsMap(plan)))
+                            + "," + csv(String.valueOf(phase3AliasSecondsMap(plan, "stream_send")))
+                            + "," + csv(String.valueOf(phase3AliasSecondsMap(plan, "data_barrier_ack")))
+                            + "," + csv(String.valueOf(phase3AliasRowsPerSecondMap(plan, "stream_send")))
+                            + "," + csv(String.valueOf(phase3AliasRowsPerSecondMap(plan, "data_barrier_ack")))
+                            + "," + doubleCsv(sdeAddTotal)
+                            + "," + doubleCsv(sdeAddRowsPerSecond)
+                            + "," + doubleCsv(transportOrFrameworkGap)
+                            + "," + csv(sdeAddRowsByPhaseAliasCsv())
+                            + "," + csv(sdeAddSecondsByPhaseAliasCsv())
                             + System.lineSeparator()
             );
         } finally {
@@ -2764,6 +2923,132 @@ public final class OnePassSamplerSdeSynopsisTest {
         return Long.toString(rowLimit);
     }
 
+    private static JsonNode latestSdeAddProfile() {
+        if (latestSdeStatusPayloadForBenchmark == null || latestSdeStatusPayloadForBenchmark.isNull()) {
+            return null;
+        }
+
+        JsonNode profile = findFirst(latestSdeStatusPayloadForBenchmark, "onePassAddProfile");
+
+        if (profile == null || profile.isNull() || !profile.isObject()) {
+            return null;
+        }
+
+        return profile;
+    }
+
+    private static double sdeAddTotalSeconds() {
+        JsonNode profile = latestSdeAddProfile();
+
+        if (profile == null) {
+            return 0.0d;
+        }
+
+        JsonNode secondsNode = profile.get("totalAddSeconds");
+
+        if (secondsNode != null && !secondsNode.isNull()) {
+            return secondsNode.asDouble();
+        }
+
+        JsonNode nanosNode = profile.get("totalAddNanos");
+
+        if (nanosNode != null && !nanosNode.isNull()) {
+            return nanosNode.asLong() / 1_000_000_000.0d;
+        }
+
+        return 0.0d;
+    }
+
+    private static long sdeAddTotalRows() {
+        JsonNode profile = latestSdeAddProfile();
+
+        if (profile == null) {
+            return 0L;
+        }
+
+        JsonNode rowsNode = profile.get("totalAddRows");
+
+        return rowsNode == null || rowsNode.isNull() ? 0L : rowsNode.asLong();
+    }
+
+    private static double sdeAddRowsPerSecond() {
+        double seconds = sdeAddTotalSeconds();
+
+        if (seconds <= 0.0d) {
+            return 0.0d;
+        }
+
+        return sdeAddTotalRows() / seconds;
+    }
+
+    private static String sdeAddRowsByPhaseAliasCsv() {
+        JsonNode profile = latestSdeAddProfile();
+
+        if (profile == null) {
+            return "";
+        }
+
+        JsonNode rows = profile.get("rowsByPhaseAlias");
+
+        return rows == null || rows.isNull() ? "" : rows.toString();
+    }
+
+    private static String sdeAddSecondsByPhaseAliasCsv() {
+        JsonNode profile = latestSdeAddProfile();
+
+        if (profile == null) {
+            return "";
+        }
+
+        JsonNode seconds = profile.get("addSecondsByPhaseAlias");
+
+        return seconds == null || seconds.isNull() ? "" : seconds.toString();
+    }
+
+    private static Map<String, Long> phase3AliasRowsMap(CompiledOnePassPlan plan) {
+        Map<String, Long> out = new LinkedHashMap<String, Long>();
+
+        for (String alias : plan.getRootToLeafOrder()) {
+            if (plan.isRoot(alias)) {
+                continue;
+            }
+
+            out.put(alias, countFor("phase3_alias_" + alias + "_rows_sent"));
+        }
+
+        return out;
+    }
+
+    private static Map<String, Double> phase3AliasSecondsMap(CompiledOnePassPlan plan, String timingSuffix) {
+        Map<String, Double> out = new LinkedHashMap<String, Double>();
+
+        for (String alias : plan.getRootToLeafOrder()) {
+            if (plan.isRoot(alias)) {
+                continue;
+            }
+
+            out.put(alias, secondsFor("phase3_alias_" + alias + "_" + timingSuffix));
+        }
+
+        return out;
+    }
+
+    private static Map<String, Double> phase3AliasRowsPerSecondMap(CompiledOnePassPlan plan, String timingSuffix) {
+        Map<String, Double> out = new LinkedHashMap<String, Double>();
+
+        for (String alias : plan.getRootToLeafOrder()) {
+            if (plan.isRoot(alias)) {
+                continue;
+            }
+
+            long rows = countFor("phase3_alias_" + alias + "_rows_sent");
+            double seconds = secondsFor("phase3_alias_" + alias + "_" + timingSuffix);
+            out.put(alias, rowsPerSecond(rows, seconds));
+        }
+
+        return out;
+    }
+
     private static void printBenchmarkSummary(CompiledOnePassPlan plan) {
         double phase1Stream = secondsFor("phase1_stream_send");
         double phase2Stream = secondsFor("phase2_root_stream_send");
@@ -2791,6 +3076,20 @@ public final class OnePassSamplerSdeSynopsisTest {
             adjustedEndToEnd = 0.0d;
         }
 
+        long phase1RowsSent = countFor("phase1_rows_sent");
+        long phase2RowsSent = countFor("phase2_rows_sent");
+        long phase3RowsSent = countFor("phase3_rows_sent_total");
+
+        long totalRowsSent = phase1RowsSent + phase2RowsSent + phase3RowsSent;
+        double sdeAddTotal = sdeAddTotalSeconds();
+        double sdeAddRowsPerSecond = sdeAddRowsPerSecond();
+
+        double transportOrFrameworkGap = adjustedEndToEnd - sdeAddTotal;
+
+        if (transportOrFrameworkGap < 0.0d) {
+            transportOrFrameworkGap = 0.0d;
+        }
+
         System.out.println();
         System.out.println("=== OnePass comparison benchmark ===");
         System.out.println("TEST_ROW_LIMIT:            " + formatRowLimit(TEST_ROW_LIMIT));
@@ -2800,12 +3099,39 @@ public final class OnePassSamplerSdeSynopsisTest {
         printTimingLine("phase3_side_stream_send_total", phase3Stream);
         printTimingLine("data_stream_send_total", dataStreamTotal);
         printTimingLine("data_barrier_ack_total", dataBarrierTotal);
-        printTimingLine("data_barrier_ack_total", dataBarrierTotal);
         printTimingLine("control_status_total", controlStatusTotal);
         printTimingLine("adjusted_end_to_end_no_artificial_wait", adjustedEndToEnd);
         printTimingLine("observed_end_to_end_with_test_waits", observedEndToEnd);
         System.out.println("====================================");
         System.out.println();
+
+        System.out.println();
+        System.out.println("Rows sent:");
+        System.out.println("phase1_rows_sent:        " + phase1RowsSent);
+        System.out.println("phase2_rows_sent:        " + phase2RowsSent);
+        System.out.println("phase3_rows_sent_total:  " + phase3RowsSent);
+        System.out.println("total_rows_sent:         " + totalRowsSent);
+
+        System.out.println();
+        printRateLine("phase1_send_rows_per_sec", rowsPerSecond(phase1RowsSent, phase1Stream));
+        printRateLine("phase2_send_rows_per_sec", rowsPerSecond(phase2RowsSent, phase2Stream));
+        printRateLine("phase3_send_rows_per_sec", rowsPerSecond(phase3RowsSent, phase3Stream));
+
+        printRateLine("phase1_backend_rows_per_sec", rowsPerSecond(phase1RowsSent, phase1DataBarrier));
+        printRateLine("phase2_backend_rows_per_sec", rowsPerSecond(phase2RowsSent, phase2DataBarrier));
+        printRateLine("phase3_backend_rows_per_sec", rowsPerSecond(phase3RowsSent, phase3DataBarrier));
+
+        System.out.println();
+        printTimingLine("sde_add_total", sdeAddTotal);
+        printRateLine("sde_add_rows_per_sec", sdeAddRowsPerSecond);
+        printTimingLine("transport_or_framework_gap", transportOrFrameworkGap);
+
+        System.out.println();
+        System.out.println("phase3_alias_rows_sent: " + phase3AliasRowsMap(plan));
+        System.out.println("phase3_alias_stream_send_s: " + phase3AliasSecondsMap(plan, "stream_send"));
+        System.out.println("phase3_alias_data_barrier_ack_s: " + phase3AliasSecondsMap(plan, "data_barrier_ack"));
+        System.out.println("phase3_alias_send_rows_per_sec: " + phase3AliasRowsPerSecondMap(plan, "stream_send"));
+        System.out.println("phase3_alias_backend_rows_per_sec: " + phase3AliasRowsPerSecondMap(plan, "data_barrier_ack"));
 
         if (PRINT_DETAILED_BENCHMARK_TIMINGS) {
             System.out.println("=== Detailed OnePass benchmark timings ===");

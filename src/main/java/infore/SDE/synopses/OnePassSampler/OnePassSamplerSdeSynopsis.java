@@ -62,6 +62,12 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
     private final CompiledOnePassPlan plan;
     private final OnePassSamplerSynopsis lifecycle;
 
+    private final Map<String, Long> addRowsByPhaseAlias = new LinkedHashMap<String, Long>();
+    private final Map<String, Long> addNanosByPhaseAlias = new LinkedHashMap<String, Long>();
+
+    private long totalAddRows = 0L;
+    private long totalAddNanos = 0L;
+
     private static final int FULL_COMPLETED_SAMPLES_STATUS_LIMIT = 200;
     private static final int COMPLETED_SAMPLES_PREVIEW_LIMIT = 5;
 
@@ -80,7 +86,15 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             return;
         }
 
-        lifecycle.add(payload);
+        String profileKey = profileKeyForPayload(payload);
+        long startNanos = System.nanoTime();
+
+        try {
+            lifecycle.add(payload);
+        } finally {
+            long elapsedNanos = System.nanoTime() - startNanos;
+            recordAddProfile(profileKey, elapsedNanos);
+        }
     }
 
     @Override
@@ -91,6 +105,106 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
     @Override
     public Estimation estimate(Request request) {
         return buildEstimation(request);
+    }
+
+    private String profileKeyForPayload(Object payload) {
+        String phase = lifecycle.getPhase().name();
+        String alias = aliasForPayload(payload);
+
+        if (lifecycle.getPhase() == OnePassSamplerSynopsis.Phase.PHASE_3
+                && lifecycle.isPhaseThreeAliasActive()
+                && lifecycle.getPhaseThreeActiveAlias() != null
+                && !lifecycle.getPhaseThreeActiveAlias().trim().isEmpty()) {
+            alias = lifecycle.getPhaseThreeActiveAlias().trim();
+        }
+
+        if (alias == null || alias.trim().isEmpty()) {
+            alias = "unknown";
+        }
+
+        return phase + ":" + alias;
+    }
+
+    private String aliasForPayload(Object payload) {
+        if (payload instanceof JsonNode) {
+            JsonNode node = (JsonNode) payload;
+            JsonNode aliasNode = node.get("alias");
+
+            if (aliasNode != null && !aliasNode.isNull()) {
+                String alias = aliasNode.asText();
+
+                if (alias != null && !alias.trim().isEmpty()) {
+                    return alias.trim();
+                }
+            }
+        }
+
+        return "unknown";
+    }
+
+    private void recordAddProfile(String profileKey, long elapsedNanos) {
+        if (profileKey == null || profileKey.trim().isEmpty()) {
+            profileKey = "unknown";
+        }
+
+        Long rows = addRowsByPhaseAlias.get(profileKey);
+
+        if (rows == null) {
+            rows = 0L;
+        }
+
+        addRowsByPhaseAlias.put(profileKey, rows + 1L);
+
+        Long nanos = addNanosByPhaseAlias.get(profileKey);
+
+        if (nanos == null) {
+            nanos = 0L;
+        }
+
+        addNanosByPhaseAlias.put(profileKey, nanos + elapsedNanos);
+
+        totalAddRows++;
+        totalAddNanos += elapsedNanos;
+    }
+
+    private Map<String, Object> buildAddProfilePayload() {
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+
+        out.put("totalAddRows", totalAddRows);
+        out.put("totalAddNanos", totalAddNanos);
+        out.put("totalAddSeconds", totalAddNanos / 1_000_000_000.0d);
+
+        double rowsPerSecond = totalAddNanos <= 0L ? 0.0d : totalAddRows / (totalAddNanos / 1_000_000_000.0d);
+
+        out.put("totalAddRowsPerSecond", rowsPerSecond);
+        out.put("rowsByPhaseAlias", new LinkedHashMap<String, Long>(addRowsByPhaseAlias));
+        out.put("addNanosByPhaseAlias", new LinkedHashMap<String, Long>(addNanosByPhaseAlias));
+
+        Map<String, Double> addSecondsByPhaseAlias = new LinkedHashMap<String, Double>();
+        Map<String, Double> rowsPerSecondByPhaseAlias = new LinkedHashMap<String, Double>();
+
+        for (Map.Entry<String, Long> entry : addNanosByPhaseAlias.entrySet()) {
+            String key = entry.getKey();
+
+            long nanos = entry.getValue() == null ? 0L : entry.getValue().longValue();
+            long rows = 0L;
+            Long rowCount = addRowsByPhaseAlias.get(key);
+
+            if (rowCount != null) {
+                rows = rowCount.longValue();
+            }
+
+            double seconds = nanos / 1_000_000_000.0d;
+
+            addSecondsByPhaseAlias.put(key, seconds);
+            rowsPerSecondByPhaseAlias.put(key, seconds <= 0.0d ? 0.0d : rows / seconds
+            );
+        }
+
+        out.put("addSecondsByPhaseAlias", addSecondsByPhaseAlias);
+        out.put("addRowsPerSecondByPhaseAlias", rowsPerSecondByPhaseAlias);
+
+        return out;
     }
 
     /**
@@ -322,6 +436,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         out.put("rootToLeafOrder", new ArrayList<String>(plan.getRootToLeafOrder()));
         out.put("weightsByAlias", new LinkedHashMap<String, String>(plan.getWeightsByAlias()));
         out.put("projection", new ArrayList<String>(plan.getProjection()));
+        out.put("onePassAddProfile", buildAddProfilePayload());
         OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
 
         if (phaseOneResult != null) {
@@ -343,10 +458,14 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
             out.put("edgeIndexCount", rawIndexes.size());
             out.put("edgeIndexIds", new ArrayList(rawIndexes.keySet()));
+            out.put("phaseOneSummary", phaseOneResult.toSummaryMap(0));
+            out.put("phaseOneEdgeSummaries", phaseOneResult.getEdgeSummaries(0));
         } else {
             out.put("phaseOneComplete", false);
             out.put("edgeIndexCount", 0);
             out.put("edgeIndexIds", new ArrayList());
+            out.put("phaseOneSummary", new LinkedHashMap<String, Object>());
+            out.put("phaseOneEdgeSummaries", new LinkedHashMap<String, Object>());
         }
 
         OnePassRootSampleResult phaseTwoResult = lifecycle.getPhaseTwoResult();
