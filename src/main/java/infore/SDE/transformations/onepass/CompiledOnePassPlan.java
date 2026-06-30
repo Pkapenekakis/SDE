@@ -8,7 +8,8 @@ import infore.SDE.messages.Onepass.OnePassRequestValidator;
 import infore.SDE.messages.Onepass.OutputSpec;
 import infore.SDE.messages.Onepass.RelationSpec;
 import infore.SDE.messages.Onepass.WeightSpec;
-
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.io.Serializable;
 import java.util.*;
 
@@ -68,6 +69,9 @@ public final class CompiledOnePassPlan implements Serializable {
     private final List<String> leafToRootOrder;
     private final Set<String> leafAliases;
 
+    private static final Pattern LOCAL_FIELD_IDENTIFIER = Pattern.compile("\\b[A-Za-z_][A-Za-z0-9_]*\\b");
+    private final Map<String, Set<String>> requiredFieldsByAlias;
+
     private CompiledOnePassPlan(
             String queryName,
             String rootAlias,
@@ -97,12 +101,8 @@ public final class CompiledOnePassPlan implements Serializable {
 
         this.weightSpec = copyWeightSpec(weightSpec);
         this.weightExpression = this.weightSpec.getExpression();
-        this.weightVariables = Collections.unmodifiableList(
-                toStringList(this.weightSpec.getVariables())
-        );
-        this.weightsByAlias = Collections.unmodifiableMap(
-                copyStringMap(this.weightSpec.getWeightsByAlias())
-        );
+        this.weightVariables = Collections.unmodifiableList(toStringList(this.weightSpec.getVariables()));
+        this.weightsByAlias = Collections.unmodifiableMap(copyStringMap(this.weightSpec.getWeightsByAlias()));
 
         this.sampleSize = sampleSize;
         this.projection = Collections.unmodifiableList(new ArrayList<String>(projection));
@@ -122,6 +122,8 @@ public final class CompiledOnePassPlan implements Serializable {
         this.rootToLeafOrder = Collections.unmodifiableList(new ArrayList<String>(rootToLeafOrder));
         this.leafToRootOrder = Collections.unmodifiableList(new ArrayList<String>(leafToRootOrder));
         this.leafAliases = Collections.unmodifiableSet(new LinkedHashSet<String>(leafAliases));
+
+        this.requiredFieldsByAlias = buildRequiredFieldsByAlias();
     }
 
     public static CompiledOnePassPlan from(OnePassParams params) {
@@ -557,6 +559,189 @@ public final class CompiledOnePassPlan implements Serializable {
         return Collections.unmodifiableList(out);
     }
 
+    public Map<String, Set<String>> getRequiredFieldsByAlias() {
+        Map<String, Set<String>> copy = new LinkedHashMap<String, Set<String>>();
+
+        for (Map.Entry<String, Set<String>> entry : requiredFieldsByAlias.entrySet()) {
+            copy.put(entry.getKey(),
+                    Collections.unmodifiableSet(new LinkedHashSet<String>(entry.getValue())));
+        }
+
+        return Collections.unmodifiableMap(copy);
+    }
+
+    public Set<String> getRequiredFields(String alias) {
+        Set<String> fields = requiredFieldsByAlias.get(alias);
+
+        if (fields == null) {
+            return Collections.emptySet();
+        }
+
+        return Collections.unmodifiableSet(fields);
+    }
+
+    public boolean isFieldRequired(String alias, String field) {
+        Set<String> fields = requiredFieldsByAlias.get(alias);
+
+
+        //if we cannot determine required fields, do not prune.
+        if (fields == null || fields.isEmpty()) {
+            return true;
+        }
+
+        return fields.contains("*") || fields.contains(field);
+    }
+
+    private Map<String, Set<String>> buildRequiredFieldsByAlias() {
+        Map<String, Set<String>> out =
+                new LinkedHashMap<String, Set<String>>();
+
+        for (String alias : relationsByAlias.keySet()) {
+            out.put(alias, new LinkedHashSet<String>());
+        }
+
+        addRequiredJoinFields(out);
+        addRequiredWeightFields(out);
+        addRequiredProjectionFields(out);
+
+        Map<String, Set<String>> immutable = new LinkedHashMap<String, Set<String>>();
+
+        for (Map.Entry<String, Set<String>> entry : out.entrySet()) {
+            immutable.put(entry.getKey(),
+                    Collections.unmodifiableSet(new LinkedHashSet<String>(entry.getValue())));
+        }
+
+        return Collections.unmodifiableMap(immutable);
+    }
+
+    private void addRequiredJoinFields(Map<String, Set<String>> out) {
+        for (LogicalJoinEdge edge : logicalEdgesById.values()) {
+            Set<String> leftFields = out.get(edge.getAliasA());
+            Set<String> rightFields = out.get(edge.getAliasB());
+
+            if (leftFields == null || rightFields == null) {
+                continue;
+            }
+
+            for (FieldPair pair : edge.getFieldPairs()) {
+                leftFields.add(pair.getFieldA());
+                rightFields.add(pair.getFieldB());
+            }
+        }
+    }
+
+    private void addRequiredWeightFields(Map<String, Set<String>> out) {
+        if (weightsByAlias == null || weightsByAlias.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<String, String> entry : weightsByAlias.entrySet()) {
+            String alias = entry.getKey();
+            String expression = entry.getValue();
+            Set<String> fields = out.get(alias);
+
+            if (fields == null || expression == null) {
+                continue;
+            }
+
+            for (String field : localFieldIdentifiers(expression)) {
+                fields.add(field);
+            }
+        }
+    }
+
+    private void addRequiredProjectionFields(Map<String, Set<String>> out) {
+        if (projection == null || projection.isEmpty()) {
+            //if projection is unknown, do not prune any alias.
+            markAllAliasesAsFullTupleRequired(out);
+            return;
+        }
+
+        for (String item : projection) {
+            if (item == null) {
+                continue;
+            }
+
+            String trimmed = item.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+
+            /*
+             * Normally SELECT * has already been expanded by OnePassSqlCompiler.
+             * This fallback protects direct JSON OnePassParams usage.
+             */
+            if ("*".equals(trimmed)) {
+                markAllAliasesAsFullTupleRequired(out);
+                continue;
+            }
+
+            int dot = trimmed.indexOf('.');
+
+            if (dot <= 0 || dot == trimmed.length() - 1) {
+                throw new IllegalStateException("Invalid compiled projection item: " +
+                        trimmed + ". Expected alias.field");
+            }
+
+            String alias = trimmed.substring(0, dot);
+            String field = trimmed.substring(dot + 1);
+            Set<String> fields = out.get(alias);
+
+            if (fields == null) {
+                throw new IllegalStateException("Projection item " + trimmed + " refers to unknown alias " + alias);
+            }
+
+            fields.add(field);
+        }
+    }
+
+    private void markAllAliasesAsFullTupleRequired(Map<String, Set<String>> out) {
+        for (Set<String> fields : out.values()) {
+            fields.add("*");
+        }
+    }
+
+    private static Set<String> localFieldIdentifiers(String expression) {
+        Set<String> out = new LinkedHashSet<String>();
+        if (expression == null || expression.trim().isEmpty()) {
+            return out;
+        }
+
+        Matcher matcher = LOCAL_FIELD_IDENTIFIER.matcher(expression);
+
+        while (matcher.find()) {
+            String token = matcher.group();
+
+            if (isKnownMathFunction(token)) {
+                continue;
+            }
+
+            out.add(token);
+        }
+
+        return out;
+    }
+
+    private static boolean isKnownMathFunction(String token) {
+        return "abs".equalsIgnoreCase(token) || "log".equalsIgnoreCase(token) || "exp".equalsIgnoreCase(token) ||
+                "sqrt".equalsIgnoreCase(token) || "pow".equalsIgnoreCase(token) ||
+                "min".equalsIgnoreCase(token) || "max".equalsIgnoreCase(token);
+    }
+
+    private Map<String, List<String>> copyRequiredFieldsByAlias(Map<String, Set<String>> requiredFieldsByAlias) {
+        Map<String, List<String>> out = new LinkedHashMap<String, List<String>>();
+
+        if (requiredFieldsByAlias == null) {
+            return out;
+        }
+
+        for (Map.Entry<String, Set<String>> entry : requiredFieldsByAlias.entrySet()) {
+            out.put(entry.getKey(), new ArrayList<String>(entry.getValue()));
+        }
+
+        return out;
+    }
+
     @Override
     public String toString() {
         return "CompiledOnePassPlan{" +
@@ -566,6 +751,7 @@ public final class CompiledOnePassPlan implements Serializable {
                 ", rootToLeafOrder=" + rootToLeafOrder +
                 ", leafToRootOrder=" + leafToRootOrder +
                 ", weightsByAlias=" + weightsByAlias +
+                ", requiredFieldsByAlias=" + requiredFieldsByAlias +
                 '}';
     }
 
@@ -784,5 +970,6 @@ public final class CompiledOnePassPlan implements Serializable {
         private LogicalJoinEdge build() {
             return new LogicalJoinEdge(edgeId(aliasA, aliasB), aliasA, aliasB, fieldPairs);
         }
+
     }
 }

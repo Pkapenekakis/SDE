@@ -13,10 +13,7 @@ import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassCompletedSample;
 import com.fasterxml.jackson.databind.JsonNode;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * SDE-facing wrapper for the full One-pass* lifecycle.
@@ -436,6 +433,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         out.put("rootToLeafOrder", new ArrayList<String>(plan.getRootToLeafOrder()));
         out.put("weightsByAlias", new LinkedHashMap<String, String>(plan.getWeightsByAlias()));
         out.put("projection", new ArrayList<String>(plan.getProjection()));
+        out.put("requiredFieldsByAlias", copyRequiredFieldsByAlias(plan.getRequiredFieldsByAlias()));
         out.put("onePassAddProfile", buildAddProfilePayload());
         OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
 
@@ -699,6 +697,20 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         }
 
         out.put("projected", projected);
+
+        return out;
+    }
+
+    private Map<String, List<String>> copyRequiredFieldsByAlias(Map<String, Set<String>> requiredFieldsByAlias) {
+        Map<String, List<String>> out = new LinkedHashMap<String, List<String>>();
+
+        if (requiredFieldsByAlias == null) {
+            return out;
+        }
+
+        for (Map.Entry<String, Set<String>> entry : requiredFieldsByAlias.entrySet()) {
+            out.put(entry.getKey(), new ArrayList<String>(entry.getValue()));
+        }
 
         return out;
     }

@@ -80,13 +80,13 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final String TEST_TPCH_DIR = "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
 
     private static final String TEST_ONEPASS_SQL =
-            "SELECT o.o_orderkey, l.l_linenumber FROM wq3_alias WEIGHTED BY (" +
+            "SELECT * FROM wq3_alias WEIGHTED BY (" +
                     "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
-                    "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
 
     //Use -1 for full TPC-H files.
-    private static final long TEST_ROW_LIMIT = 1000000;
+    private static final long TEST_ROW_LIMIT = 14000;
 
     private static final int SYNOPSIS_ID = 30;
     private static final int PHASE1_DEBUG_SYNOPSIS_ID = 31;
@@ -118,8 +118,8 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static double expectedTotalRootGroupWeight = 0.0d;
 
     //Debug Flags
-    private static final boolean PRINT_FULL_KAFKA_RECORDS = false;
-    private static final boolean PRINT_FULL_STATUS_PAYLOADS = false;
+    private static final boolean PRINT_FULL_KAFKA_RECORDS = true;
+    private static final boolean PRINT_FULL_STATUS_PAYLOADS = true;
     private static final int FINAL_SAMPLE_PREVIEW_LIMIT = 5;
 
     private static final long FULL_VALIDATION_MAX_ROW_LIMIT = 15000L;
@@ -133,6 +133,19 @@ public final class OnePassSamplerSdeSynopsisTest {
     private static final boolean WRITE_BENCHMARK_CSV = true;
     private static final String BENCHMARK_CSV_PATH = "/home/vboxuser/Desktop/Thesis/onepass_sde_benchmark.csv";
     private static final Map<String, Long> benchmarkCounts = new LinkedHashMap<String, Long>();
+
+    /*
+     * Prune each tuple to the fields required by the compiled plan.
+     *
+     * Required fields are computed in CompiledOnePassPlan from:
+     *   - join fields
+     *   - alias-local weight fields
+     *   - final projection fields
+     *
+     * If SELECT * is used, OnePassSqlCompiler expands it to the catalog
+     * query projection before CompiledOnePassPlan is built.
+     */
+    private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
 
     private static JsonNode latestSdeStatusPayloadForBenchmark = null;
 
@@ -196,7 +209,10 @@ public final class OnePassSamplerSdeSynopsisTest {
         System.out.println("Leaf-to-root order: " + plan.getLeafToRootOrder());
         System.out.println("Root-to-leaf order: " + plan.getRootToLeafOrder());
         System.out.println("Weights by alias: " + plan.getWeightsByAlias());
+        System.out.println("Required fields by alias: " + plan.getRequiredFieldsByAlias());
         System.out.println();
+
+        Map<String, Set<String>> requiredFieldsByAlias = plan.getRequiredFieldsByAlias();
 
         KafkaProducer<String, String> producer = createProducer();
         KafkaConsumer<String, String> consumer = createConsumer("onepass-sampler-test-" + uid);
@@ -255,7 +271,8 @@ public final class OnePassSamplerSdeSynopsisTest {
                         alias,
                         TEST_ROW_LIMIT,
                         "PHASE1",
-                        expectedWeightEvaluator
+                        expectedWeightEvaluator,
+                        requiredFieldsByAlias
                 );
 
                 phaseOneRows += count;
@@ -287,13 +304,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             System.out.println("3. Sending FINISH_PHASE_1 request...");
             long phaseOneFinishAckStartNanos = tic();
 
-            ObjectNode finishPhaseOneRequest =
-                    buildControlRequest(
-                            uid,
-                            datasetKey,
-                            streamId,
-                            COMMAND_FINISH_PHASE_1
-                    );
+            ObjectNode finishPhaseOneRequest = buildControlRequest(uid, datasetKey, streamId, COMMAND_FINISH_PHASE_1);
 
             sendJson(producer, REQUEST_TOPIC, datasetKey, finishPhaseOneRequest);
             producer.flush();
@@ -319,14 +330,11 @@ public final class OnePassSamplerSdeSynopsisTest {
             sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneStatusRequest);
             producer.flush();
 
-            System.out.println(
-                    MAPPER.writerWithDefaultPrettyPrinter()
-                            .writeValueAsString(phaseOneStatusRequest)
-            );
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(phaseOneStatusRequest));
             System.out.println();
 
             JsonNode phaseOneStatusEnvelope = waitForResponseContaining(consumer, uid, "PHASE_2",
-                            120000L);
+                    120000L);
 
             System.out.println("PHASE_1 STATUS envelope:");
             printPayloadSummary(extractEstimationPayload(phaseOneStatusEnvelope));
@@ -345,7 +353,7 @@ public final class OnePassSamplerSdeSynopsisTest {
                 long phaseOneDebugExportStartNanos = tic();
 
                 ObjectNode phaseOneDebugEstimateRequest = buildPhaseOneDebugEstimateRequest(
-                                phaseOneDebugUid, datasetKey, streamId);
+                        phaseOneDebugUid, datasetKey, streamId);
 
                 sendJson(producer, REQUEST_TOPIC, datasetKey, phaseOneDebugEstimateRequest);
                 producer.flush();
@@ -374,7 +382,8 @@ public final class OnePassSamplerSdeSynopsisTest {
                     plan.getRootAlias(),
                     TEST_ROW_LIMIT,
                     "PHASE2",
-                    expectedWeightEvaluator);
+                    expectedWeightEvaluator,
+                    requiredFieldsByAlias);
 
             producer.flush();
             recordDuration("phase2_root_stream_send", phaseTwoStreamStartNanos);//TIMING PHASE2 END
@@ -506,7 +515,8 @@ public final class OnePassSamplerSdeSynopsisTest {
                         alias,
                         TEST_ROW_LIMIT,
                         null,
-                        expectedWeightEvaluator);
+                        expectedWeightEvaluator,
+                        requiredFieldsByAlias);
 
                 producer.flush();
 
@@ -821,10 +831,21 @@ public final class OnePassSamplerSdeSynopsisTest {
                                     String alias,
                                     long maxRows,
                                     String expectedUpdateMode,
-                                    OnePassWeightEvaluator expectedWeightEvaluator) throws Exception {
+                                    OnePassWeightEvaluator expectedWeightEvaluator,
+                                    Map<String, Set<String>> requiredFieldsByAlias) throws Exception {
         File file = tableFileForAlias(catalog, plan, alias);
         List<String> columns = columnsForAlias(catalog, plan, alias);
         String separator = separatorForAlias(catalog, plan, alias);
+        Set<String> requiredFields = requiredFieldsByAlias == null ? null : requiredFieldsByAlias.get(alias);
+
+        if (ENABLE_REQUIRED_FIELD_PRUNING && requiredFields == null) {
+            throw new IllegalStateException(
+                    "Required-field pruning is enabled, but plan has no required fields for alias: " + alias);
+        }
+
+        if (ENABLE_REQUIRED_FIELD_PRUNING) {
+            System.out.println("  Required fields for alias " + alias + ": " + requiredFields);
+        }
 
         long count = 0L;
 
@@ -838,27 +859,19 @@ public final class OnePassSamplerSdeSynopsisTest {
                     break;
                 }
 
-                ObjectNode tuple =
-                        tupleJsonFromLine(alias, columns, separator, line);
-
-                ObjectNode datapoint =
-                        wrapTupleAsDatapoint(datasetKey, streamId, tuple);
+                ObjectNode tuple = tupleJsonFromLine(alias, columns, separator, line, requiredFields);
+                ObjectNode datapoint = wrapTupleAsDatapoint(datasetKey, streamId, tuple);
 
                 sendJsonAsync(producer, topic, datasetKey, datapoint);
 
-                updateExpectedState(
-                        plan,
-                        expectedWeightEvaluator,
-                        tuple,
-                        expectedUpdateMode
-                );
-
+                updateExpectedState(plan, expectedWeightEvaluator, tuple, expectedUpdateMode);
                 count++;
 
+                /*
                 if (count % 1000 == 0) {
                     producer.flush();
                     System.out.println("    sent " + count + " rows for alias " + alias);
-                }
+                } */
             }
         } finally {
             br.close();
@@ -879,28 +892,17 @@ public final class OnePassSamplerSdeSynopsisTest {
             throw new IllegalStateException("Unknown alias in plan: " + alias);
         }
 
-        OnePassCatalog.CatalogTable table =
-                catalog.getDataset().getTables().get(relation.getTable());
+        OnePassCatalog.CatalogTable table = catalog.getDataset().getTables().get(relation.getTable());
 
         if (table == null) {
-            throw new IllegalStateException(
-                    "Catalog does not define table '"
-                            + relation.getTable()
-                            + "' for alias '"
-                            + alias
-                            + "'"
-            );
+            throw new IllegalStateException("Catalog does not define table '" + relation.getTable() +
+                    "' for alias '" + alias + "'");
         }
 
         File file = new File(TEST_TPCH_DIR, table.getFile());
 
         if (!file.exists()) {
-            throw new IllegalStateException(
-                    "Missing TPC-H file for alias '"
-                            + alias
-                            + "': "
-                            + file.getAbsolutePath()
-            );
+            throw new IllegalStateException("Missing TPC-H file for alias '" + alias + "': " + file.getAbsolutePath());
         }
 
         return file;
@@ -964,23 +966,25 @@ public final class OnePassSamplerSdeSynopsisTest {
         return separator;
     }
 
-    private static ObjectNode tupleJsonFromLine(String alias,
-                                                List<String> columns,
-                                                String separator,
-                                                String line) {
-        String[] parts =
-                line.split("\\Q" + separator + "\\E", -1);
+    private static ObjectNode tupleJsonFromLine(String alias, List<String> columns, String separator,
+                                                String line, Set<String> requiredFields) {
 
-        ObjectNode tuple =
-                MAPPER.createObjectNode();
+        String[] parts = line.split("\\Q" + separator + "\\E", -1);
+        ObjectNode tuple = MAPPER.createObjectNode();
 
         tuple.put("alias", alias);
 
-        int limit =
-                Math.min(columns.size(), parts.length);
+        int limit = Math.min(columns.size(), parts.length);
 
         for (int i = 0; i < limit; i++) {
-            putTypedValue(tuple, columns.get(i), parts[i]);
+            String fieldName = columns.get(i);
+
+            if (ENABLE_REQUIRED_FIELD_PRUNING && requiredFields != null && !requiredFields.contains("*") &&
+                    !requiredFields.contains(fieldName)) {
+                continue;
+            }
+
+            putTypedValue(tuple, fieldName, parts[i]);
         }
 
         return tuple;
@@ -1161,7 +1165,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             );
 
             System.out.println("Validated Phase 1 compact summary for edge " + edgeId + ": keys="
-                            + actualKeyCount + ", totalWeight=" + actualTotalWeight);
+                    + actualKeyCount + ", totalWeight=" + actualTotalWeight);
         }
     }
 
@@ -1254,7 +1258,7 @@ public final class OnePassSamplerSdeSynopsisTest {
         if (sampleInstanceCountNode != null) {
             if (sampleInstanceCountNode.asInt() != expectedSampleSize) {
                 throw new IllegalStateException("Expected sampleInstanceCount = " + expectedSampleSize + ", got " +
-                                sampleInstanceCountNode.asInt());
+                        sampleInstanceCountNode.asInt());
             }
         }
 
@@ -1271,7 +1275,7 @@ public final class OnePassSamplerSdeSynopsisTest {
             }
         } else {
             System.out.println("Validated compact FINISH_PHASE_2 payload: sampleInstanceCount=" + expectedSampleSize
-                            + ". Full sampleInstances omitted from status because sample size is large.");
+                    + ". Full sampleInstances omitted from status because sample size is large.");
         }
 
         /*
@@ -1359,7 +1363,7 @@ public final class OnePassSamplerSdeSynopsisTest {
         }
 
         boolean phaseTwoSamplesAvailable = phaseTwoSampleInstances != null && phaseTwoSampleInstances.isArray()
-                        && phaseTwoSampleInstances.size() == expectedPhaseTwoSampleCount;
+                && phaseTwoSampleInstances.size() == expectedPhaseTwoSampleCount;
 
         if (!completedSamplesIncluded) {
             System.out.println(
@@ -2666,7 +2670,7 @@ public final class OnePassSamplerSdeSynopsisTest {
 
         if (projectedSamples == null || !projectedSamples.isArray()) {
             System.out.println("No projected completed samples found in Phase 3 payload. "
-                            + "Expected projectedCompletedSamples or projectedCompletedSamplesPreview.");
+                    + "Expected projectedCompletedSamples or projectedCompletedSamplesPreview.");
             return;
         }
 
@@ -2821,7 +2825,6 @@ public final class OnePassSamplerSdeSynopsisTest {
                                 + "control_status_total_s,"
                                 + "artificial_wait_s,"
                                 + "adjusted_end_to_end_no_artificial_wait_s,"
-                                + "observed_end_to_end_with_test_waits_s"
                                 + "observed_end_to_end_with_test_waits_s,"
                                 + "phase1_rows_sent,"
                                 + "phase2_rows_sent,"
