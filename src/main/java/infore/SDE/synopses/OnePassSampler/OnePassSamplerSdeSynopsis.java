@@ -715,4 +715,50 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return out;
     }
 
+    public Estimation buildLocalPhaseOneResultEstimation(Request request, int workerId, int expectedWorkers,
+                                                         int actualParallelism, String resultId) {
+
+        OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
+
+        if (phaseOneResult == null) {
+            throw new IllegalStateException(
+                    "Cannot export LOCAL_PHASE1_RESULT before Phase 1 is complete."
+            );
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+
+        payload.put("type", "LOCAL_PHASE1_RESULT");
+        payload.put("uid", request.getUID());
+        payload.put("workerId", workerId);
+        payload.put("expectedWorkers", expectedWorkers);
+        payload.put("actualParallelism", actualParallelism);
+        payload.put("phase", "PHASE1");
+        payload.put("resultId", resultId);
+        payload.put("queryName", plan.getQueryName());
+        payload.put("rootAlias", plan.getRootAlias());
+
+    /*
+     * Small test Payload
+     * Later will be replaced with a compact merge payload
+     */
+        payload.put("phaseOneResult", phaseOneResult.toDebugMap());
+
+        String json;
+
+        try {
+            json = MAPPER.writeValueAsString(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not serialize LOCAL_PHASE1_RESULT", e);
+        }
+
+        String[] param = new String[] {"LOCAL_PHASE1_RESULT", resultId, "PHASE1", "",
+                Integer.toString(workerId), Integer.toString(expectedWorkers)};
+
+        String estimationKey = request.getUID() + "_LOCAL_PHASE1_RESULT_" + workerId + "_" + resultId;
+
+        return new Estimation(request.getUID(), estimationKey, 72, 30,
+                request.getKey(), json, param, expectedWorkers);
+    }
+
 }

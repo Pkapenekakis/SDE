@@ -351,10 +351,32 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 						 */
 						Estimation internalResult = onePass.handleControlRequest(rq);
 
-						Object payload = internalResult.getEstimation();
+						if ("FINISH_PHASE_1".equalsIgnoreCase(command)) {
+							int actualParallelism = 1;
 
+							try {
+								actualParallelism = getRuntimeContext().getNumberOfParallelSubtasks();
+							} catch (Exception ignored) {
+								actualParallelism = 1;
+							}
+
+							int expectedWorkers = rq.getNoOfP() > 0 ? rq.getNoOfP() : actualParallelism;;
+
+							String resultId = resolveOnePassResultId(rq, "PHASE1_RESULT_" + rq.getUID());
+
+							Estimation localPhaseOneResult =
+									onePass.buildLocalPhaseOneResultEstimation(rq, pId, expectedWorkers,
+											actualParallelism, resultId);
+
+							collector.collect(localPhaseOneResult);
+
+							System.out.println("[OnePass LOCAL_PHASE1_RESULT] emitted uid="
+									+ rq.getUID()
+									+ ", workerId=" + pId
+									+ ", expectedWorkers=" + expectedWorkers
+									+ ", resultId=" + resultId);
+						}
 						System.out.println("[OnePass UPDATE] command = " + command);
-						//System.out.println("[OnePass UPDATE] internal payload = " + payload);
 
 						/*
 						 * Return only a simple ACK through the existing SDE Estimation path.
@@ -568,6 +590,38 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			return defaultValue;
 		}
 		return field.asInt(defaultValue);
+	}
+
+	private static String resolveOnePassResultId(Request request, String defaultValue) {
+		if (request == null) {
+			return defaultValue;
+		}
+
+		JsonNode parameters = request.getParameters();
+
+		if (parameters != null && !parameters.isNull()) {
+			JsonNode resultIdNode = parameters.get("onePassResultId");
+
+			if (resultIdNode != null && !resultIdNode.isNull()) {
+				String value = resultIdNode.asText();
+
+				if (value != null && !value.trim().isEmpty()) {
+					return value.trim();
+				}
+			}
+		}
+
+		String[] param = request.getParam();
+
+		if (param != null && param.length > 1 && param[1] != null) {
+			String value = param[1];
+
+			if (!value.trim().isEmpty()) {
+				return value.trim();
+			}
+		}
+
+		return defaultValue;
 	}
 
 }

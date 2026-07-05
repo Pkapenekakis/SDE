@@ -19,9 +19,8 @@ public final class OnePassRequestParser {
             throw new IllegalArgumentException("Request is null");
         }
 
-        if (rq.getNoOfP() != 1) {
-            throw new IllegalArgumentException("OnePass* initial implementation supports only noOfP = 1, got " +
-                    rq.getNoOfP());
+        if (rq.getNoOfP() <= 0) {
+            throw new IllegalArgumentException("OnePass* requires noOfP > 0, got " + rq.getNoOfP());
         }
 
         JsonNode parameters = rq.getParameters();
@@ -61,8 +60,7 @@ public final class OnePassRequestParser {
          * This should not be the canonical interface, but it makes debugging
          * and old requests safer.
          */
-        String[] param =
-                rq.getParam();
+        String[] param = rq.getParam();
 
         if (param != null && param.length > 0) {
             String maybeSql = param[0];
