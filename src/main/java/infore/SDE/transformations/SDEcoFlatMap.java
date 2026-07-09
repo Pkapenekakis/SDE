@@ -348,6 +348,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				return;
 			}
 
+			if ("INSTALL_ROOT_SAMPLE".equalsIgnoreCase(command)) {
+				handleInstallRootSampleRequest(rq, Synopses, collector);
+				M_Synopses.put(rq.getKey(), Synopses);
+				return;
+			}
+
 			for (Synopsis syn : Synopses) {
 				if (rq.getUID() == syn.getSynopsisID()) {
 					if (syn instanceof OnePassSamplerSdeSynopsis) {
@@ -400,6 +406,37 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 									+ ", resultId=" + resultId
 									+ ", activeAlias=" + activeAlias);
 						}
+
+						if ("FINISH_PHASE_2".equalsIgnoreCase(command)) {
+							int actualParallelism = 1;
+
+							try {
+								actualParallelism = getRuntimeContext().getNumberOfParallelSubtasks();
+							} catch (Exception ignored) {
+								actualParallelism = 1;
+							}
+
+							int expectedWorkers = rq.getNoOfP() > 0 ? rq.getNoOfP() : actualParallelism;
+							String resultId = resolveOnePassResultId(rq, "PHASE2_RESULT_" + rq.getUID());
+
+							Estimation localPhaseTwoSummary =
+									onePass.buildLocalPhaseTwoRootSummaryEstimation(
+											rq,
+											pId,
+											expectedWorkers,
+											actualParallelism,
+											resultId
+									);
+
+							collector.collect(localPhaseTwoSummary);
+
+							System.out.println("[OnePass LOCAL_PHASE2_ROOT_SUMMARY] emitted uid="
+									+ rq.getUID()
+									+ ", workerId=" + pId
+									+ ", expectedWorkers=" + expectedWorkers
+									+ ", resultId=" + resultId);
+						}
+
 						System.out.println("[OnePass UPDATE] command = " + command);
 
 						/*
@@ -770,7 +807,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			throw new IllegalStateException("Missing chunk 0 for stateRef=" + stateRef);
 		}
 
-		assembled.put("type", "GLOBAL_PHASE1_INDEX");
+		String stateType = textField(first, "stateType", "GLOBAL_PHASE1_INDEX");
+		assembled.put("type", stateType);
+
 		assembled.put("stateRef", stateRef);
 
 		copyIfPresent(first, assembled, "stateType");
@@ -788,6 +827,13 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		copyIfPresent(first, assembled, "edgeSummaries");
 		copyIfPresent(first, assembled, "activeAlias");
 		copyIfPresent(first, assembled, "activeEdgeId");
+		copyIfPresent(first, assembled, "sampleSize");
+		copyIfPresent(first, assembled, "rootTuplesSeen");
+		copyIfPresent(first, assembled, "positiveRootCandidatesSeen");
+		copyIfPresent(first, assembled, "totalRootGroupWeight");
+		copyIfPresent(first, assembled, "sampleInstanceCount");
+		copyIfPresent(first, assembled, "datasetSeed");
+		copyIfPresent(first, assembled, "globalReservoir");
 
 		ArrayNode entries = MAPPER.createArrayNode();
 
@@ -1060,6 +1106,143 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		} catch (Exception e) {
 			return "CHECKSUM_ERROR_" + e.getClass().getSimpleName();
 		}
+	}
+
+	private void handleInstallRootSampleRequest(
+			Request rq,
+			ArrayList<Synopsis> synopses,
+			Collector<Estimation> collector) {
+
+		String stateRef = resolveInstallStateRef(rq);
+
+		if (stateRef == null || stateRef.trim().isEmpty()) {
+			System.out.println("[OnePass INSTALL_ROOT_SAMPLE] Missing stateRef. Request=" + rq);
+			return;
+		}
+
+		JsonNode state = onePassGlobalStatesByRef.get(stateRef);
+
+		if (state == null || state.isNull()) {
+			pendingOnePassInstallRequestsByRef.put(stateRef, rq);
+
+			System.out.println("[OnePass INSTALL_ROOT_SAMPLE] State not available yet. Pending install stored. stateRef="
+					+ stateRef + ", key=" + rq.getKey());
+			return;
+		}
+
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsis(rq, synopses);
+
+		boolean installed = false;
+		String error = "";
+
+		if (onePass == null) {
+			error = "No OnePassSamplerSdeSynopsis found for uid=" + rq.getUID()
+					+ ", key=" + rq.getKey();
+		} else {
+			try {
+				onePass.installGlobalPhaseTwoRootSample(state);
+				installed = true;
+			} catch (Exception ex) {
+				error = ex.getMessage();
+				ex.printStackTrace();
+			}
+		}
+
+		int expectedWorkers = rq.getNoOfP() > 0
+				? rq.getNoOfP()
+				: getRuntimeContext().getNumberOfParallelSubtasks();
+
+		String ackJson = buildInstallRootSampleAckJson(
+				rq,
+				state,
+				stateRef,
+				pId,
+				expectedWorkers,
+				installed,
+				error
+		);
+
+		String[] param = new String[] {
+				"INSTALL_ROOT_SAMPLE_ACK",
+				stateRef,
+				"PHASE2",
+				textField(state, "rootAlias", ""),
+				Integer.toString(pId),
+				Integer.toString(expectedWorkers)
+		};
+
+		String estimationKey = rq.getUID() + "_INSTALL_ROOT_SAMPLE_" + stateRef + "_" + pId;
+
+		Estimation ack = new Estimation(
+				rq.getUID(),
+				estimationKey,
+				85,
+				30,
+				rq.getKey(),
+				ackJson,
+				param,
+				expectedWorkers
+		);
+
+		collector.collect(ack);
+
+		System.out.println("[OnePass INSTALL_ROOT_SAMPLE] ACK emitted uid="
+				+ rq.getUID()
+				+ ", workerId=" + pId
+				+ ", stateRef=" + stateRef
+				+ ", installed=" + installed
+				+ ", key=" + rq.getKey());
+	}
+
+	private String buildInstallRootSampleAckJson(
+			Request rq,
+			JsonNode state,
+			String stateRef,
+			int workerId,
+			int expectedWorkers,
+			boolean installed,
+			String error) {
+
+		Map<String, Object> ack = new LinkedHashMap<String, Object>();
+
+		ack.put("type", "INSTALL_ROOT_SAMPLE_ACK");
+		ack.put("uid", rq.getUID());
+		ack.put("stateRef", stateRef);
+		ack.put("phase", "PHASE2");
+		ack.put("resultId", textField(state, "resultId", ""));
+		ack.put("rootAlias", textField(state, "rootAlias", ""));
+		ack.put("workerId", workerId);
+		ack.put("expectedWorkers", expectedWorkers);
+		ack.put("installed", installed);
+		ack.put("sampleSize", intField(state, "sampleSize", 0));
+		ack.put("sampleInstanceCount", intField(state, "sampleInstanceCount", 0));
+		ack.put("rootTuplesSeen", longField(state, "rootTuplesSeen", 0L));
+		ack.put("positiveRootCandidatesSeen", longField(state, "positiveRootCandidatesSeen", 0L));
+		ack.put("totalRootGroupWeight", doubleField(state, "totalRootGroupWeight", 0.0d));
+
+		if (error != null && !error.trim().isEmpty()) {
+			ack.put("error", error);
+		}
+
+		try {
+			return MAPPER.writeValueAsString(ack);
+		} catch (Exception e) {
+			throw new IllegalStateException("Could not serialize INSTALL_ROOT_SAMPLE_ACK", e);
+		}
+	}
+
+	private static long longField(JsonNode node, String fieldName, long defaultValue) {
+		if (node == null || node.isNull()) return defaultValue;
+		JsonNode field = node.get(fieldName);
+		if (field == null || field.isNull()) return defaultValue;
+		return field.asLong(defaultValue);
+	}
+
+	private static double doubleField(JsonNode node, String fieldName, double defaultValue) {
+		if (node == null || node.isNull()) return defaultValue;
+		JsonNode field = node.get(fieldName);
+		if (field == null || field.isNull()) return defaultValue;
+		return field.asDouble(defaultValue);
 	}
 
 }

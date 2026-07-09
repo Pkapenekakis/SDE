@@ -14,6 +14,12 @@ import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassCompletedSample;
 import com.fasterxml.jackson.databind.JsonNode;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleCandidate;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.WeightedReservoirEntry;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleCandidate;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleInstance;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
 import java.util.*;
 
 /**
@@ -939,6 +945,186 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         String last = order.get(order.size() - 1);
 
         return alias.trim().equals(last);
+    }
+
+    public Estimation buildLocalPhaseTwoRootSummaryEstimation(
+            Request request,
+            int workerId,
+            int expectedWorkers,
+            int actualParallelism,
+            String resultId) {
+
+        OnePassPhaseTwoState phaseTwoState = lifecycle.getPhaseTwoState();
+
+        if (phaseTwoState == null) {
+            throw new IllegalStateException("Cannot export LOCAL_PHASE2_ROOT_SUMMARY because Phase 2 state is null.");
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+
+        payload.put("type", "LOCAL_PHASE2_ROOT_SUMMARY");
+        payload.put("uid", request.getUID());
+        payload.put("workerId", workerId);
+        payload.put("expectedWorkers", expectedWorkers);
+        payload.put("actualParallelism", actualParallelism);
+        payload.put("phase", "PHASE2");
+        payload.put("resultId", resultId);
+        payload.put("queryName", plan.getQueryName());
+        payload.put("rootAlias", plan.getRootAlias());
+        payload.put("baseKey", stripOnePassWorkerSuffix(request.getKey(), expectedWorkers, workerId));
+        payload.put("datasetSeed", plan.getDatasetSeed());
+        payload.put("sampleSize", phaseTwoState.getSampleSize());
+        payload.put("rootTuplesSeen", phaseTwoState.getRootTuplesSeen());
+        payload.put("positiveRootCandidatesSeen", phaseTwoState.getPositiveRootCandidatesSeen());
+        payload.put("totalRootGroupWeight", phaseTwoState.getTotalRootGroupWeight());
+
+        List<Map<String, Object>> reservoir = new ArrayList<Map<String, Object>>();
+
+        for (WeightedReservoirEntry<OnePassRootSampleCandidate> entry : phaseTwoState.getOrderedReservoir()) {
+            OnePassRootSampleCandidate candidate = entry.getItem();
+
+            Map<String, Object> candidateJson = new LinkedHashMap<String, Object>();
+            candidateJson.put("candidateId", candidate.getCandidateId());
+            candidateJson.put("rootAlias", candidate.getRootAlias());
+            candidateJson.put("rootTuple", candidate.getRootTuple());
+            candidateJson.put("rootGroupWeight", candidate.getRootGroupWeight());
+            candidateJson.put("esKey", entry.getKey());
+            candidateJson.put("arrivalOrder", entry.getArrivalOrder());
+            reservoir.add(candidateJson);
+        }
+
+        payload.put("orderedReservoir", reservoir);
+
+        String json;
+
+        try {
+            json = MAPPER.writeValueAsString(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not serialize LOCAL_PHASE2_ROOT_SUMMARY", e);
+        }
+
+        String[] param = new String[] {
+                "LOCAL_PHASE2_ROOT_SUMMARY",
+                resultId,
+                "PHASE2",
+                plan.getRootAlias(),
+                Integer.toString(workerId),
+                Integer.toString(expectedWorkers)
+        };
+
+        String reduceKey = request.getUID() + "_PHASE2_" + resultId;
+
+        return new Estimation(
+                request.getUID(),
+                reduceKey,
+                82,
+                30,
+                reduceKey,
+                json,
+                param,
+                expectedWorkers
+        );
+    }
+
+    public Map<String, Object> installGlobalPhaseTwoRootSample(JsonNode state) {
+        if (state == null || state.isNull()) {
+            throw new IllegalArgumentException("Global Phase 2 root sample state must not be null");
+        }
+
+        String rootAlias = textField(state, "rootAlias", plan.getRootAlias());
+        int sampleSize = intField(state, "sampleSize", 0);
+        long rootTuplesSeen = longField(state, "rootTuplesSeen", 0L);
+        long positiveRootCandidatesSeen = longField(state, "positiveRootCandidatesSeen", 0L);
+        double totalRootGroupWeight = doubleField(state, "totalRootGroupWeight", 0.0d);
+
+        JsonNode samples = state.get("entries");
+
+        if (samples == null || !samples.isArray()) {
+            samples = state.get("sampleInstances");
+        }
+
+        if (samples == null || !samples.isArray()) {
+            throw new IllegalArgumentException("Global Phase 2 root sample state has no entries/sampleInstances array: "
+                    + state);
+        }
+
+        List<OnePassRootSampleInstance> instances = new ArrayList<OnePassRootSampleInstance>();
+
+        for (int i = 0; i < samples.size(); i++) {
+            JsonNode sample = samples.get(i);
+
+            long sampleInstanceId = longField(sample, "sampleInstanceId", i);
+            long candidateId = longField(sample, "candidateId", sampleInstanceId);
+            JsonNode rootTuple = sample.get("rootTuple");
+            double rootGroupWeight = doubleField(sample, "rootGroupWeight", 0.0d);
+
+            if (rootTuple == null || rootTuple.isNull()) {
+                throw new IllegalArgumentException("Sample is missing rootTuple: " + sample);
+            }
+
+            OnePassRootSampleCandidate candidate = new OnePassRootSampleCandidate(
+                    candidateId,
+                    rootAlias,
+                    rootTuple,
+                    rootGroupWeight
+            );
+
+            instances.add(new OnePassRootSampleInstance(sampleInstanceId, candidate));
+        }
+
+        OnePassRootSampleResult globalResult = new OnePassRootSampleResult(
+                rootAlias,
+                sampleSize,
+                rootTuplesSeen,
+                positiveRootCandidatesSeen,
+                totalRootGroupWeight,
+                instances
+        );
+
+        lifecycle.installGlobalPhaseTwoRootSampleResult(globalResult);
+
+        Map<String, Object> summary = new LinkedHashMap<String, Object>();
+        summary.put("installed", true);
+        summary.put("stateRef", textField(state, "stateRef", ""));
+        summary.put("rootAlias", rootAlias);
+        summary.put("sampleSize", sampleSize);
+        summary.put("sampleInstanceCount", instances.size());
+        summary.put("rootTuplesSeen", rootTuplesSeen);
+        summary.put("positiveRootCandidatesSeen", positiveRootCandidatesSeen);
+        summary.put("totalRootGroupWeight", totalRootGroupWeight);
+        summary.put("nextLifecyclePhase", lifecycle.getPhase().name());
+
+        System.out.println("[OnePassSamplerSdeSynopsis] Installed global Phase 2 root sample: " + summary);
+
+        return summary;
+    }
+
+    private static long longField(JsonNode node, String fieldName, long defaultValue) {
+        if (node == null || node.isNull()) return defaultValue;
+        JsonNode field = node.get(fieldName);
+        if (field == null || field.isNull()) return defaultValue;
+        return field.asLong(defaultValue);
+    }
+
+    private static double doubleField(JsonNode node, String fieldName, double defaultValue) {
+        if (node == null || node.isNull()) return defaultValue;
+        JsonNode field = node.get(fieldName);
+        if (field == null || field.isNull()) return defaultValue;
+        return field.asDouble(defaultValue);
+    }
+
+    private static int intField(JsonNode node, String fieldName, int defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asInt(defaultValue);
     }
 
 }

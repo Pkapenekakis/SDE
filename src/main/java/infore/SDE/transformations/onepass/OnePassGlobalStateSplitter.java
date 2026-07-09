@@ -2,6 +2,7 @@ package infore.SDE.transformations.onepass;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Estimation;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.util.Collector;
@@ -15,14 +16,16 @@ import java.util.Map;
 /**
  * Splits merged OnePass global state into Kafka-installable chunks.
  *
- * Milestone 2A:
+ * Supported states:
  *
  *   GLOBAL_PHASE1_RESULT
- *      -> GLOBAL_STATE_CHUNK records
- *      -> onepass-global-state-topic
+ *      -> GLOBAL_STATE_CHUNK records with stateType=GLOBAL_PHASE1_INDEX
+ *
+ *   GLOBAL_PHASE2_ROOT_SAMPLE
+ *      -> GLOBAL_STATE_CHUNK records with stateType=GLOBAL_PHASE2_ROOT_SAMPLE
  *
  * This class does not install the state into workers.
- * It only prepares the payload path.
+ * It only prepares the payload path through globalStateTopic.
  */
 public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estimation, String> {
 
@@ -31,14 +34,19 @@ public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estima
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final int ONEPASS_SYNOPSIS_ID = 30;
+
     private static final int GLOBAL_PHASE1_RESULT_REQUEST_ID = 73;
+    private static final int GLOBAL_PHASE2_ROOT_SAMPLE_REQUEST_ID = 83;
 
     private static final String TYPE_GLOBAL_PHASE1_RESULT = "GLOBAL_PHASE1_RESULT";
+    private static final String TYPE_GLOBAL_PHASE2_ROOT_SAMPLE = "GLOBAL_PHASE2_ROOT_SAMPLE";
+
     private static final String TYPE_GLOBAL_STATE_CHUNK = "GLOBAL_STATE_CHUNK";
     private static final String STATE_TYPE_GLOBAL_PHASE1_INDEX = "GLOBAL_PHASE1_INDEX";
+    private static final String STATE_TYPE_GLOBAL_PHASE2_ROOT_SAMPLE = "GLOBAL_PHASE2_ROOT_SAMPLE";
 
     /*
-     * For the current test this will produce one chunk per worker.
+     * For the current test this chunks by number of flattened index entries.
      * Later we can make this byte-based instead of entry-count-based.
      */
     private static final int DEFAULT_MAX_ENTRIES_PER_CHUNK = 1000;
@@ -67,7 +75,10 @@ public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estima
             return;
         }
 
-        if (value.getRequestID() != GLOBAL_PHASE1_RESULT_REQUEST_ID) {
+        int requestId = value.getRequestID();
+
+        if (requestId != GLOBAL_PHASE1_RESULT_REQUEST_ID
+                && requestId != GLOBAL_PHASE2_ROOT_SAMPLE_REQUEST_ID) {
             return;
         }
 
@@ -79,9 +90,21 @@ public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estima
 
         String type = textField(payload, "type", "");
 
-        if (!TYPE_GLOBAL_PHASE1_RESULT.equals(type)) {
+        if (TYPE_GLOBAL_PHASE1_RESULT.equals(type)) {
+            splitPhaseOneGlobalIndex(payload, value, out);
             return;
         }
+
+        if (TYPE_GLOBAL_PHASE2_ROOT_SAMPLE.equals(type)) {
+            splitPhaseTwoRootSample(payload, value, out);
+            return;
+        }
+    }
+
+    private void splitPhaseOneGlobalIndex(
+            JsonNode payload,
+            Estimation value,
+            Collector<String> out) throws Exception {
 
         int uid = intField(payload, "uid", value.getUID());
         String phase = textField(payload, "phase", "PHASE1");
@@ -193,6 +216,85 @@ public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estima
                 + ", expectedWorkers=" + expectedWorkers);
     }
 
+    private void splitPhaseTwoRootSample(
+            JsonNode payload,
+            Estimation value,
+            Collector<String> out) throws Exception {
+
+        int uid = intField(payload, "uid", value.getUID());
+        int expectedWorkers = intField(payload, "expectedWorkers", value.getNoOfP());
+
+        if (expectedWorkers <= 0) {
+            expectedWorkers = value.getNoOfP() > 0 ? value.getNoOfP() : 1;
+        }
+
+        String resultId = textField(payload, "resultId", "PHASE2_RESULT_" + uid);
+        String stateRef = textField(payload, "stateRef", uid + "_PHASE2_" + resultId + "_GLOBAL_ROOT_SAMPLE");
+        String baseKey = textField(payload, "baseKey", "");
+        String queryName = textField(payload, "queryName", "");
+        String rootAlias = textField(payload, "rootAlias", "");
+        String datasetSeed = textField(payload, "datasetSeed", "");
+
+        if (baseKey == null || baseKey.trim().isEmpty()) {
+            baseKey = "onepass-" + uid;
+        }
+
+        JsonNode sampleInstances = payload.get("sampleInstances");
+
+        if (sampleInstances == null || !sampleInstances.isArray()) {
+            sampleInstances = MAPPER.createArrayNode();
+        }
+
+        JsonNode globalReservoir = payload.get("globalReservoir");
+
+        for (int workerId = 0; workerId < expectedWorkers; workerId++) {
+            ObjectNode chunk = MAPPER.createObjectNode();
+
+            String workerKey = baseKey + "_" + expectedWorkers + "_KEYED_" + workerId;
+
+            chunk.put("type", TYPE_GLOBAL_STATE_CHUNK);
+            chunk.put("stateType", STATE_TYPE_GLOBAL_PHASE2_ROOT_SAMPLE);
+            chunk.put("uid", uid);
+            chunk.put("synopsisID", ONEPASS_SYNOPSIS_ID);
+            chunk.put("phase", "PHASE2");
+            chunk.put("resultId", resultId);
+            chunk.put("stateRef", stateRef);
+            chunk.put("queryName", queryName);
+            chunk.put("rootAlias", rootAlias);
+            chunk.put("baseKey", baseKey);
+            chunk.put("datasetSeed", datasetSeed);
+            chunk.put("expectedWorkers", expectedWorkers);
+            chunk.put("workerId", workerId);
+            chunk.put("workerKey", workerKey);
+            chunk.put("chunkId", 0);
+            chunk.put("chunkCount", 1);
+            chunk.put("sampleSize", intField(payload, "sampleSize", 0));
+            chunk.put("rootTuplesSeen", longField(payload, "rootTuplesSeen", 0L));
+            chunk.put("positiveRootCandidatesSeen", longField(payload, "positiveRootCandidatesSeen", 0L));
+            chunk.put("totalRootGroupWeight", doubleField(payload, "totalRootGroupWeight", 0.0d));
+            chunk.put("sampleInstanceCount", sampleInstances.size());
+
+            /*
+             * Reuse the generic chunk assembly field name.
+             * For Phase 2, entries == root sample instances.
+             */
+            chunk.set("entries", sampleInstances.deepCopy());
+
+            if (globalReservoir != null && globalReservoir.isArray()) {
+                chunk.set("globalReservoir", globalReservoir.deepCopy());
+            }
+
+            out.collect(MAPPER.writeValueAsString(chunk));
+        }
+
+        System.out.println("[OnePassGlobalStateSplitter] Emitted Phase2 root sample chunks: "
+                + "uid=" + uid
+                + ", resultId=" + resultId
+                + ", stateRef=" + stateRef
+                + ", sampleInstances=" + sampleInstances.size()
+                + ", expectedWorkers=" + expectedWorkers);
+    }
+
     private static List<Map<String, Object>> flattenPhaseOneEdgeIndexes(JsonNode edgeIndexes) {
         List<Map<String, Object>> entries = new ArrayList<Map<String, Object>>();
 
@@ -284,5 +386,33 @@ public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estima
         }
 
         return field.asInt(defaultValue);
+    }
+
+    private static long longField(JsonNode node, String fieldName, long defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asLong(defaultValue);
+    }
+
+    private static double doubleField(JsonNode node, String fieldName, double defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asDouble(defaultValue);
     }
 }

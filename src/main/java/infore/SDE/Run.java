@@ -383,6 +383,10 @@ public class Run {
 			return true;
 		}
 
+		if (value.getRequestID() == 85 && "INSTALL_ROOT_SAMPLE_ACK".equals(type)) {
+			return true;
+		}
+
 		return false;
 	}
 
@@ -396,7 +400,7 @@ public class Run {
 		}
 
 		String type = firstParam(value);
-		return value.getRequestID() == 7 && "INSTALL_GLOBAL_INDEX".equals(type);
+		return value.getRequestID() == 7 && ("INSTALL_GLOBAL_INDEX".equals(type) || "INSTALL_ROOT_SAMPLE".equals(type));
 	}
 
 	private static boolean isOnePassPostReduceCoordinatorMessage(Estimation value) {
@@ -409,7 +413,15 @@ public class Run {
 		}
 
 		String type = firstParam(value);
-		return value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(type);
+		if (value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(type)) {
+			return true;
+		}
+
+		if (value.getRequestID() == 83 && "GLOBAL_PHASE2_ROOT_SAMPLE".equals(type)) {
+			return true;
+		}
+
+		return false;
 	}
 
 	private static String firstParam(Estimation value) {

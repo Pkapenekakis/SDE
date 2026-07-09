@@ -35,11 +35,14 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
     private static final int ONEPASS_DATA_BARRIER_REQUEST_ID = 70;
     private static final int ONEPASS_COORDINATOR_REQUEST_ID = 71;
     private static final int ONEPASS_LOCAL_PHASE1_RESULT_REQUEST_ID = 72;
-
     private static final int ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID = 73; //actual merged Phase1 result
     private static final int ONEPASS_GLOBAL_PHASE1_RESULT_READY_REQUEST_ID = 74; //coordinator ready event
     private static final int ONEPASS_INSTALL_GLOBAL_INDEX_ACK_REQUEST_ID = 75;
     private static final int ONEPASS_GLOBAL_PHASE1_INDEX_INSTALLED_REQUEST_ID = 76;
+    private static final int ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_REQUEST_ID = 83;
+    private static final int ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_READY_REQUEST_ID = 84;
+    private static final int ONEPASS_INSTALL_ROOT_SAMPLE_ACK_REQUEST_ID = 85;
+    private static final int ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED_REQUEST_ID = 86;
 
 
     private static final int ONEPASS_SYNOPSIS_ID = 30;
@@ -54,6 +57,12 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
     private static final String TYPE_INSTALL_GLOBAL_INDEX = "INSTALL_GLOBAL_INDEX";
     private static final String TYPE_INSTALL_GLOBAL_INDEX_ACK = "INSTALL_GLOBAL_INDEX_ACK";
     private static final String TYPE_GLOBAL_PHASE1_INDEX_INSTALLED = "GLOBAL_PHASE1_INDEX_INSTALLED";
+
+    private static final String TYPE_GLOBAL_PHASE2_ROOT_SAMPLE = "GLOBAL_PHASE2_ROOT_SAMPLE";
+    private static final String TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_READY = "GLOBAL_PHASE2_ROOT_SAMPLE_READY";
+    private static final String TYPE_INSTALL_ROOT_SAMPLE = "INSTALL_ROOT_SAMPLE";
+    private static final String TYPE_INSTALL_ROOT_SAMPLE_ACK = "INSTALL_ROOT_SAMPLE_ACK";
+    private static final String TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED = "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED";
 
     private final Map<BarrierKey, BarrierAccumulator> barriers = new HashMap<BarrierKey, BarrierAccumulator>();
     private final Map<ResultKey, ResultAccumulator> phaseOneResults = new HashMap<ResultKey, ResultAccumulator>();
@@ -101,6 +110,17 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         if (input.getRequestID() == ONEPASS_INSTALL_GLOBAL_INDEX_ACK_REQUEST_ID
                 && TYPE_INSTALL_GLOBAL_INDEX_ACK.equals(type)) {
             handleInstallGlobalIndexAck(input, payload, out);
+            return;
+        }
+        if (input.getRequestID() == ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_REQUEST_ID
+                && TYPE_GLOBAL_PHASE2_ROOT_SAMPLE.equals(type)) {
+            handleGlobalPhaseTwoRootSample(input, payload, out);
+            return;
+        }
+
+        if (input.getRequestID() == ONEPASS_INSTALL_ROOT_SAMPLE_ACK_REQUEST_ID
+                && TYPE_INSTALL_ROOT_SAMPLE_ACK.equals(type)) {
+            handleInstallRootSampleAck(input, payload, out);
             return;
         }
     }
@@ -794,4 +814,196 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         );
     }
 
+    private void handleGlobalPhaseTwoRootSample(
+            Estimation input,
+            JsonNode payload,
+            Collector<Estimation> out) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String resultId = textField(payload, "resultId", "PHASE2_RESULT_" + uid);
+        String rootAlias = textField(payload, "rootAlias", "");
+        String stateRef = textField(payload, "stateRef", uid + "_PHASE2_" + resultId + "_GLOBAL_ROOT_SAMPLE");
+        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
+
+        Map<String, Object> readyPayload = new LinkedHashMap<String, Object>();
+        readyPayload.put("type", TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_READY);
+        readyPayload.put("uid", uid);
+        readyPayload.put("phase", "PHASE2");
+        readyPayload.put("resultId", resultId);
+        readyPayload.put("rootAlias", rootAlias);
+        readyPayload.put("stateRef", stateRef);
+        readyPayload.put("expectedWorkers", expectedWorkers);
+        readyPayload.put("sampleSize", intField(payload, "sampleSize", 0));
+        readyPayload.put("sampleInstanceCount", intField(payload, "sampleInstanceCount", 0));
+        readyPayload.put("rootTuplesSeen", longField(payload, "rootTuplesSeen", 0L));
+        readyPayload.put("positiveRootCandidatesSeen", longField(payload, "positiveRootCandidatesSeen", 0L));
+        readyPayload.put("totalRootGroupWeight", doubleField(payload, "totalRootGroupWeight", 0.0d));
+
+        String readyJson = MAPPER.writeValueAsString(readyPayload);
+        String readyKey = uid + "_PHASE2_" + resultId + "_READY";
+
+        out.collect(new Estimation(
+                uid,
+                readyKey,
+                ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_READY_REQUEST_ID,
+                ONEPASS_SYNOPSIS_ID,
+                readyKey,
+                readyJson,
+                new String[] {
+                        TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_READY,
+                        resultId,
+                        "PHASE2",
+                        rootAlias,
+                        stateRef,
+                        Integer.toString(expectedWorkers)
+                },
+                expectedWorkers
+        ));
+
+        out.collect(buildInstallRootSampleCommand(input, payload, stateRef, expectedWorkers));
+    }
+
+    private Estimation buildInstallRootSampleCommand(
+            Estimation input,
+            JsonNode payload,
+            String stateRef,
+            int expectedWorkers) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String resultId = textField(payload, "resultId", "PHASE2_RESULT_" + uid);
+        String rootAlias = textField(payload, "rootAlias", "");
+        String baseKey = textField(payload, "baseKey", "");
+
+        if (baseKey == null || baseKey.trim().isEmpty()) {
+            baseKey = input.getKey();
+        }
+
+        Map<String, Object> commandPayload = new LinkedHashMap<String, Object>();
+        commandPayload.put("type", TYPE_INSTALL_ROOT_SAMPLE);
+        commandPayload.put("uid", uid);
+        commandPayload.put("phase", "PHASE2");
+        commandPayload.put("resultId", resultId);
+        commandPayload.put("rootAlias", rootAlias);
+        commandPayload.put("stateRef", stateRef);
+        commandPayload.put("baseKey", baseKey);
+        commandPayload.put("expectedWorkers", expectedWorkers);
+
+        String json = MAPPER.writeValueAsString(commandPayload);
+
+        String[] param = new String[] {
+                TYPE_INSTALL_ROOT_SAMPLE,
+                stateRef,
+                resultId,
+                "PHASE2",
+                rootAlias,
+                Integer.toString(expectedWorkers)
+        };
+
+        return new Estimation(
+                uid,
+                baseKey,
+                7,
+                ONEPASS_SYNOPSIS_ID,
+                baseKey,
+                json,
+                param,
+                expectedWorkers
+        );
+    }
+
+    private void handleInstallRootSampleAck(
+            Estimation input,
+            JsonNode payload,
+            Collector<Estimation> out) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String stateRef = textField(payload, "stateRef", "");
+        String phase = textField(payload, "phase", "PHASE2");
+        String rootAlias = textField(payload, "rootAlias", "");
+        int workerId = intField(payload, "workerId", -1);
+        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
+        boolean installed = booleanField(payload, "installed", false);
+
+        if (workerId < 0) {
+            System.out.println("[OnePassCoordinator] Ignoring INSTALL_ROOT_SAMPLE_ACK with invalid workerId: " + payload);
+            return;
+        }
+
+        InstallKey key = new InstallKey(uid, stateRef);
+
+        if (completedInstalls.contains(key)) {
+            return;
+        }
+
+        InstallAccumulator acc = installAccumulators.get(key);
+
+        if (acc == null) {
+            acc = new InstallAccumulator(uid, stateRef, phase, rootAlias, expectedWorkers);
+            installAccumulators.put(key, acc);
+        }
+
+        acc.expectedWorkers = Math.max(acc.expectedWorkers, expectedWorkers);
+        acc.receivedWorkers.add(workerId);
+
+        if (!installed) {
+            acc.failedWorkers.add(workerId);
+        }
+
+        System.out.println("[OnePassCoordinator] INSTALL_ROOT_SAMPLE_ACK received: "
+                + key
+                + ", workerId=" + workerId
+                + ", installed=" + installed
+                + ", received=" + acc.receivedWorkers.size() + "/" + acc.expectedWorkers);
+
+        if (acc.isComplete()) {
+            Map<String, Object> readyPayload = new LinkedHashMap<String, Object>();
+            readyPayload.put("type", TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED);
+            readyPayload.put("uid", acc.uid);
+            readyPayload.put("phase", acc.phase);
+            readyPayload.put("rootAlias", acc.rootAlias);
+            readyPayload.put("stateRef", acc.stateRef);
+            readyPayload.put("expectedWorkers", acc.expectedWorkers);
+            readyPayload.put("receivedWorkers", acc.receivedWorkers);
+            readyPayload.put("failedWorkers", acc.failedWorkers);
+            readyPayload.put("installedWorkerCount", acc.receivedWorkers.size());
+
+            String json = MAPPER.writeValueAsString(readyPayload);
+            String estimationKey = acc.uid + "_PHASE2_ROOT_SAMPLE_INSTALLED_" + acc.stateRef;
+
+            out.collect(new Estimation(
+                    acc.uid,
+                    estimationKey,
+                    ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED_REQUEST_ID,
+                    ONEPASS_SYNOPSIS_ID,
+                    estimationKey,
+                    json,
+                    new String[] {
+                            TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED,
+                            acc.stateRef,
+                            acc.phase,
+                            acc.rootAlias,
+                            Integer.toString(acc.receivedWorkers.size()),
+                            Integer.toString(acc.expectedWorkers)
+                    },
+                    acc.expectedWorkers
+            ));
+
+            installAccumulators.remove(key);
+            completedInstalls.add(key);
+        }
+    }
+
+    private static long longField(JsonNode node, String fieldName, long defaultValue) {
+        if (node == null || node.isNull()) return defaultValue;
+        JsonNode field = node.get(fieldName);
+        if (field == null || field.isNull()) return defaultValue;
+        return field.asLong(defaultValue);
+    }
+
+    private static double doubleField(JsonNode node, String fieldName, double defaultValue) {
+        if (node == null || node.isNull()) return defaultValue;
+        JsonNode field = node.get(fieldName);
+        if (field == null || field.isNull()) return defaultValue;
+        return field.asDouble(defaultValue);
+    }
 }

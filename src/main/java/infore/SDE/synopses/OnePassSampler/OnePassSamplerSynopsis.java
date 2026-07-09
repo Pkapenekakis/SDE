@@ -390,6 +390,14 @@ public final class OnePassSamplerSynopsis implements Serializable {
         return phaseThreeState == null ? null : phaseThreeState.getActiveAlias();
     }
 
+    public OnePassPhaseTwoState getPhaseTwoState() {
+        return phaseTwoState;
+    }
+
+    public String getDatasetSeed() {
+        return plan.getDatasetSeed();
+    }
+
     @Override
     public String toString() {
         return "OnePassSamplerSynopsis{" +
@@ -399,5 +407,34 @@ public final class OnePassSamplerSynopsis implements Serializable {
                 ", leafToRootOrder=" + plan.getLeafToRootOrder() +
                 ", rootToLeafOrder=" + plan.getRootToLeafOrder() +
                 '}';
+    }
+
+    public OnePassRootSampleResult installGlobalPhaseTwoRootSampleResult(
+            OnePassRootSampleResult globalPhaseTwoResult) {
+
+        if (globalPhaseTwoResult == null) {
+            throw new IllegalArgumentException("globalPhaseTwoResult must not be null");
+        }
+
+        if (phase != Phase.PHASE_2 && phase != Phase.PHASE_3) {
+            throw new IllegalStateException(
+                    "installGlobalPhaseTwoRootSampleResult() is only valid during PHASE_2 or PHASE_3. Current phase: "
+                            + phase
+            );
+        }
+
+        if (phaseOneResult == null) {
+            throw new IllegalStateException("Cannot install Phase 2 root sample before Phase 1 result is available.");
+        }
+
+        this.phaseTwoResult = globalPhaseTwoResult;
+        this.phaseThreeState = new OnePassPhaseThreeState(
+                phaseOneResult,
+                phaseTwoResult,
+                plan.getDatasetSeed()
+        );
+        this.phase = Phase.PHASE_3;
+
+        return this.phaseTwoResult;
     }
 }

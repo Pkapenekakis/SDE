@@ -282,4 +282,16 @@ public final class OnePassRootSampler implements Serializable {
 
         return result;
     }
+
+    public List<WeightedReservoirEntry<OnePassRootSampleCandidate>> getOrderedReservoir() {
+        return sampler.getOrderedReservoir();
+    }
+
+    public long getPositiveRootCandidatesSeen() {
+        return sampler.getPositiveItemsSeen();
+    }
+
+    public double getTotalRootGroupWeight() {
+        return sampler.getTotalWeight();
+    }
 }

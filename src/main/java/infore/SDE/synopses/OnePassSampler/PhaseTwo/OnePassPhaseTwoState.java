@@ -6,6 +6,7 @@ import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 
 import java.io.Serializable;
+import java.util.List;
 
 /**
  * Phase 2 state wrapper.
@@ -114,5 +115,21 @@ public final class OnePassPhaseTwoState implements Serializable {
 
     public long getRootTuplesSeen() {
         return rootSampler.getRootTuplesSeen();
+    }
+
+    public List<WeightedReservoirEntry<OnePassRootSampleCandidate>> getOrderedReservoir() {
+        return rootSampler.getOrderedReservoir();
+    }
+
+    public long getPositiveRootCandidatesSeen() {
+        return rootSampler.getPositiveRootCandidatesSeen();
+    }
+
+    public double getTotalRootGroupWeight() {
+        return rootSampler.getTotalRootGroupWeight();
+    }
+
+    public int getSampleSize() {
+        return rootSampler.getSampleSize();
     }
 }

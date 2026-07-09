@@ -90,7 +90,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
     private static final boolean PRINT_MATCHED_PAYLOADS = true;
 
-    private static final boolean EXPORT_FINAL_PHASE1_INDEX = true;
+    private static final boolean EXPORT_FINAL_PHASE1_INDEX = false;
     private static final String PHASE1_INDEX_EXPORT_DIR = "/tmp/onepass_wq3_alias_phase1_full_indexes.json";
 
     private OnePassSamplerSdeCoordinatorTest() {
@@ -305,8 +305,123 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 );
             }
 
+            /*
+             * PHASE 2:
+             *
+             * Now that the final global Phase 1 index is installed on every worker,
+             * all workers should be in PHASE_2.
+             *
+             * Stream the root alias, then finish Phase 2 and wait for the merged
+             * GLOBAL_PHASE2_ROOT_SAMPLE.
+             */
+            String rootAlias = plan.getRootAlias();
+            String phaseTwoResultId = "PHASE2_ROOT_" + uid;
+            String phaseTwoBarrierId = "TPCH_PHASE2_" + rootAlias + "_" + uid + "_" + System.nanoTime();
+
             System.out.println();
-            System.out.println("SUCCESS: SQL/TPC-H multi-alias Phase 1 coordinator test passed.");
+            System.out.println("=======================================================");
+            System.out.println("PHASE_2 root alias: " + rootAlias);
+            System.out.println("phaseTwoResultId = " + phaseTwoResultId);
+            System.out.println("phaseTwoBarrierId = " + phaseTwoBarrierId);
+            System.out.println("=======================================================");
+            System.out.println();
+
+            System.out.println("Streaming PHASE_2 root alias from TPC-H: " + rootAlias + "...");
+
+            long rootRowsSent = streamAlias(
+                    producer,
+                    DATA_TOPIC,
+                    baseKey,
+                    streamId,
+                    catalog,
+                    plan,
+                    rootAlias,
+                    TEST_ROW_LIMIT,
+                    plan.getRequiredFieldsByAlias()
+            );
+
+            producer.flush();
+
+            if (rootRowsSent <= 0L) {
+                throw new IllegalStateException("No rows were streamed for root alias " + rootAlias);
+            }
+
+            System.out.println("Rows sent for PHASE_2 root alias " + rootAlias + ": " + rootRowsSent);
+            System.out.println();
+
+            System.out.println("Sending PHASE_2 data barrier for root alias " + rootAlias + "...");
+
+            ObjectNode phaseTwoBarrierDatapoint = buildDataBarrierDatapoint(
+                    baseKey,
+                    streamId,
+                    uid,
+                    "PHASE2",
+                    rootAlias,
+                    phaseTwoBarrierId,
+                    EXPECTED_WORKERS
+            );
+
+            sendJson(producer, DATA_TOPIC, baseKey, phaseTwoBarrierDatapoint);
+            producer.flush();
+
+            System.out.println("Waiting for GLOBAL_BARRIER_READY for PHASE_2...");
+
+            JsonNode phaseTwoBarrierReady = waitForCoordinatorMessage(
+                    consumer,
+                    uid,
+                    "GLOBAL_BARRIER_READY",
+                    "barrierId",
+                    phaseTwoBarrierId,
+                    EXPECTED_WORKERS,
+                    TIMEOUT_MS
+            );
+
+            validateNoMissingSynopsisWorkers(phaseTwoBarrierReady);
+            printMatchedPayload("GLOBAL_BARRIER_READY PHASE2 " + rootAlias, phaseTwoBarrierReady);
+
+            System.out.println("Sending FINISH_PHASE_2 request...");
+
+            ObjectNode finishPhaseTwoRequest = buildFinishPhaseTwoRequest(
+                    baseKey,
+                    streamId,
+                    uid,
+                    phaseTwoResultId,
+                    EXPECTED_WORKERS
+            );
+
+            sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseTwoRequest);
+            producer.flush();
+
+            System.out.println("Waiting for GLOBAL_PHASE2_ROOT_SAMPLE...");
+
+            JsonNode globalPhaseTwoRootSample = waitForCoordinatorMessage(
+                    consumer,
+                    uid,
+                    "GLOBAL_PHASE2_ROOT_SAMPLE",
+                    "resultId",
+                    phaseTwoResultId,
+                    EXPECTED_WORKERS,
+                    TIMEOUT_MS
+            );
+
+            validateGlobalPhaseTwoRootSample(
+                    globalPhaseTwoRootSample,
+                    rootAlias,
+                    plan.getSampleSize(),
+                    EXPECTED_WORKERS
+            );
+
+            printMatchedPayload("GLOBAL_PHASE2_ROOT_SAMPLE", globalPhaseTwoRootSample);
+
+            System.out.println();
+            System.out.println("SUCCESS: PHASE_2 global root sample produced.");
+            System.out.println("rootAlias=" + rootAlias
+                    + ", rootRowsSent=" + rootRowsSent
+                    + ", sampleSize=" + plan.getSampleSize()
+                    + ", expectedWorkers=" + EXPECTED_WORKERS);
+
+            System.out.println();
+            System.out.println("SUCCESS: test passed.");
             System.out.println("Validated aliases=" + plan.getLeafToRootOrder() + ", expectedWorkers=" + EXPECTED_WORKERS);
 
         } finally {
@@ -373,6 +488,36 @@ public final class OnePassSamplerSdeCoordinatorTest {
         parameters.put("onePassResultId", resultId);
         parameters.put("onePassAlias", activeAlias);
         parameters.put("phaseOneAlias", activeAlias);
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static ObjectNode buildFinishPhaseTwoRequest(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String resultId,
+            int noOfP) {
+
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_UPDATE);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("FINISH_PHASE_2");
+        param.add(resultId);
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassCommand", "FINISH_PHASE_2");
+        parameters.put("onePassResultId", resultId);
         request.set("parameters", parameters);
 
         return request;
@@ -732,6 +877,128 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
     }
 
+    private static void validateGlobalPhaseTwoRootSample(
+            JsonNode payload,
+            String expectedRootAlias,
+            int expectedSampleSize,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"GLOBAL_PHASE2_ROOT_SAMPLE".equals(type)) {
+            throw new IllegalStateException(
+                    "Expected GLOBAL_PHASE2_ROOT_SAMPLE, got " + type + ". Payload: " + payload
+            );
+        }
+
+        String rootAlias = textField(payload, "rootAlias", "");
+
+        if (!expectedRootAlias.equals(rootAlias)) {
+            throw new IllegalStateException(
+                    "Expected rootAlias=" + expectedRootAlias
+                            + ", got " + rootAlias
+                            + ". Payload: " + payload
+            );
+        }
+
+        int localResultCount = intField(payload, "localResultCount", -1);
+
+        if (localResultCount != expectedWorkers) {
+            throw new IllegalStateException(
+                    "Expected localResultCount=" + expectedWorkers
+                            + ", got " + localResultCount
+                            + ". Payload: " + payload
+            );
+        }
+
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers == null
+                || !receivedWorkers.isArray()
+                || receivedWorkers.size() != expectedWorkers) {
+            throw new IllegalStateException(
+                    "Expected receivedWorkers size=" + expectedWorkers
+                            + ", got " + receivedWorkers
+                            + ". Payload: " + payload
+            );
+        }
+
+        long rootTuplesSeen = longField(payload, "rootTuplesSeen", -1L);
+        long positiveRootCandidatesSeen = longField(payload, "positiveRootCandidatesSeen", -1L);
+        double totalRootGroupWeight = doubleField(payload, "totalRootGroupWeight", 0.0d);
+
+        if (rootTuplesSeen <= 0L) {
+            throw new IllegalStateException(
+                    "Expected rootTuplesSeen > 0, got " + rootTuplesSeen
+                            + ". Payload: " + payload
+            );
+        }
+
+        if (positiveRootCandidatesSeen <= 0L) {
+            throw new IllegalStateException(
+                    "Expected positiveRootCandidatesSeen > 0, got "
+                            + positiveRootCandidatesSeen
+                            + ". Payload: " + payload
+            );
+        }
+
+        if (totalRootGroupWeight <= 0.0d) {
+            throw new IllegalStateException(
+                    "Expected totalRootGroupWeight > 0, got "
+                            + totalRootGroupWeight
+                            + ". Payload: " + payload
+            );
+        }
+
+        int sampleSize = intField(payload, "sampleSize", -1);
+
+        if (sampleSize != expectedSampleSize) {
+            throw new IllegalStateException(
+                    "Expected sampleSize=" + expectedSampleSize
+                            + ", got " + sampleSize
+                            + ". Payload: " + payload
+            );
+        }
+
+        int sampleInstanceCount = intField(payload, "sampleInstanceCount", -1);
+
+        if (sampleInstanceCount != expectedSampleSize) {
+            throw new IllegalStateException(
+                    "Expected sampleInstanceCount=" + expectedSampleSize
+                            + ", got " + sampleInstanceCount
+                            + ". Payload: " + payload
+            );
+        }
+
+        JsonNode sampleInstances = payload.get("sampleInstances");
+
+        if (sampleInstances == null
+                || !sampleInstances.isArray()
+                || sampleInstances.size() != expectedSampleSize) {
+            throw new IllegalStateException(
+                    "Expected sampleInstances size=" + expectedSampleSize
+                            + ", got " + sampleInstances
+                            + ". Payload: " + payload
+            );
+        }
+
+        JsonNode globalReservoir = payload.get("globalReservoir");
+
+        if (globalReservoir == null || !globalReservoir.isArray() || globalReservoir.size() <= 0) {
+            throw new IllegalStateException(
+                    "Expected non-empty globalReservoir. Payload: " + payload
+            );
+        }
+
+        System.out.println("Validated GLOBAL_PHASE2_ROOT_SAMPLE:"
+                + " rootAlias=" + rootAlias
+                + ", rootTuplesSeen=" + rootTuplesSeen
+                + ", positiveRootCandidatesSeen=" + positiveRootCandidatesSeen
+                + ", totalRootGroupWeight=" + totalRootGroupWeight
+                + ", globalReservoirSize=" + globalReservoir.size()
+                + ", sampleInstanceCount=" + sampleInstanceCount);
+    }
+
     private static JsonNode waitForCoordinatorMessage(
             KafkaConsumer<String, String> consumer,
             int uid,
@@ -888,6 +1155,20 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         return field.asDouble(defaultValue);
+    }
+
+    private static long longField(JsonNode node, String fieldName, long defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asLong(defaultValue);
     }
 
     private static void printMatchedPayload(String label, JsonNode payload) throws Exception {

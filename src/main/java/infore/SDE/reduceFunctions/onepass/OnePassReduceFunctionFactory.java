@@ -28,6 +28,16 @@ public final class OnePassReduceFunctionFactory {
             );
         }
 
+        if ("LOCAL_PHASE2_ROOT_SUMMARY".equals(type) || value.getRequestID() == 82) {
+            return new OnePassSampleReduceFunction(
+                    value.getNoOfP(),
+                    0,
+                    value.getParam(),
+                    value.getSynopsisID(),
+                    value.getRequestID()
+            );
+        }
+
         System.out.println("[OnePassReduceFactory] Unsupported OnePass reduce type: " + type
                 + ", requestID=" + value.getRequestID());
 
