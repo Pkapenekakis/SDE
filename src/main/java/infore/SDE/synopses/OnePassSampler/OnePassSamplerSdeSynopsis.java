@@ -755,10 +755,16 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         String[] param = new String[] {"LOCAL_PHASE1_RESULT", resultId, "PHASE1", "",
                 Integer.toString(workerId), Integer.toString(expectedWorkers)};
 
+        /*
         String estimationKey = request.getUID() + "_LOCAL_PHASE1_RESULT_" + workerId + "_" + resultId;
 
         return new Estimation(request.getUID(), estimationKey, 72, 30,
-                request.getKey(), json, param, expectedWorkers);
+                request.getKey(), json, param, expectedWorkers); */
+
+        String reduceKey = request.getUID() + "_PHASE1_" + resultId;
+
+        return new Estimation(request.getUID(), reduceKey, 72, 30,
+                reduceKey, json, param, expectedWorkers);
     }
 
 }

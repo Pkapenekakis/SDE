@@ -6,12 +6,7 @@ import infore.SDE.messages.Estimation;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.util.Collector;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 
 /**
  * First version of the One-pass* Flink coordinator.
@@ -40,13 +35,17 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
     private static final int ONEPASS_DATA_BARRIER_REQUEST_ID = 70;
     private static final int ONEPASS_COORDINATOR_REQUEST_ID = 71;
     private static final int ONEPASS_LOCAL_PHASE1_RESULT_REQUEST_ID = 72;
-    private static final int ONEPASS_GLOBAL_PHASE1_RESULT_READY_REQUEST_ID = 73;
+
+    private static final int ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID = 73; //actual merged Phase1 result
+    private static final int ONEPASS_GLOBAL_PHASE1_RESULT_READY_REQUEST_ID = 74; //coordinator ready event
+
     private static final int ONEPASS_SYNOPSIS_ID = 30;
 
     private static final String TYPE_DATA_BARRIER_ACK = "DATA_BARRIER_ACK";
     private static final String TYPE_GLOBAL_BARRIER_READY = "GLOBAL_BARRIER_READY";
 
     private static final String TYPE_LOCAL_PHASE1_RESULT = "LOCAL_PHASE1_RESULT";
+    private static final String TYPE_GLOBAL_PHASE1_RESULT = "GLOBAL_PHASE1_RESULT";
     private static final String TYPE_GLOBAL_PHASE1_RESULT_READY = "GLOBAL_PHASE1_RESULT_READY";
 
     private final Map<BarrierKey, BarrierAccumulator> barriers = new HashMap<BarrierKey, BarrierAccumulator>();
@@ -85,92 +84,106 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
             return;
         }
 
-        if (input.getRequestID() == ONEPASS_LOCAL_PHASE1_RESULT_REQUEST_ID
-                && TYPE_LOCAL_PHASE1_RESULT.equals(type)) {
-            handleLocalPhaseOneResult(input, payload, out);
+        if (input.getRequestID() == ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID && TYPE_GLOBAL_PHASE1_RESULT.equals(type)) {
+            handleGlobalPhaseOneResult(input, payload, out);
         }
     }
 
-    private void handleLocalPhaseOneResult(Estimation input, JsonNode payload, Collector<Estimation> out) throws Exception {
+    private void handleGlobalPhaseOneResult(Estimation input, JsonNode payload, Collector<Estimation> out) throws Exception {
 
         int uid = intField(payload, "uid", input.getUID());
         String phase = textField(payload, "phase", "PHASE1");
         String resultId = textField(payload, "resultId", "PHASE1_RESULT_" + uid);
 
-        int workerId = intField(payload, "workerId", -1);
-        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
-        int actualParallelism = intField(payload, "actualParallelism", expectedWorkers);
-
         String queryName = textField(payload, "queryName", "");
         String rootAlias = textField(payload, "rootAlias", "");
 
-        if (workerId < 0) {
-            System.out.println("[OnePassCoordinator] Ignoring LOCAL_PHASE1_RESULT with invalid workerId: "
-                    + payload.toString());
-            return;
-        }
+        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
+        int localResultCount = intField(payload, "localResultCount", -1);
 
         if (expectedWorkers <= 0) {
-            expectedWorkers = 1;
+            expectedWorkers = input.getNoOfP() > 0 ? input.getNoOfP() : 1;
         }
 
-        ResultKey key = new ResultKey(uid, resultId);
+        /*
+         * This is only a reference for now.
+         * In the next milestone, the Global State Splitter will write chunks
+         * with this stateRef into onepass-global-state-topic.
+         */
+        String stateRef = uid + "_PHASE1_" + resultId + "_GLOBAL_STATE";
 
-        if (completedPhaseOneResults.contains(key)) {
-            System.out.println("[OnePassCoordinator] Ignoring late duplicate LOCAL_PHASE1_RESULT for completed result: "
-                    + key + ", workerId=" + workerId);
-            return;
+        Map<String, Object> readyPayload = new LinkedHashMap<String, Object>();
+
+        readyPayload.put("type", TYPE_GLOBAL_PHASE1_RESULT_READY);
+        readyPayload.put("uid", uid);
+        readyPayload.put("phase", phase);
+        readyPayload.put("resultId", resultId);
+        readyPayload.put("queryName", queryName);
+        readyPayload.put("rootAlias", rootAlias);
+        readyPayload.put("expectedWorkers", expectedWorkers);
+        readyPayload.put("localResultCount", localResultCount);
+        readyPayload.put("stateRef", stateRef);
+
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers != null && !receivedWorkers.isNull()) {
+            readyPayload.put("receivedWorkers", MAPPER.convertValue(receivedWorkers, Object.class));
         }
 
-        ResultAccumulator acc = phaseOneResults.get(key);
+        JsonNode globalPhaseOneResult = payload.get("globalPhaseOneResult");
 
-        if (acc == null) {
-            acc = new ResultAccumulator(uid, phase, resultId, expectedWorkers, actualParallelism,
-                    input.getKey(), queryName, rootAlias);
+        if (globalPhaseOneResult != null && !globalPhaseOneResult.isNull()) {
+            JsonNode edgeIndexes = globalPhaseOneResult.get("edgeIndexes");
 
-            phaseOneResults.put(key, acc);
-        }
+            if (edgeIndexes != null && edgeIndexes.isObject()) {
+                Map<String, Object> edgeSummaries = new LinkedHashMap<String, Object>();
 
-        acc.expectedWorkers = Math.max(acc.expectedWorkers, expectedWorkers);
-        acc.actualParallelism = Math.max(acc.actualParallelism, actualParallelism);
+                Iterator<Map.Entry<String, JsonNode>> fields = edgeIndexes.fields();
 
-        boolean isNewWorker = acc.receivedWorkers.add(workerId);
+                while (fields.hasNext()) {
+                    Map.Entry<String, JsonNode> entry = fields.next();
 
-        if (!isNewWorker) {
-            System.out.println("[OnePassCoordinator] Duplicate LOCAL_PHASE1_RESULT ignored: "
-                    + key + ", workerId=" + workerId);
-            return;
-        }
+                    String edgeId = entry.getKey();
+                    JsonNode index = entry.getValue();
 
-        JsonNode phaseOneResult = payload.get("phaseOneResult");
+                    int numberOfKeys = index != null && index.isObject() ? index.size() : 0;
 
-        if (phaseOneResult != null && !phaseOneResult.isNull()) {
-            acc.localPhaseOneResultsByWorker.put(workerId, phaseOneResult.toString());
+                    Map<String, Object> summary = new LinkedHashMap<String, Object>();
+                    summary.put("numberOfKeys", numberOfKeys);
 
-            if(DEBUG_PRINT){
-                JsonNode seenTuplesByAlias = phaseOneResult.get("seenTuplesByAlias");
-                if (seenTuplesByAlias != null && !seenTuplesByAlias.isNull()) {
-                    System.out.println("[OnePassCoordinator] Worker "
-                            + workerId + " Phase 1 seenTuplesByAlias = " + seenTuplesByAlias.toString());
+                    edgeSummaries.put(edgeId, summary);
                 }
+
+                readyPayload.put("edgeSummaries", edgeSummaries);
             }
-
         }
 
-        System.out.println("[OnePassCoordinator] LOCAL_PHASE1_RESULT received: " + key + ", workerId=" + workerId +
-                ", received=" + acc.receivedWorkers.size() + "/" + acc.expectedWorkers);
+        String json = MAPPER.writeValueAsString(readyPayload);
 
-        if (acc.isComplete()) {
-            Estimation ready = buildGlobalPhaseOneResultReady(acc);
+        String[] param = new String[] {TYPE_GLOBAL_PHASE1_RESULT_READY, resultId, phase,
+                rootAlias, Integer.toString(localResultCount), Integer.toString(expectedWorkers)};
 
-            out.collect(ready);
+        String estimationKey = uid + "_PHASE1_" + resultId + "_READY";
 
-            phaseOneResults.remove(key);
-            completedPhaseOneResults.add(key);
+        Estimation ready = new Estimation(
+                uid,
+                estimationKey,
+                ONEPASS_GLOBAL_PHASE1_RESULT_READY_REQUEST_ID,
+                ONEPASS_SYNOPSIS_ID,
+                input.getKey(),
+                json,
+                param,
+                expectedWorkers
+        );
 
-            System.out.println("[OnePassCoordinator] GLOBAL_PHASE1_RESULT_READY emitted: "+ key
-                    + ", receivedWorkers=" + acc.receivedWorkers);
-        }
+        out.collect(ready);
+
+        System.out.println("[OnePassCoordinator] GLOBAL_PHASE1_RESULT_READY emitted: "
+                + "uid=" + uid
+                + ", resultId=" + resultId
+                + ", localResultCount=" + localResultCount
+                + ", expectedWorkers=" + expectedWorkers
+                + ", stateRef=" + stateRef);
     }
 
     private Estimation buildGlobalPhaseOneResultReady(ResultAccumulator acc) throws Exception {

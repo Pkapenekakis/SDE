@@ -12,6 +12,10 @@ import infore.SDE.sources.kafkaStringConsumer;
 
 import infore.SDE.sources.kafkaStringConsumer_Earliest;
 import infore.SDE.transformations.*;
+import infore.SDE.transformations.onepass.RoundRobinDataRouterCoFlatMap;
+import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorOperator;
+import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
+import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.streaming.api.collector.selector.OutputSelector;
@@ -29,6 +33,14 @@ import infore.SDE.messages.Request;
  * ATHENA Research and Innovation Center <br> *
  * Author: Antonis_Kontaxakis <br> *
  * email: adokontax15@gmail.com *
+ *
+ * OnePass* adds:
+ *   - OnePass-aware data routing
+ *   - OnePass worker partitioning
+ *   - OnePass coordinator control messages
+ *
+ * Heavy merge still happens in ReduceFlatMap.
+ * Coordinator only handles readiness / control messages.
  */
 
 
@@ -100,19 +112,81 @@ public class Run {
 				.flatMap(new RqRouterFlatMap()).name("REQUEST_ROUTER");
 
 
+		/*
 		DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
 				                                .flatMap(new dataRouterCoFlatMap()).name("DATA_ROUTER")
 												.keyBy((KeySelector<Datapoint, String>) Datapoint::getKey);
-
 
 		DataStream<Estimation> estimationStream = DataStream.keyBy((KeySelector<Datapoint, String>) Datapoint::getKey)
 				.connect(SynopsisRequests.keyBy((KeySelector<Request, String>) Request::getKey))
 				.flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
 
+		*/
+
+		//Replace generic dataRouter with round-robin for One-pass*
+		DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
+				.flatMap(new RoundRobinDataRouterCoFlatMap()).name("ONEPASS_AWARE_DATA_ROUTER");
 
 
+		/*
+		 * Force routed OnePass keys to the intended Flink worker.
+		 *
+		 * Important:
+		 * Do not keyBy again after partitionCustom, because keyBy may re-hash
+		 * _KEYED_0, _KEYED_1, ... into different subtasks.
+		 */
 
-		SplitStream<Estimation> split = estimationStream.split(new OutputSelector<Estimation>() {
+		DataStream<Datapoint> partitionedDataStream = DataStream
+				.partitionCustom(new OnePassWorkerPartitioner(),
+						(KeySelector<Datapoint, String>) Datapoint::getKey);
+
+		DataStream<Request> partitionedSynopsisRequests = SynopsisRequests
+				.partitionCustom(new OnePassWorkerPartitioner(),
+						(KeySelector<Request, String>) Request::getKey);
+
+		DataStream<Estimation> estimationStream = partitionedDataStream
+				.connect(partitionedSynopsisRequests)
+				.flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
+
+		/*
+		 * Pre-reduce coordinator input.
+		 *
+		 * These messages are pure synchronization/control messages.
+		 * They must not enter ReduceFlatMap.
+		 *
+		 * Example:
+		 *   DATA_BARRIER_ACK -> OnePassCoordinatorOperator -> GLOBAL_BARRIER_READY
+		 */
+		DataStream<Estimation> onePassPreReduceCoordinatorInput = estimationStream
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return isOnePassPreReduceCoordinatorMessage(value);
+					}
+				}).name("ONEPASS_PRE_REDUCE_COORDINATOR_INPUT");
+
+
+		/*
+		 * Normal estimation stream.
+		 *
+		 * Important:
+		 * LOCAL_PHASE1_RESULT must stay here, because it must be merged by
+		 * ReduceFlatMap into GLOBAL_PHASE1_RESULT.
+		 */
+		DataStream<Estimation> normalEstimationStream = estimationStream
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return !isOnePassPreReduceCoordinatorMessage(value) && !isOnePassControlAck(value);
+					}
+				}).name("NORMAL_ESTIMATION_STREAM");
+
+		//SplitStream<Estimation> split = estimationStream.split(new OutputSelector<Estimation>()
+		SplitStream<Estimation> split = normalEstimationStream.split(new OutputSelector<Estimation>() {
 			private static final long serialVersionUID = 1L;
 			@Override
 			public Iterable<String> select(Estimation value) {
@@ -157,10 +231,116 @@ public class Run {
 		//E.addSink(kp.getProducer());
 		//UR.addSink(pRequest.getProducer());
 
+
+		/*
+		 * Post-reduce coordinator input.
+		 *
+		 * These are already merged OnePass global results.
+		 * The coordinator must not merge them again.
+		 *
+		 * Example:
+		 *   GLOBAL_PHASE1_RESULT -> OnePassCoordinatorOperator -> GLOBAL_PHASE1_RESULT_READY
+		 */
+		DataStream<Estimation> onePassPostReduceCoordinatorInput = finalStream.
+				filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return isOnePassPostReduceCoordinatorMessage(value);
+					}
+				}).name("ONEPASS_POST_REDUCE_COORDINATOR_INPUT");
+
 		finalStream.addSink(kp.getProducer());
+
+		/*
+		 * Single OnePass coordinator stage.
+		 *
+		 * Receives:
+		 *   - pre-reduce ACKs
+		 *   - post-reduce global results
+		 *
+		 * Emits:
+		 *   - GLOBAL_BARRIER_READY
+		 *   - GLOBAL_PHASE1_RESULT_READY
+		 */
+		DataStream<Estimation> onePassCoordinatorOutput = onePassPreReduceCoordinatorInput
+						.union(onePassPostReduceCoordinatorInput)
+						.flatMap(new OnePassCoordinatorOperator())
+						.name("ONEPASS_COORDINATOR")
+						.setParallelism(1);
+
+		onePassCoordinatorOutput.addSink(kp.getProducer()).name("ONEPASS_COORDINATOR_OUTPUT");
+
 		env.execute("Streaming SDE");
 
 }
+
+	private static boolean isOnePassPreReduceCoordinatorMessage(Estimation value) {
+		if (value == null) {
+			return false;
+		}
+
+		if (value.getSynopsisID() != 30) {
+			return false;
+		}
+
+		String type = firstParam(value);
+		return value.getRequestID() == 70 && "DATA_BARRIER_ACK".equals(type);
+	}
+
+	private static boolean isOnePassPostReduceCoordinatorMessage(Estimation value) {
+		if (value == null) {
+			return false;
+		}
+
+		if (value.getSynopsisID() != 30) {
+			return false;
+		}
+
+		String type = firstParam(value);
+		return value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(type);
+	}
+
+	private static String firstParam(Estimation value) {
+		if (value == null) {
+			return "";
+		}
+
+		String[] param = value.getParam();
+
+		if (param == null || param.length == 0 || param[0] == null) {
+			return "";
+		}
+
+		return param[0].trim();
+	}
+
+	private static boolean isOnePassControlAck(Estimation value) {
+		if (value == null) {
+			return false;
+		}
+
+		if (value.getSynopsisID() != 30) {
+			return false;
+		}
+
+		/*
+		 * SDEcoFlatMap currently emits lightweight ACKs for RequestID=7 commands,
+		 * for example FINISH_PHASE_1. These ACKs are useful for debugging/tests,
+		 * but they are not mergeable algorithmic results.
+		 *
+		 * They should not enter ReduceFlatMap.
+		 */
+		if (value.getRequestID() != 7) {
+			return false;
+		}
+
+		String type = firstParam(value);
+
+		return "FINISH_PHASE_1".equals(type) || "FINISH_PHASE_2".equals(type) || "START_PHASE_3_ALIAS".equals(type)
+				|| "FINISH_PHASE_3_ALIAS".equals(type) || "FINISH_PHASE_3".equals(type) || "STATUS".equals(type);
+	}
 
 	private static void initializeParameters(String[] args) {
 

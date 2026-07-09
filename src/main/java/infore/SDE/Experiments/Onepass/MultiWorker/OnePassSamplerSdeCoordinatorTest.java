@@ -189,9 +189,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
             sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseOneRequest);
             producer.flush();
 
-            System.out.println("Waiting for GLOBAL_PHASE1_RESULT_READY...");
+            System.out.println("Waiting for GLOBAL_PHASE1_RESULT...");
 
-            JsonNode phaseOneReady = waitForCoordinatorMessage(consumer, uid, "GLOBAL_PHASE1_RESULT_READY",
+            JsonNode phaseOneReady = waitForCoordinatorMessage(consumer, uid, "GLOBAL_PHASE1_RESULT",
                     "resultId", phaseOneResultId, EXPECTED_WORKERS, TIMEOUT_MS);
 
             int localResultCount = phaseOneReady.has("localResultCount") ?

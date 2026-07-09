@@ -3,6 +3,7 @@ package infore.SDE.transformations;
 import infore.SDE.reduceFunctions.*;
 import infore.SDE.messages.Estimation;
 import infore.SDE.reduceFunctions.WLSH_Reduce;
+import infore.SDE.reduceFunctions.onepass.OnePassReduceFunctionFactory;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.util.Collector;
 
@@ -26,6 +27,13 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
             if (t_rf == null){
 
                 t_rf = initReduceFunction(value, id);
+
+                if (t_rf == null) {
+                    System.out.println("[ReduceFlatMap] No reducer for synopsisID=" + id + ", requestID=" +
+                            value.getRequestID() + ", estimationkey=" + value.getEstimationkey());
+                    return;
+                }
+
                 rf.put("" + key, t_rf);
 
             }else{
@@ -37,6 +45,9 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
                         rf.remove("" + key);
                         if(id == 28)
                             value.setEstimationkey(value.getUID()+"");
+                        if(id == 30){
+                            decorateOnePassReducedEstimation(value);
+                        }
                         out.collect(value);
                     }
 
@@ -104,6 +115,14 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
             //int workers, double th, int k, int t, String[] stock
             t_rf.add(value);
         }
+        //One-pass* SYNOPSIS
+        else if (id == 30) {
+            t_rf = OnePassReduceFunctionFactory.create(value);
+
+            if (t_rf != null) {
+                t_rf.add(value);
+            }
+        }
         return t_rf;
     }
 
@@ -111,6 +130,28 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
     private  String[] stringToStringArray(String param)
     {
         return param.split(";");
+    }
+
+    private void decorateOnePassReducedEstimation(Estimation value) {
+        String[] param = value.getParam();
+
+        if (value.getRequestID() == 72 && param != null && param.length > 0 && "LOCAL_PHASE1_RESULT".equals(param[0])) {
+
+            String resultId = "PHASE1_RESULT_" + value.getUID();
+
+            if (param.length > 1 && param[1] != null && !param[1].trim().isEmpty()) {
+                resultId = param[1].trim();
+            }
+
+            String globalKey = value.getUID() + "_PHASE1_" + resultId + "_GLOBAL";
+
+            value.setRequestID(73);
+            value.setEstimationkey(globalKey);
+            value.setKey(globalKey);
+
+            value.setParam(new String[] {"GLOBAL_PHASE1_RESULT", resultId, "PHASE1", "", "",
+                    Integer.toString(value.getNoOfP())});
+        }
     }
 
 }
