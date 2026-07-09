@@ -8,6 +8,8 @@ import java.util.*;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.synopses.OnePassSampler.OnePassSamplerSdeSynopsis;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOne;
@@ -28,6 +30,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	private static final long serialVersionUID = 1L;
 	private HashMap<String,ArrayList<Synopsis>> M_Synopses = new HashMap<>();
 	private HashMap<String,ArrayList<ContinuousSynopsis>> MC_Synopses = new HashMap<>();
+	private HashMap<String, Map<Integer, JsonNode>> onePassGlobalStateChunksByRef = new HashMap<String, Map<Integer, JsonNode>>();
+	private HashMap<String, JsonNode> onePassGlobalStatesByRef = new HashMap<String, JsonNode>();
+	private HashMap<String, Request> pendingOnePassInstallRequestsByRef = new HashMap<String, Request>();
 	private int pId;
 	private static final ObjectMapper MAPPER = new ObjectMapper();
 	private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
@@ -38,6 +43,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	public void flatMap1(Datapoint node, Collector<Estimation> collector) throws JsonProcessingException {
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(node.getKey());
 
+		if (isOnePassGlobalStateChunk(node)) {
+			handleOnePassGlobalStateChunk(node, Synopses, collector);
+			return;
+		}
 		/*
 		 * One-pass* data-path barrier.
 		 *
@@ -333,6 +342,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				command = rq.getParam()[0];
 			}
 
+			if ("INSTALL_GLOBAL_INDEX".equalsIgnoreCase(command)) {
+				handleInstallGlobalIndexRequest(rq, Synopses, collector);
+				M_Synopses.put(rq.getKey(), Synopses);
+				return;
+			}
+
 			for (Synopsis syn : Synopses) {
 				if (rq.getUID() == syn.getSynopsisID()) {
 					if (syn instanceof OnePassSamplerSdeSynopsis) {
@@ -364,9 +379,17 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 							String resultId = resolveOnePassResultId(rq, "PHASE1_RESULT_" + rq.getUID());
 
+							String activeAlias = resolveOnePassPhaseOneAlias(rq);
+
 							Estimation localPhaseOneResult =
-									onePass.buildLocalPhaseOneResultEstimation(rq, pId, expectedWorkers,
-											actualParallelism, resultId);
+									onePass.buildLocalPhaseOneResultEstimation(
+											rq,
+											pId,
+											expectedWorkers,
+											actualParallelism,
+											resultId,
+											activeAlias
+									);
 
 							collector.collect(localPhaseOneResult);
 
@@ -374,7 +397,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 									+ rq.getUID()
 									+ ", workerId=" + pId
 									+ ", expectedWorkers=" + expectedWorkers
-									+ ", resultId=" + resultId);
+									+ ", resultId=" + resultId
+									+ ", activeAlias=" + activeAlias);
 						}
 						System.out.println("[OnePass UPDATE] command = " + command);
 
@@ -622,6 +646,420 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		return defaultValue;
+	}
+
+	private boolean isOnePassGlobalStateChunk(Datapoint node) {
+		if (node == null || node.getValues() == null || node.getValues().isNull()) {
+			return false;
+		}
+
+		JsonNode values = node.getValues();
+		JsonNode typeNode = values.get("type");
+
+		return typeNode != null
+				&& "GLOBAL_STATE_CHUNK".equals(typeNode.asText(""));
+	}
+
+	private void handleOnePassGlobalStateChunk(
+			Datapoint node,
+			ArrayList<Synopsis> synopses,
+			Collector<Estimation> collector) {
+
+		JsonNode chunk = node.getValues();
+
+		String stateRef = textField(chunk, "stateRef", "");
+		int chunkId = intField(chunk, "chunkId", -1);
+		int chunkCount = intField(chunk, "chunkCount", -1);
+
+		if (stateRef == null || stateRef.trim().isEmpty()) {
+			System.out.println("[OnePass GLOBAL_STATE_CHUNK] Ignoring chunk without stateRef: " + chunk);
+			return;
+		}
+
+		if (chunkId < 0 || chunkCount <= 0) {
+			System.out.println("[OnePass GLOBAL_STATE_CHUNK] Ignoring invalid chunk metadata: " + chunk);
+			return;
+		}
+
+		Map<Integer, JsonNode> chunks = onePassGlobalStateChunksByRef.get(stateRef);
+
+		if (chunks == null) {
+			chunks = new HashMap<Integer, JsonNode>();
+			onePassGlobalStateChunksByRef.put(stateRef, chunks);
+		}
+
+		chunks.put(chunkId, chunk);
+
+		System.out.println("[OnePass GLOBAL_STATE_CHUNK] received stateRef="
+				+ stateRef
+				+ ", chunkId=" + chunkId
+				+ ", chunkCount=" + chunkCount
+				+ ", key=" + node.getKey()
+				+ ", received=" + chunks.size() + "/" + chunkCount);
+
+		if (chunks.size() >= chunkCount) {
+			JsonNode assembled = assembleGlobalState(stateRef, chunks, chunkCount);
+
+			onePassGlobalStatesByRef.put(stateRef, assembled);
+			onePassGlobalStateChunksByRef.remove(stateRef);
+
+			System.out.println("[OnePass GLOBAL_STATE_READY_LOCAL] stateRef="
+					+ stateRef
+					+ ", key=" + node.getKey()
+					+ ", entries=" + assembled.get("entries").size());
+
+			Request pending = pendingOnePassInstallRequestsByRef.remove(stateRef);
+
+			if (pending != null) {
+				System.out.println("[OnePass INSTALL_GLOBAL_INDEX] pending request found after chunks completed. stateRef="
+						+ stateRef);
+
+				handleInstallGlobalIndexRequest(pending, synopses, collector);
+			}
+		}
+	}
+
+	private static String resolveOnePassPhaseOneAlias(Request request) {
+		if (request == null) {
+			return "";
+		}
+
+		JsonNode parameters = request.getParameters();
+
+		if (parameters != null && !parameters.isNull()) {
+			JsonNode aliasNode = parameters.get("onePassAlias");
+
+			if (aliasNode == null || aliasNode.isNull()) {
+				aliasNode = parameters.get("phaseOneAlias");
+			}
+
+			if (aliasNode != null && !aliasNode.isNull()) {
+				String value = aliasNode.asText();
+
+				if (value != null && !value.trim().isEmpty()) {
+					return value.trim();
+				}
+			}
+		}
+
+		String[] param = request.getParam();
+
+		/*
+		 * Expected multi-alias form:
+		 *   param[0] = FINISH_PHASE_1
+		 *   param[1] = resultId
+		 *   param[2] = activeAlias
+		 */
+		if (param != null && param.length > 2 && param[2] != null) {
+			String value = param[2];
+
+			if (!value.trim().isEmpty()) {
+				return value.trim();
+			}
+		}
+
+		return "";
+	}
+
+	private JsonNode assembleGlobalState(String stateRef, Map<Integer, JsonNode> chunks, int chunkCount) {
+		ObjectNode assembled = MAPPER.createObjectNode();
+
+		JsonNode first = chunks.get(0);
+
+		if (first == null) {
+			throw new IllegalStateException("Missing chunk 0 for stateRef=" + stateRef);
+		}
+
+		assembled.put("type", "GLOBAL_PHASE1_INDEX");
+		assembled.put("stateRef", stateRef);
+
+		copyIfPresent(first, assembled, "stateType");
+		copyIfPresent(first, assembled, "uid");
+		copyIfPresent(first, assembled, "synopsisID");
+		copyIfPresent(first, assembled, "phase");
+		copyIfPresent(first, assembled, "resultId");
+		copyIfPresent(first, assembled, "queryName");
+		copyIfPresent(first, assembled, "rootAlias");
+		copyIfPresent(first, assembled, "baseKey");
+		copyIfPresent(first, assembled, "expectedWorkers");
+		copyIfPresent(first, assembled, "workerId");
+		copyIfPresent(first, assembled, "workerKey");
+		copyIfPresent(first, assembled, "seenTuplesByAlias");
+		copyIfPresent(first, assembled, "edgeSummaries");
+		copyIfPresent(first, assembled, "activeAlias");
+		copyIfPresent(first, assembled, "activeEdgeId");
+
+		ArrayNode entries = MAPPER.createArrayNode();
+
+		for (int i = 0; i < chunkCount; i++) {
+			JsonNode chunk = chunks.get(i);
+
+			if (chunk == null) {
+				throw new IllegalStateException("Missing chunk " + i + " for stateRef=" + stateRef);
+			}
+
+			JsonNode chunkEntries = chunk.get("entries");
+
+			if (chunkEntries != null && chunkEntries.isArray()) {
+				for (JsonNode entry : chunkEntries) {
+					entries.add(entry);
+				}
+			}
+		}
+
+		assembled.set("entries", entries);
+
+		return assembled;
+	}
+
+	private void copyIfPresent(JsonNode source, ObjectNode target, String fieldName) {
+		JsonNode value = source.get(fieldName);
+
+		if (value != null && !value.isNull()) {
+			target.set(fieldName, value);
+		}
+	}
+
+	private void handleInstallGlobalIndexRequest(
+			Request rq,
+			ArrayList<Synopsis> synopses,
+			Collector<Estimation> collector) {
+
+		String stateRef = resolveInstallStateRef(rq);
+
+		if (stateRef == null || stateRef.trim().isEmpty()) {
+			System.out.println("[OnePass INSTALL_GLOBAL_INDEX] Missing stateRef. Request=" + rq);
+			return;
+		}
+
+		JsonNode state = onePassGlobalStatesByRef.get(stateRef);
+
+		if (state == null || state.isNull()) {
+			pendingOnePassInstallRequestsByRef.put(stateRef, rq);
+
+			System.out.println("[OnePass INSTALL_GLOBAL_INDEX] State not available yet. Pending install stored. stateRef="
+					+ stateRef
+					+ ", key=" + rq.getKey());
+
+			return;
+		}
+
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsis(rq, synopses);
+
+		boolean installed = false;
+		String error = "";
+
+		if (onePass == null) {
+			error = "No OnePassSamplerSdeSynopsis found for uid=" + rq.getUID()
+					+ ", key=" + rq.getKey();
+		} else {
+			try {
+				String activeAlias = resolveInstallActiveAlias(rq, state);
+				onePass.installGlobalPhaseOneIndex(state, activeAlias);
+				installed = true;
+			} catch (Exception ex) {
+				error = ex.getMessage();
+				ex.printStackTrace();
+			}
+		}
+
+		int expectedWorkers = rq.getNoOfP() > 0
+				? rq.getNoOfP()
+				: getRuntimeContext().getNumberOfParallelSubtasks();
+
+		String stateCheckSum = computeGlobalStateChecksum(state);
+
+		String ackJson = buildInstallGlobalIndexAckJson(
+				rq,
+				state,
+				stateRef,
+				pId,
+				expectedWorkers,
+				installed,
+				error,
+				stateCheckSum
+		);
+
+		String[] param = new String[] {
+				"INSTALL_GLOBAL_INDEX_ACK",
+				stateRef,
+				"PHASE1",
+				textField(state, "rootAlias", ""),
+				Integer.toString(pId),
+				Integer.toString(expectedWorkers)
+		};
+
+		String estimationKey = rq.getUID() + "_INSTALL_GLOBAL_INDEX_" + stateRef + "_" + pId;
+
+		Estimation ack = new Estimation(
+				rq.getUID(),
+				estimationKey,
+				75,
+				30,
+				rq.getKey(),
+				ackJson,
+				param,
+				expectedWorkers
+		);
+
+		collector.collect(ack);
+
+		System.out.println("[OnePass INSTALL_GLOBAL_INDEX] ACK emitted uid="
+				+ rq.getUID()
+				+ ", workerId=" + pId
+				+ ", stateRef=" + stateRef
+				+ ", installed=" + installed
+				+ ", checksum=" + stateCheckSum
+				+ ", key=" + rq.getKey());
+	}
+
+	private String resolveInstallActiveAlias(Request request, JsonNode state) {
+		JsonNode parameters = request == null ? null : request.getParameters();
+
+		if (parameters != null && !parameters.isNull()) {
+			JsonNode aliasNode = parameters.get("onePassAlias");
+
+			if (aliasNode == null || aliasNode.isNull()) {
+				aliasNode = parameters.get("phaseOneAlias");
+			}
+
+			if (aliasNode != null && !aliasNode.isNull()) {
+				String value = aliasNode.asText();
+
+				if (value != null && !value.trim().isEmpty()) {
+					return value.trim();
+				}
+			}
+		}
+
+		if (request != null && request.getParam() != null && request.getParam().length > 3) {
+			String value = request.getParam()[3];
+
+			if (value != null && !value.trim().isEmpty()) {
+				return value.trim();
+			}
+		}
+
+		return textField(state, "activeAlias", "");
+	}
+
+	private OnePassSamplerSdeSynopsis findOnePassSynopsis(Request rq, ArrayList<Synopsis> synopses) {
+		if (synopses == null) {
+			return null;
+		}
+
+		for (Synopsis syn : synopses) {
+			if (syn instanceof OnePassSamplerSdeSynopsis
+					&& rq.getUID() == syn.getSynopsisID()) {
+				return (OnePassSamplerSdeSynopsis) syn;
+			}
+		}
+
+		return null;
+	}
+
+	private String resolveInstallStateRef(Request request) {
+		if (request == null) {
+			return "";
+		}
+
+		JsonNode parameters = request.getParameters();
+
+		if (parameters != null && !parameters.isNull()) {
+			JsonNode node = parameters.get("onePassStateRef");
+
+			if (node != null && !node.isNull()) {
+				String value = node.asText();
+
+				if (value != null && !value.trim().isEmpty()) {
+					return value.trim();
+				}
+			}
+		}
+
+		String[] param = request.getParam();
+
+		if (param != null && param.length > 1 && param[1] != null) {
+			String value = param[1];
+
+			if (!value.trim().isEmpty()) {
+				return value.trim();
+			}
+		}
+
+		return "";
+	}
+
+	private String buildInstallGlobalIndexAckJson(
+			Request rq,
+			JsonNode state,
+			String stateRef,
+			int workerId,
+			int expectedWorkers,
+			boolean installed,
+			String error, String stateCheckSum) {
+
+		Map<String, Object> ack = new LinkedHashMap<String, Object>();
+
+		ack.put("type", "INSTALL_GLOBAL_INDEX_ACK");
+		ack.put("uid", rq.getUID());
+		ack.put("stateRef", stateRef);
+		ack.put("phase", "PHASE1");
+		ack.put("resultId", textField(state, "resultId", ""));
+		ack.put("rootAlias", textField(state, "rootAlias", ""));
+		ack.put("workerId", workerId);
+		ack.put("expectedWorkers", expectedWorkers);
+		ack.put("installed", installed);
+
+		JsonNode entries = state.get("entries");
+		ack.put("entryCount", entries != null && entries.isArray() ? entries.size() : 0);
+		//debug
+		ack.put("stateChecksum", computeGlobalStateChecksum(state));
+
+		if (error != null && !error.trim().isEmpty()) {
+			ack.put("error", error);
+		}
+
+		try {
+			return MAPPER.writeValueAsString(ack);
+		} catch (Exception e) {
+			throw new IllegalStateException("Could not serialize INSTALL_GLOBAL_INDEX_ACK", e);
+		}
+	}
+
+	private String computeGlobalStateChecksum(JsonNode state) {
+		try {
+			JsonNode entries = state.get("entries");
+
+			if (entries == null || !entries.isArray()) {
+				return "EMPTY";
+			}
+
+			List<String> parts = new ArrayList<String>();
+
+			for (JsonNode entry : entries) {
+				String edgeId = textField(entry, "edgeId", "");
+				String joinKey = textField(entry, "joinKey", "");
+				double weight = entry.has("globalWeight")
+						? entry.get("globalWeight").asDouble(0.0d)
+						: 0.0d;
+
+				parts.add(edgeId + "|" + joinKey + "|" + weight);
+			}
+
+			Collections.sort(parts);
+
+			StringBuilder sb = new StringBuilder();
+
+			for (String part : parts) {
+				sb.append(part).append("\n");
+			}
+
+			return Integer.toHexString(sb.toString().hashCode());
+
+		} catch (Exception e) {
+			return "CHECKSUM_ERROR_" + e.getClass().getSimpleName();
+		}
 	}
 
 }

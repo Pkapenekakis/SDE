@@ -2,7 +2,13 @@ package infore.SDE.Experiments.Onepass.MultiWorker;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import infore.SDE.messages.Onepass.OnePassParams;
+import infore.SDE.transformations.onepass.CompiledOnePassPlan;
+import infore.SDE.transformations.onepass.sql.OnePassCatalog;
+import infore.SDE.transformations.onepass.sql.OnePassQueryCatalogLoader;
+import infore.SDE.transformations.onepass.sql.OnePassSqlCompiler;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -10,27 +16,39 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Future;
+import java.io.FileWriter;
 
 /**
- * Kafka/SDE integration test for the One-pass* coordinator with one logical base key.
+ * Multi-worker OnePass* coordinator test using real query compilation and TPC-H input.
+
+ * For WQ3 the expected flow is:
  *
- * Required setup:
+ *   alias l:
+ *     stream l
+ *     barrier
+ *     FINISH_PHASE_1(resultId, alias=l)
+ *     merge/install global l<->o
+ *     workers stay in PHASE_1
  *
- *   RunOnepass must use OnePassRoundRobinDataRouterCoFlatMap.
+ *   alias o:
+ *     stream o
+ *     workers use installed global l<->o
+ *     barrier
+ *     FINISH_PHASE_1(resultId, alias=o)
+ *     merge/install global c<->o
+ *     workers move to PHASE_2
  *
- * This test verifies:
- *
- *   1. One ADD request with noOfP = 2 creates worker synopses.
- *   2. Small Phase 1 tuples are routed round-robin.
- *   3. One barrier is broadcast to both worker keys.
- *   4. Coordinator emits GLOBAL_BARRIER_READY.
- *   5. One FINISH_PHASE_1 request is routed to both workers.
- *   6. Coordinator receives two LOCAL_PHASE1_RESULT messages.
- *   7. Coordinator emits GLOBAL_PHASE1_RESULT_READY with localResultCount = 2.
+ * This test stops after the complete Phase 1 index is installed.
  */
 public final class OnePassSamplerSdeCoordinatorTest {
 
@@ -41,10 +59,39 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String ESTIMATION_TOPIC = "estimationTopic";
     private static final String REQUEST_TOPIC = "requestTopic";
 
+    /*
+     * Keep your Run.java default or argument value aligned with this topic name.
+     */
+    @SuppressWarnings("unused")
+    private static final String GLOBAL_STATE_TOPIC = "globalStateTopic";
+
+    private static final String TEST_TPCH_DIR = "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
+
+    private static final String TEST_ONEPASS_SQL =
+            "SELECT * FROM wq3_alias WEIGHTED BY (" +
+                    "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
+                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+
+    /*
+     * Use -1 for the whole file.
+     * Keep this modest while debugging.
+     */
+    private static final long TEST_ROW_LIMIT = 14000L;
+
     private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
+
+    private static final int SYNOPSIS_ID = 30;
+    private static final int REQUEST_ADD = 1;
+    private static final int REQUEST_UPDATE = 7;
 
     private static final int EXPECTED_WORKERS = 4;
     private static final long TIMEOUT_MS = 120000L;
+
+    private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
+    private static final boolean PRINT_MATCHED_PAYLOADS = true;
+
+    private static final boolean EXPORT_FINAL_PHASE1_INDEX = true;
+    private static final String PHASE1_INDEX_EXPORT_DIR = "/tmp/onepass_wq3_alias_phase1_full_indexes.json";
 
     private OnePassSamplerSdeCoordinatorTest() {
     }
@@ -52,167 +99,215 @@ public final class OnePassSamplerSdeCoordinatorTest {
     public static void main(String[] args) throws Exception {
         int uid = Math.abs(UUID.randomUUID().toString().hashCode());
 
-        String streamId = "onepass-coordinator-test";
+        String streamId = "onepass-coordinator-tpch-test";
         String phase = "PHASE1";
-        String alias = "l";
-
-        String barrierId = "COORD_PIPELINE_" + uid;
-
-        /*
-         * This is the logical query key.
-         *
-         * The OnePassRoundRobinDataRouterCoFlatMap should route data from:
-         *
-         *   baseKey
-         *
-         * into:
-         *
-         *   baseKey_2_KEYED_0
-         *   baseKey_2_KEYED_1
-         */
         String baseKey = "onepass-phase1-" + uid;
 
-        String phaseOneResultId = "PHASE1_RESULT_" + uid;
-
-        System.out.println("=== OnePassSamplerSdeCoordinatorTest ===");
+        System.out.println("=== OnePassSamplerSdeCoordinatorTest: SQL/TPC-H multi-alias Phase 1 ===");
         System.out.println("uid = " + uid);
         System.out.println("baseKey = " + baseKey);
         System.out.println("expectedWorkers = " + EXPECTED_WORKERS);
-        System.out.println("barrierId = " + barrierId);
-        System.out.println("phaseOneResultId = " + phaseOneResultId);
+        System.out.println("TEST_TPCH_DIR = " + TEST_TPCH_DIR);
+        System.out.println("TEST_ROW_LIMIT = " + TEST_ROW_LIMIT);
+        System.out.println("SQL:");
+        System.out.println(TEST_ONEPASS_SQL);
+        System.out.println();
+
+        OnePassParams params = OnePassSqlCompiler.compile(TEST_ONEPASS_SQL);
+        CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
+        OnePassCatalog catalog = OnePassQueryCatalogLoader.load(params.getDataset().getDbConfig());
+
+        if (plan.getLeafToRootOrder() == null || plan.getLeafToRootOrder().isEmpty()) {
+            throw new IllegalStateException("Compiled plan has empty leafToRootOrder: " + plan);
+        }
+
+        System.out.println("Compiled plan:");
+        System.out.println(plan);
+        System.out.println("Root alias: " + plan.getRootAlias());
+        System.out.println("Leaf-to-root order: " + plan.getLeafToRootOrder());
+        System.out.println("Root-to-leaf order: " + plan.getRootToLeafOrder());
+        System.out.println("Required fields by alias: " + plan.getRequiredFieldsByAlias());
         System.out.println();
 
         KafkaProducer<String, String> producer = createProducer();
-        KafkaConsumer<String, String> consumer = createConsumer("onepass-coordinator-test-" + uid);
+        KafkaConsumer<String, String> consumer = createConsumer("onepass-coordinator-tpch-test-" + uid);
 
         consumer.subscribe(Collections.singletonList(ESTIMATION_TOPIC));
 
         try {
             drainConsumer(consumer);
 
-            /*
-             * Step 1:
-             * Send one logical ADD request with noOfP = 2.
-             *
-             * RqRouterFlatMap should duplicate it to:
-             *   baseKey_2_KEYED_0
-             *   baseKey_2_KEYED_1
-             *
-             * OnePassRoundRobinDataRouterCoFlatMap should also register
-             * baseKey -> parallelism 2 for future data routing.
-             */
-            System.out.println("Sending ADD OnePass request...");
-
+            System.out.println("1. Sending ADD OnePass request with SQL and noOfP=" + EXPECTED_WORKERS + "...");
             ObjectNode addRequest = buildOnePassAddRequest(baseKey, streamId, uid, EXPECTED_WORKERS);
             sendJson(producer, REQUEST_TOPIC, baseKey, addRequest);
             producer.flush();
 
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(addRequest));
+            System.out.println();
+
             /*
-             * Give request routing time to create the worker synopses.
-             * Later we should replace this sleep with an explicit ADD ACK.
+             * Temporary synchronization. Later this should become ADD_ACK.
              */
             Thread.sleep(3000L);
 
-            /*
-             * Step 2:
-             * Send small Phase 1 lineitem tuples.
-             *
-             * With round-robin routing and expectedWorkers = 2, these should be split
-             * across the two worker synopses.
-             */
-            System.out.println("Sending small Phase 1 Test tuples...");
+            int aliasPosition = 0;
 
-            for(int i=0; i<60; i++){
-                int j=i+1;
-                sendJson(producer, DATA_TOPIC, baseKey,
-                        buildDataTuple(baseKey,streamId,tupleLineitem(i,j)));
+            JsonNode finalGlobalPhaseOneResult = null;
+            String finalPhaseOneAlias = "";
+            String finalPhaseOneEdgeId = "";
+
+            for (String phaseOneAlias : plan.getLeafToRootOrder()) {
+                aliasPosition++;
+
+                CompiledOnePassPlan.DirectedJoinEdge parentEdge =
+                        plan.getParentEdge(phaseOneAlias);
+
+                if (parentEdge == null) {
+                    throw new IllegalStateException("Phase 1 alias has no parent edge: " + phaseOneAlias);
+                }
+
+                String expectedEdgeId = parentEdge.getEdgeId();
+                String resultId = "PHASE1_" + phaseOneAlias + "_" + uid;
+                String barrierId = "TPCH_PHASE1_" + phaseOneAlias + "_" + uid + "_" + System.nanoTime();
+                String expectedStateRef = uid + "_PHASE1_" + resultId + "_GLOBAL_STATE";
+
+                System.out.println();
+                System.out.println("=======================================================");
+                System.out.println("PHASE_1 alias " + aliasPosition + "/" + plan.getLeafToRootOrder().size()
+                        + ": " + phaseOneAlias);
+                System.out.println("expectedEdgeId = " + expectedEdgeId);
+                System.out.println("resultId = " + resultId);
+                System.out.println("expectedStateRef = " + expectedStateRef);
+                System.out.println("=======================================================");
+                System.out.println();
+
+                System.out.println("Streaming PHASE_1 alias from TPC-H: " + phaseOneAlias + "...");
+                long rowsSent = streamAlias(
+                        producer,
+                        DATA_TOPIC,
+                        baseKey,
+                        streamId,
+                        catalog,
+                        plan,
+                        phaseOneAlias,
+                        TEST_ROW_LIMIT,
+                        plan.getRequiredFieldsByAlias()
+                );
+                producer.flush();
+
+                if (rowsSent <= 0L) {
+                    throw new IllegalStateException("No rows were streamed for alias " + phaseOneAlias);
+                }
+
+                System.out.println("Rows sent for alias " + phaseOneAlias + ": " + rowsSent);
+                System.out.println();
+
+                System.out.println("Sending Phase 1 data barrier for alias " + phaseOneAlias + "...");
+                ObjectNode barrierDatapoint = buildDataBarrierDatapoint(
+                        baseKey,
+                        streamId,
+                        uid,
+                        phase,
+                        phaseOneAlias,
+                        barrierId,
+                        EXPECTED_WORKERS
+                );
+
+                sendJson(producer, DATA_TOPIC, baseKey, barrierDatapoint);
+                producer.flush();
+
+                System.out.println("Waiting for GLOBAL_BARRIER_READY for alias " + phaseOneAlias + "...");
+                JsonNode barrierReady = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_BARRIER_READY",
+                        "barrierId",
+                        barrierId,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validateNoMissingSynopsisWorkers(barrierReady);
+                printMatchedPayload("GLOBAL_BARRIER_READY " + phaseOneAlias, barrierReady);
+
+                System.out.println("Sending FINISH_PHASE_1 request for alias " + phaseOneAlias + "...");
+                ObjectNode finishPhaseOneRequest = buildFinishPhaseOneRequest(
+                        baseKey,
+                        streamId,
+                        uid,
+                        resultId,
+                        phaseOneAlias,
+                        EXPECTED_WORKERS
+                );
+
+                sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseOneRequest);
+                producer.flush();
+
+                System.out.println("Waiting for GLOBAL_PHASE1_RESULT for alias " + phaseOneAlias + "...");
+                JsonNode globalPhaseOneResult = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_PHASE1_RESULT",
+                        "resultId",
+                        resultId,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                finalGlobalPhaseOneResult = globalPhaseOneResult;
+                finalPhaseOneAlias = phaseOneAlias;
+                finalPhaseOneEdgeId = expectedEdgeId;
+
+                validateGlobalPhaseOneResult(globalPhaseOneResult, expectedEdgeId, EXPECTED_WORKERS);
+                validateActiveAlias(globalPhaseOneResult, phaseOneAlias);
+                printMatchedPayload("GLOBAL_PHASE1_RESULT " + phaseOneAlias, globalPhaseOneResult);
+
+                System.out.println("Waiting for GLOBAL_PHASE1_RESULT_READY for alias " + phaseOneAlias + "...");
+                JsonNode globalPhaseOneReady = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_PHASE1_RESULT_READY",
+                        "resultId",
+                        resultId,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validateGlobalPhaseOneReady(globalPhaseOneReady, expectedStateRef, EXPECTED_WORKERS);
+                validateActiveAlias(globalPhaseOneReady, phaseOneAlias);
+                printMatchedPayload("GLOBAL_PHASE1_RESULT_READY " + phaseOneAlias, globalPhaseOneReady);
+
+                System.out.println("Waiting for GLOBAL_PHASE1_INDEX_INSTALLED for alias " + phaseOneAlias + "...");
+                JsonNode installed = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_PHASE1_INDEX_INSTALLED",
+                        "stateRef",
+                        expectedStateRef,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validateGlobalPhaseOneIndexInstalled(installed, EXPECTED_WORKERS);
+                printMatchedPayload("GLOBAL_PHASE1_INDEX_INSTALLED " + phaseOneAlias, installed);
+
+                System.out.println("Alias " + phaseOneAlias + " completed and installed on all workers.");
             }
 
-            sendJson(producer, DATA_TOPIC, baseKey,
-                    buildDataTuple(baseKey, streamId, tupleLineitem(1, 1)));
-
-            sendJson(producer, DATA_TOPIC, baseKey,
-                    buildDataTuple(baseKey, streamId, tupleLineitem(1, 2)));
-
-            sendJson(producer, DATA_TOPIC, baseKey,
-                    buildDataTuple(baseKey, streamId, tupleLineitem(2, 1)));
-
-            sendJson(producer, DATA_TOPIC, baseKey,
-                    buildDataTuple(baseKey, streamId, tupleLineitem(3, 1)));
-
-            producer.flush();
-
-            /*
-             * Step 3:
-             * Send one logical Phase 1 barrier.
-             *
-             * The OnePassRoundRobinDataRouterCoFlatMap should broadcast this barrier to:
-             *   baseKey_2_KEYED_0
-             *   baseKey_2_KEYED_1
-             */
-            System.out.println("Sending Phase 1 barrier...");
-
-            ObjectNode barrierDatapoint = buildDataBarrierDatapoint(baseKey, streamId, uid,
-                            phase, alias, barrierId, EXPECTED_WORKERS);
-
-            sendJson(producer, DATA_TOPIC, baseKey, barrierDatapoint);
-            producer.flush();
-
-            System.out.println("Waiting for GLOBAL_BARRIER_READY...");
-
-            JsonNode ready = waitForGlobalBarrierReady(consumer, uid, barrierId, EXPECTED_WORKERS, TIMEOUT_MS);
-            JsonNode missing = ready.get("missingSynopsisWorkers");
-
-            if (missing != null && missing.size() > 0) {
-                throw new IllegalStateException("Expected missingSynopsisWorkers to be empty, but got: "
-                                + missing.toString());
-            }
-
-            System.out.println();
-            System.out.println("GLOBAL_BARRIER_READY received:");
-            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(ready));
-            System.out.println();
-
-            /*
-             * Step 4:
-             * Send one logical FINISH_PHASE_1 request with noOfP = 2.
-             *
-             * RqRouterFlatMap should duplicate it to both worker keys.
-             * Each worker emits LOCAL_PHASE1_RESULT.
-             * Coordinator emits GLOBAL_PHASE1_RESULT_READY.
-             */
-            System.out.println("Sending FINISH_PHASE_1 request...");
-
-            ObjectNode finishPhaseOneRequest = buildFinishPhaseOneRequest(baseKey, streamId, uid,
-                            phaseOneResultId, EXPECTED_WORKERS);
-
-            sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseOneRequest);
-            producer.flush();
-
-            System.out.println("Waiting for GLOBAL_PHASE1_RESULT...");
-
-            JsonNode phaseOneReady = waitForCoordinatorMessage(consumer, uid, "GLOBAL_PHASE1_RESULT",
-                    "resultId", phaseOneResultId, EXPECTED_WORKERS, TIMEOUT_MS);
-
-            int localResultCount = phaseOneReady.has("localResultCount") ?
-                    phaseOneReady.get("localResultCount").asInt() : -1;
-
-            if (localResultCount != EXPECTED_WORKERS) {
-                throw new IllegalStateException(
-                        "Expected localResultCount="
-                                + EXPECTED_WORKERS
-                                + ", but got "
-                                + localResultCount
-                                + ". Payload: "
-                                + phaseOneReady.toString()
+            if (EXPORT_FINAL_PHASE1_INDEX) {
+                writeFinalPhaseOneIndexForPythonValidator(
+                        finalGlobalPhaseOneResult,
+                        uid,
+                        plan.getQueryName(),
+                        plan.getRootAlias(),
+                        finalPhaseOneAlias,
+                        finalPhaseOneEdgeId
                 );
             }
 
             System.out.println();
-            System.out.println("GLOBAL_PHASE1_RESULT_READY received:");
-            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(phaseOneReady));
-            System.out.println();
-            System.out.println("Coordinator integration test PASSED.");
+            System.out.println("SUCCESS: SQL/TPC-H multi-alias Phase 1 coordinator test passed.");
+            System.out.println("Validated aliases=" + plan.getLeafToRootOrder() + ", expectedWorkers=" + EXPECTED_WORKERS);
 
         } finally {
             try {
@@ -227,30 +322,269 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
     }
 
-    private static ObjectNode buildDataTuple(String datasetKey, String streamId, ObjectNode tuple) {
+    private static ObjectNode buildOnePassAddRequest(String datasetKey, String streamId, int uid, int noOfP) {
+        ObjectNode request = MAPPER.createObjectNode();
 
-        ObjectNode datapoint = MAPPER.createObjectNode();
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_ADD);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
 
-        datapoint.put("dataSetkey", datasetKey);
-        datapoint.put("streamID", streamId);
-        datapoint.set("values", tuple);
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("ONEPASS_SQL");
+        request.set("param", param);
 
-        return datapoint;
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassSql", TEST_ONEPASS_SQL);
+        request.set("parameters", parameters);
+
+        return request;
     }
 
-    private static ObjectNode tupleLineitem(int orderKey, int lineNumber) {
+    private static ObjectNode buildFinishPhaseOneRequest(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String resultId,
+            String activeAlias,
+            int noOfP) {
 
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_UPDATE);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("FINISH_PHASE_1");
+        param.add(resultId);
+        param.add(activeAlias);
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassCommand", "FINISH_PHASE_1");
+        parameters.put("onePassResultId", resultId);
+        parameters.put("onePassAlias", activeAlias);
+        parameters.put("phaseOneAlias", activeAlias);
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static long streamAlias(
+            KafkaProducer<String, String> producer,
+            String topic,
+            String datasetKey,
+            String streamId,
+            OnePassCatalog catalog,
+            CompiledOnePassPlan plan,
+            String alias,
+            long maxRows,
+            Map<String, Set<String>> requiredFieldsByAlias) throws Exception {
+
+        File file = tableFileForAlias(catalog, plan, alias);
+        List<String> columns = columnsForAlias(catalog, plan, alias);
+        String separator = separatorForAlias(catalog, plan, alias);
+        Set<String> requiredFields = requiredFieldsByAlias == null ? null : requiredFieldsByAlias.get(alias);
+
+        if (ENABLE_REQUIRED_FIELD_PRUNING && requiredFields == null) {
+            throw new IllegalStateException(
+                    "Required-field pruning is enabled, but plan has no required fields for alias: " + alias);
+        }
+
+        System.out.println("  file: " + file.getAbsolutePath());
+        System.out.println("  required fields: " + requiredFields);
+
+        long count = 0L;
+        BufferedReader br = new BufferedReader(new FileReader(file));
+
+        try {
+            String line;
+
+            while ((line = br.readLine()) != null) {
+                if (maxRows >= 0L && count >= maxRows) {
+                    break;
+                }
+
+                ObjectNode tuple = tupleJsonFromLine(alias, columns, separator, line, requiredFields);
+                ObjectNode datapoint = wrapTupleAsDatapoint(datasetKey, streamId, tuple);
+
+                sendJsonAsync(producer, topic, datasetKey, datapoint);
+                count++;
+
+                if (count % 5000L == 0L) {
+                    producer.flush();
+                    System.out.println("    sent " + count + " rows for alias " + alias);
+                }
+            }
+        } finally {
+            br.close();
+        }
+
+        return count;
+    }
+
+    private static File tableFileForAlias(OnePassCatalog catalog, CompiledOnePassPlan plan, String alias) {
+        CompiledOnePassPlan.RelationNode relation = plan.getRelation(alias);
+
+        if (relation == null) {
+            throw new IllegalStateException("Unknown alias in plan: " + alias);
+        }
+
+        OnePassCatalog.CatalogTable table = catalog.getDataset().getTables().get(relation.getTable());
+
+        if (table == null) {
+            throw new IllegalStateException("Catalog does not define table '" + relation.getTable()
+                    + "' for alias '" + alias + "'");
+        }
+
+        File file = new File(TEST_TPCH_DIR, table.getFile());
+
+        if (!file.exists()) {
+            throw new IllegalStateException("Missing TPC-H file for alias '" + alias + "': "
+                    + file.getAbsolutePath());
+        }
+
+        return file;
+    }
+
+    private static List<String> columnsForAlias(OnePassCatalog catalog, CompiledOnePassPlan plan, String alias) {
+        CompiledOnePassPlan.RelationNode relation = plan.getRelation(alias);
+        OnePassCatalog.CatalogTable table = catalog.getDataset().getTables().get(relation.getTable());
+        List<String> columns = table.getColumns();
+
+        if (columns == null || columns.isEmpty()) {
+            throw new IllegalStateException("Catalog table '" + relation.getTable() + "' has no columns");
+        }
+
+        return columns;
+    }
+
+    private static String separatorForAlias(OnePassCatalog catalog, CompiledOnePassPlan plan, String alias) {
+        CompiledOnePassPlan.RelationNode relation = plan.getRelation(alias);
+        OnePassCatalog.CatalogTable table = catalog.getDataset().getTables().get(relation.getTable());
+        String separator = table.getSeparator();
+
+        if (separator == null || separator.length() == 0) {
+            return "|";
+        }
+
+        return separator;
+    }
+
+    private static ObjectNode tupleJsonFromLine(
+            String alias,
+            List<String> columns,
+            String separator,
+            String line,
+            Set<String> requiredFields) {
+
+        String[] parts = line.split("\\Q" + separator + "\\E", -1);
         ObjectNode tuple = MAPPER.createObjectNode();
 
-        tuple.put("alias", "l");
-        tuple.put("l_orderkey", orderKey);
-        tuple.put("l_linenumber", lineNumber);
+        tuple.put("alias", alias);
+
+        int limit = Math.min(columns.size(), parts.length);
+
+        for (int i = 0; i < limit; i++) {
+            String fieldName = columns.get(i);
+
+            if (ENABLE_REQUIRED_FIELD_PRUNING
+                    && requiredFields != null
+                    && !requiredFields.contains("*")
+                    && !requiredFields.contains(fieldName)) {
+                continue;
+            }
+
+            putTypedValue(tuple, fieldName, parts[i]);
+        }
 
         return tuple;
     }
 
-    private static ObjectNode buildDataBarrierDatapoint(String datasetKey, String streamId, int uid, String phase,
-            String alias, String barrierId, int expectedWorkers) {
+    private static void putTypedValue(ObjectNode tuple, String fieldName, String rawValue) {
+        if (fieldName == null || fieldName.trim().isEmpty()) {
+            return;
+        }
+
+        if (rawValue == null) {
+            tuple.put(fieldName, "");
+            return;
+        }
+
+        String value = rawValue.trim();
+
+        if (value.length() == 0) {
+            tuple.put(fieldName, "");
+            return;
+        }
+
+        Long asLong = tryParseLong(value);
+
+        if (asLong != null) {
+            tuple.put(fieldName, asLong.longValue());
+            return;
+        }
+
+        Double asDouble = tryParseDouble(value);
+
+        if (asDouble != null) {
+            tuple.put(fieldName, asDouble.doubleValue());
+            return;
+        }
+
+        tuple.put(fieldName, value);
+    }
+
+    private static Long tryParseLong(String value) {
+        try {
+            if (value.indexOf('.') >= 0) {
+                return null;
+            }
+
+            return Long.valueOf(Long.parseLong(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static Double tryParseDouble(String value) {
+        try {
+            return Double.valueOf(Double.parseDouble(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static ObjectNode wrapTupleAsDatapoint(String datasetKey, String streamId, ObjectNode tuple) {
+        ObjectNode datapoint = MAPPER.createObjectNode();
+
+        /*
+         * Datapoint JSON must not contain "key".
+         * Datapoint only has dataSetkey, streamID, and values.
+         */
+        datapoint.put("dataSetkey", datasetKey);
+        datapoint.put("streamID", streamId);
+        datapoint.set("values", tuple.deepCopy());
+
+        return datapoint;
+    }
+
+    private static ObjectNode buildDataBarrierDatapoint(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String phase,
+            String alias,
+            String barrierId,
+            int expectedWorkers) {
 
         ObjectNode barrier = MAPPER.createObjectNode();
 
@@ -263,6 +597,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         ObjectNode datapoint = MAPPER.createObjectNode();
 
+        /*
+         * Datapoint JSON must not contain "key".
+         */
         datapoint.put("dataSetkey", datasetKey);
         datapoint.put("streamID", streamId);
         datapoint.set("values", barrier);
@@ -270,176 +607,139 @@ public final class OnePassSamplerSdeCoordinatorTest {
         return datapoint;
     }
 
-    private static ObjectNode buildOnePassAddRequest(String datasetKey, String streamId, int uid, int noOfP) {
+    private static void validateNoMissingSynopsisWorkers(JsonNode payload) {
+        JsonNode missing = payload.get("missingSynopsisWorkers");
 
-        ObjectNode request = MAPPER.createObjectNode();
-
-        request.put("dataSetkey", datasetKey);
-        request.put("requestID", 1);
-        request.put("synopsisID", 30);
-        request.put("uid", uid);
-        request.put("streamID", streamId);
-        request.put("noOfP", noOfP);
-
-        request.putArray("param").add("onepass-coordinator-add-test");
-
-        ObjectNode parameters = MAPPER.createObjectNode();
-        ObjectNode onePassParams = MAPPER.createObjectNode();
-
-        onePassParams.put("queryName", "WQ3_COORDINATOR_TEST");
-        onePassParams.put("mainTable", "c");
-
-        ObjectNode dataset = MAPPER.createObjectNode();
-
-        dataset.put("name", "tpch");
-        dataset.put("dbConfig", "tpch.json");
-        dataset.put("scaleFactor", 1);
-        dataset.put("seed", "test123");
-
-        onePassParams.set("dataset", dataset);
-
-        onePassParams.putArray("relations")
-                .add(relation("customer", "c"))
-                .add(relation("orders", "o"))
-                .add(relation("lineitem", "l"));
-
-        onePassParams.putArray("joins")
-                .add(join("c", "c_custkey", "o", "o_custkey"))
-                .add(join("o", "o_orderkey", "l", "l_orderkey"));
-
-        ObjectNode weight = MAPPER.createObjectNode();
-        weight.put("expression", "1");
-
-        ObjectNode weightsByAlias = MAPPER.createObjectNode();
-
-        weightsByAlias.put("c", "1");
-        weightsByAlias.put("o", "1");
-        weightsByAlias.put("l", "1");
-
-        weight.set("weightsByAlias", weightsByAlias);
-        onePassParams.set("weight", weight);
-
-        ObjectNode output = MAPPER.createObjectNode();
-
-        output.put("sampleSize", 10);
-        output.putArray("projection").add("c.c_custkey").add("o.o_orderkey").add("l.l_linenumber");
-        onePassParams.set("output", output);
-        parameters.set("onePassParams", onePassParams);
-
-        request.set("parameters", parameters);
-
-        return request;
+        if (missing != null && missing.isArray() && missing.size() > 0) {
+            throw new IllegalStateException("Expected missingSynopsisWorkers to be empty, got: " + missing);
+        }
     }
 
-    private static ObjectNode buildFinishPhaseOneRequest(String datasetKey, String streamId, int uid,
-            String resultId, int noOfP) {
+    private static void validateActiveAlias(JsonNode payload, String expectedAlias) {
+        String actual = textField(payload, "activeAlias", "");
 
-        ObjectNode request = MAPPER.createObjectNode();
-
-        request.put("dataSetkey", datasetKey);
-        request.put("requestID", 7);
-        request.put("synopsisID", 30);
-        request.put("uid", uid);
-        request.put("streamID", streamId);
-        request.put("noOfP", noOfP);
-
-        request.putArray("param").add("FINISH_PHASE_1").add(resultId);
-
-        ObjectNode parameters = MAPPER.createObjectNode();
-
-        parameters.put("onePassCommand", "FINISH_PHASE_1");
-        parameters.put("onePassResultId", resultId);
-
-        request.set("parameters", parameters);
-
-        return request;
-    }
-
-    private static ObjectNode relation(String table, String alias) {
-        ObjectNode node = MAPPER.createObjectNode();
-
-        node.put("table", table);
-        node.put("alias", alias);
-
-        return node;
-    }
-
-    private static ObjectNode join(String leftAlias, String leftField, String rightAlias, String rightField) {
-
-        ObjectNode node = MAPPER.createObjectNode();
-
-        node.put("leftAlias", leftAlias);
-        node.put("leftField", leftField);
-        node.put("rightAlias", rightAlias);
-        node.put("rightField", rightField);
-
-        return node;
-    }
-
-    private static JsonNode waitForGlobalBarrierReady(KafkaConsumer<String, String> consumer, int uid,
-            String barrierId, int expectedWorkers, long timeoutMs) throws Exception {
-
-        long deadline = System.currentTimeMillis() + timeoutMs;
-
-        int recordsSeen = 0;
-
-        while (System.currentTimeMillis() < deadline) {
-            ConsumerRecords<String, String> records = consumer.poll(1000);
-
-            for (ConsumerRecord<String, String> record : records) {
-                recordsSeen++;
-
-                String value = record.value();
-
-                if (value == null || value.trim().isEmpty()) {
-                    continue;
-                }
-
-                JsonNode envelope;
-                try {
-                    envelope =MAPPER.readTree(value);
-                } catch (Exception ignored) {
-                    continue;
-                }
-
-                if (!matchesIntField(envelope, "uid", uid)) {
-                    continue;
-                }
-
-                JsonNode payload = extractEstimationPayload(envelope);
-
-                if (payload == null || payload.isNull()) {
-                    continue;
-                }
-
-                String type = textField(payload, "type", "");
-
-                if (!"GLOBAL_BARRIER_READY".equals(type)) {
-                    continue;
-                }
-
-                if (!barrierId.equals(textField(payload, "barrierId", ""))) {
-                    continue;
-                }
-
-                int received = payload.has("receivedWorkers") ? payload.get("receivedWorkers").size() : 0;
-
-                System.out.println("Candidate GLOBAL_BARRIER_READY:" + " barrierId=" + barrierId +
-                        ", receivedWorkers=" + received + "/" + expectedWorkers);
-
-                if (received >= expectedWorkers) {
-                    return payload;
-                }
-            }
+        if (actual == null || actual.trim().isEmpty()) {
+            /*
+             * Older intermediate messages may not have it yet.
+             * Keep this as a warning instead of failure for compatibility.
+             */
+            System.out.println("WARNING: payload has no activeAlias. Expected " + expectedAlias
+                    + ". Payload type=" + textField(payload, "type", ""));
+            return;
         }
 
-        throw new IllegalStateException(
-                "Timed out waiting for GLOBAL_BARRIER_READY" + ", uid=" + uid + ", barrierId=" + barrierId
-                        + ", expectedWorkers=" + expectedWorkers + ", recordsSeen=" + recordsSeen);
+        if (!expectedAlias.equals(actual)) {
+            throw new IllegalStateException("Expected activeAlias=" + expectedAlias
+                    + ", got " + actual + ". Payload: " + payload);
+        }
     }
 
-    private static JsonNode waitForCoordinatorMessage(KafkaConsumer<String, String> consumer, int uid,
-            String expectedType, String idField, String expectedId, int expectedWorkers, long timeoutMs) throws Exception {
+    private static void validateGlobalPhaseOneResult(
+            JsonNode payload,
+            String expectedEdgeId,
+            int expectedWorkers) {
+
+        int localResultCount = intField(payload, "localResultCount", -1);
+
+        if (localResultCount != expectedWorkers) {
+            throw new IllegalStateException("Expected localResultCount=" + expectedWorkers
+                    + ", got " + localResultCount + ". Payload: " + payload);
+        }
+
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers == null || !receivedWorkers.isArray() || receivedWorkers.size() != expectedWorkers) {
+            throw new IllegalStateException("Expected receivedWorkers size=" + expectedWorkers
+                    + ", got " + receivedWorkers + ". Payload: " + payload);
+        }
+
+        JsonNode globalPhaseOneResult = payload.get("globalPhaseOneResult");
+
+        if (globalPhaseOneResult == null || globalPhaseOneResult.isNull()) {
+            throw new IllegalStateException("GLOBAL_PHASE1_RESULT missing globalPhaseOneResult: " + payload);
+        }
+
+        JsonNode edgeSummaries = globalPhaseOneResult.get("edgeSummaries");
+
+        if (edgeSummaries == null || !edgeSummaries.isObject()) {
+            throw new IllegalStateException("GLOBAL_PHASE1_RESULT missing edgeSummaries: " + payload);
+        }
+
+        JsonNode summary = edgeSummaries.get(expectedEdgeId);
+
+        if (summary == null || summary.isNull()) {
+            throw new IllegalStateException("Missing expected edge summary " + expectedEdgeId
+                    + " in " + edgeSummaries);
+        }
+
+        int keyCount = intField(summary, "numberOfKeys", 0);
+        double totalWeight = doubleField(summary, "totalWeight", 0.0d);
+
+        if (keyCount <= 0) {
+            throw new IllegalStateException("Expected " + expectedEdgeId + " numberOfKeys > 0, got " + keyCount
+                    + ". Summary: " + summary);
+        }
+
+        if (totalWeight <= 0.0d) {
+            throw new IllegalStateException("Expected " + expectedEdgeId + " totalWeight > 0, got " + totalWeight
+                    + ". Summary: " + summary);
+        }
+
+        System.out.println("Validated GLOBAL_PHASE1_RESULT edge summary: edgeId=" + expectedEdgeId
+                + ", numberOfKeys=" + keyCount
+                + ", totalWeight=" + totalWeight);
+    }
+
+    private static void validateGlobalPhaseOneReady(
+            JsonNode payload,
+            String expectedStateRef,
+            int expectedWorkers) {
+
+        String stateRef = textField(payload, "stateRef", "");
+
+        if (!expectedStateRef.equals(stateRef)) {
+            throw new IllegalStateException("Expected stateRef=" + expectedStateRef
+                    + ", got " + stateRef + ". Payload: " + payload);
+        }
+
+        int localResultCount = intField(payload, "localResultCount", -1);
+
+        if (localResultCount != expectedWorkers) {
+            throw new IllegalStateException("Expected localResultCount=" + expectedWorkers
+                    + ", got " + localResultCount + ". Payload: " + payload);
+        }
+    }
+
+    private static void validateGlobalPhaseOneIndexInstalled(JsonNode payload, int expectedWorkers) {
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers == null || !receivedWorkers.isArray() || receivedWorkers.size() != expectedWorkers) {
+            throw new IllegalStateException("Expected receivedWorkers size=" + expectedWorkers
+                    + ", got " + receivedWorkers + ". Payload: " + payload);
+        }
+
+        JsonNode failedWorkers = payload.get("failedWorkers");
+
+        if (failedWorkers != null && failedWorkers.isArray() && failedWorkers.size() > 0) {
+            throw new IllegalStateException("Expected failedWorkers to be empty, got: " + failedWorkers);
+        }
+
+        int installedWorkerCount = intField(payload, "installedWorkerCount", -1);
+
+        if (installedWorkerCount != expectedWorkers) {
+            throw new IllegalStateException("Expected installedWorkerCount=" + expectedWorkers
+                    + ", got " + installedWorkerCount + ". Payload: " + payload);
+        }
+    }
+
+    private static JsonNode waitForCoordinatorMessage(
+            KafkaConsumer<String, String> consumer,
+            int uid,
+            String expectedType,
+            String idField,
+            String expectedId,
+            int expectedWorkers,
+            long timeoutMs) throws Exception {
 
         long deadline = System.currentTimeMillis() + timeoutMs;
         int recordsSeen = 0;
@@ -488,21 +788,24 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     }
                 }
 
-                int received = payload.has("receivedWorkers") ? payload.get("receivedWorkers").size() : 0;
+                int received = payload.has("receivedWorkers") && payload.get("receivedWorkers").isArray()
+                        ? payload.get("receivedWorkers").size()
+                        : -1;
 
                 System.out.println("Candidate " + expectedType
                         + ": " + idField + "=" + expectedId
                         + ", receivedWorkers=" + received
                         + "/" + expectedWorkers);
 
-                if (received >= expectedWorkers) {
-                    return payload;
-                }
+                return payload;
             }
         }
 
-        throw new IllegalStateException("Timed out waiting for " + expectedType + ", uid=" + uid + ", " +
-                idField + "=" + expectedId + ", expectedWorkers=" + expectedWorkers + ", recordsSeen=" + recordsSeen);
+        throw new IllegalStateException("Timed out waiting for " + expectedType
+                + ", uid=" + uid
+                + ", " + idField + "=" + expectedId
+                + ", expectedWorkers=" + expectedWorkers
+                + ", recordsSeen=" + recordsSeen);
     }
 
     private static JsonNode extractEstimationPayload(JsonNode envelope) throws Exception {
@@ -511,8 +814,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         JsonNode estimationNode = envelope.get("estimation");
+
         if (estimationNode == null || estimationNode.isNull()) {
-            return null;
+            return envelope;
         }
 
         if (estimationNode.isTextual()) {
@@ -529,17 +833,16 @@ public final class OnePassSamplerSdeCoordinatorTest {
     }
 
     private static boolean matchesIntField(JsonNode node, String fieldName, int expectedValue) {
-
         if (node == null || node.isNull()) {
             return false;
         }
 
         JsonNode field = node.get(fieldName);
+
         return field != null && field.asInt(Integer.MIN_VALUE) == expectedValue;
     }
 
     private static String textField(JsonNode node, String fieldName, String defaultValue) {
-
         if (node == null || node.isNull()) {
             return defaultValue;
         }
@@ -559,11 +862,54 @@ public final class OnePassSamplerSdeCoordinatorTest {
         return value.trim();
     }
 
+    private static int intField(JsonNode node, String fieldName, int defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asInt(defaultValue);
+    }
+
+    private static double doubleField(JsonNode node, String fieldName, double defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asDouble(defaultValue);
+    }
+
+    private static void printMatchedPayload(String label, JsonNode payload) throws Exception {
+        if (!PRINT_MATCHED_PAYLOADS) {
+            return;
+        }
+
+        System.out.println();
+        System.out.println(label + " received:");
+        System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(payload));
+        System.out.println();
+    }
+
     private static KafkaProducer<String, String> createProducer() {
         Properties props = new Properties();
+
         props.put("bootstrap.servers", BOOTSTRAP_SERVERS);
         props.put("acks", "all");
-        props.put("retries", "0");
+        props.put("retries", "3");
+        props.put("batch.size", "16384");
+        props.put("linger.ms", "1");
+        props.put("buffer.memory", "33554432");
         props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
         props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
 
@@ -585,7 +931,16 @@ public final class OnePassSamplerSdeCoordinatorTest {
         return new KafkaConsumer<String, String>(props);
     }
 
-    private static void sendJson(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) throws Exception {
+    private static void sendJsonAsync(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) {
+        producer.send(new ProducerRecord<String, String>(topic, key, json.toString()));
+    }
+
+    private static void sendJson(
+            KafkaProducer<String, String> producer,
+            String topic,
+            String key,
+            JsonNode json) throws Exception {
+
         Future<RecordMetadata> future = producer.send(new ProducerRecord<String, String>(topic, key, json.toString()));
         future.get();
     }
@@ -593,5 +948,104 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static void drainConsumer(KafkaConsumer<String, String> consumer) {
         consumer.poll(500);
         consumer.poll(500);
+    }
+
+    private static void writeFinalPhaseOneIndexForPythonValidator(
+            JsonNode globalPhaseOneEnvelope,
+            int uid,
+            String queryName,
+            String rootAlias,
+            String finalAlias,
+            String finalEdgeId) throws Exception {
+
+        if (globalPhaseOneEnvelope == null || globalPhaseOneEnvelope.isNull()) {
+            throw new IllegalStateException(
+                    "Cannot export final Phase 1 index because GLOBAL_PHASE1_RESULT is null."
+            );
+        }
+
+        JsonNode globalPhaseOneResult =
+                globalPhaseOneEnvelope.get("globalPhaseOneResult");
+
+        if (globalPhaseOneResult == null || globalPhaseOneResult.isNull()) {
+            throw new IllegalStateException(
+                    "Cannot export final Phase 1 index. Missing globalPhaseOneResult: "
+                            + globalPhaseOneEnvelope
+            );
+        }
+
+        JsonNode edgeIndexes = globalPhaseOneResult.get("edgeIndexes");
+
+        if (edgeIndexes == null || !edgeIndexes.isObject()) {
+            throw new IllegalStateException(
+                    "Cannot export final Phase 1 index. Missing edgeIndexes: "
+                            + globalPhaseOneResult
+            );
+        }
+
+        JsonNode edgeSummaries = globalPhaseOneResult.get("edgeSummaries");
+
+        if (edgeSummaries == null || !edgeSummaries.isObject()) {
+            throw new IllegalStateException(
+                    "Cannot export final Phase 1 index. Missing edgeSummaries: "
+                            + globalPhaseOneResult
+            );
+        }
+
+        ObjectNode export = MAPPER.createObjectNode();
+
+        /*
+         * IMPORTANT:
+         * The Python validator expects edgeIndexes / edgeSummaries at the top level.
+         * Do not nest them under globalPhaseOneResult.
+         */
+        export.put("type", "ONEPASS_PHASE1_FULL_INDEX_EXPORT");
+        export.put("implementation", "parallel-sde");
+        export.put("uid", uid);
+        export.put("queryName", queryName == null ? "" : queryName);
+        export.put("rootAlias", rootAlias == null ? "" : rootAlias);
+        export.put("finalAlias", finalAlias == null ? "" : finalAlias);
+        export.put("finalEdgeId", finalEdgeId == null ? "" : finalEdgeId);
+
+        JsonNode resultId = globalPhaseOneEnvelope.get("resultId");
+        JsonNode stateRef = globalPhaseOneEnvelope.get("stateRef");
+        JsonNode seenTuplesByAlias = globalPhaseOneResult.get("seenTuplesByAlias");
+
+        if (resultId != null && !resultId.isNull()) {
+            export.set("resultId", resultId);
+        }
+
+        if (stateRef != null && !stateRef.isNull()) {
+            export.set("stateRef", stateRef);
+        }
+
+        if (seenTuplesByAlias != null && !seenTuplesByAlias.isNull()) {
+            export.set("seenTuplesByAlias", seenTuplesByAlias);
+        }
+
+        export.set("edgeIndexes", edgeIndexes);
+        export.set("edgeSummaries", edgeSummaries);
+
+        File outputFile = new File(PHASE1_INDEX_EXPORT_DIR);
+        FileWriter writer = new FileWriter(outputFile);
+
+        try {
+            writer.write(
+                    MAPPER.writerWithDefaultPrettyPrinter()
+                            .writeValueAsString(export)
+            );
+            writer.write(System.lineSeparator());
+        } finally {
+            writer.close();
+        }
+
+        System.out.println();
+        System.out.println("Exported final Phase 1 index for Python validator:");
+        System.out.println(outputFile.getAbsolutePath());
+        System.out.println("queryName=" + queryName);
+        System.out.println("rootAlias=" + rootAlias);
+        System.out.println("finalAlias=" + finalAlias);
+        System.out.println("finalEdgeId=" + finalEdgeId);
+        System.out.println();
     }
 }

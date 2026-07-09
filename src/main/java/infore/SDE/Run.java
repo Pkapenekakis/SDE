@@ -11,7 +11,9 @@ import infore.SDE.sources.kafkaProducerEstimation;
 import infore.SDE.sources.kafkaStringConsumer;
 
 import infore.SDE.sources.kafkaStringConsumer_Earliest;
+import infore.SDE.sources.kafkaStringProducer;
 import infore.SDE.transformations.*;
+import infore.SDE.transformations.onepass.OnePassGlobalStateSplitter;
 import infore.SDE.transformations.onepass.RoundRobinDataRouterCoFlatMap;
 import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorOperator;
 import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
@@ -51,6 +53,7 @@ public class Run {
 	private static String kafkaBrokersList;
 	private static int parallelism;
 	private static String kafkaOutputTopic;
+	private static String kafkaOnePassGlobalStateTopic;
 
 	/**
 	 * @param args Program arguments. You have to provide 4 arguments otherwise
@@ -74,10 +77,18 @@ public class Run {
 		kafkaStringConsumer kc = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic);
 		kafkaStringConsumer requests = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic);
 		kafkaProducerEstimation kp = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
+		kafkaStringProducer onePassGlobalStateKp = new kafkaStringProducer(kafkaBrokersList, kafkaOnePassGlobalStateTopic);
 
+		kafkaStringConsumer globalStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassGlobalStateTopic);
+		/*
+		 * Used only for coordinator feedback commands.
+		 * requestID == 7 will be serialized as a Request by kafkaProducerEstimation.
+		 */
+		kafkaProducerEstimation pRequest = new kafkaProducerEstimation(kafkaBrokersList, kafkaRequestInputTopic);
 
 		DataStream<String> datastream = env.addSource(kc.getFc());
 		DataStream<String> RQ_stream = env.addSource(requests.getFc());
+		DataStream<String> globalStateStream = env.addSource(globalStateConsumer.getFc());
 
 		//map kafka data input to tuple2<int,double>
 		DataStream<Datapoint> dataStream = datastream
@@ -111,6 +122,28 @@ public class Run {
 		DataStream<Request> SynopsisRequests = RQ_Stream
 				.flatMap(new RqRouterFlatMap()).name("REQUEST_ROUTER");
 
+		DataStream<Datapoint> onePassGlobalStateDataStream = globalStateStream
+				.map(new MapFunction<String, Datapoint>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public Datapoint map(String node) throws IOException {
+						ObjectMapper objectMapper = new ObjectMapper();
+						com.fasterxml.jackson.databind.JsonNode chunk = objectMapper.readTree(node);
+
+						String workerKey = "";
+
+						if (chunk.has("workerKey") && !chunk.get("workerKey").isNull()) {
+							workerKey = chunk.get("workerKey").asText();
+						}
+
+						if (workerKey == null || workerKey.trim().isEmpty()) {
+							throw new IOException("GLOBAL_STATE_CHUNK missing workerKey: " + node);
+						}
+
+						return new Datapoint(workerKey, "onepass-global-state", chunk);
+					}
+				}).name("ONEPASS_GLOBAL_STATE_SOURCE");
 
 		/*
 		DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
@@ -127,6 +160,12 @@ public class Run {
 		DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
 				.flatMap(new RoundRobinDataRouterCoFlatMap()).name("ONEPASS_AWARE_DATA_ROUTER");
 
+		/*
+		 * Global-state chunks are already keyed by workerKey.
+		 * They should enter the same physical worker path as normal OnePass data.
+		 */
+		DataStream<Datapoint> DataStreamWithGlobalState = DataStream.union(onePassGlobalStateDataStream);
+
 
 		/*
 		 * Force routed OnePass keys to the intended Flink worker.
@@ -136,7 +175,7 @@ public class Run {
 		 * _KEYED_0, _KEYED_1, ... into different subtasks.
 		 */
 
-		DataStream<Datapoint> partitionedDataStream = DataStream
+		DataStream<Datapoint> partitionedDataStream = DataStreamWithGlobalState
 				.partitionCustom(new OnePassWorkerPartitioner(),
 						(KeySelector<Datapoint, String>) Datapoint::getKey);
 
@@ -251,6 +290,22 @@ public class Run {
 					}
 				}).name("ONEPASS_POST_REDUCE_COORDINATOR_INPUT");
 
+
+		/*
+		 * Global state payload path.
+		 *
+		 * GLOBAL_PHASE1_RESULT is the heavy merged result.
+		 * The splitter converts it into per-worker chunks and writes them to
+		 * onepass-global-state-topic.
+		 */
+		DataStream<String> onePassGlobalStateChunks = onePassPostReduceCoordinatorInput
+				.flatMap(new OnePassGlobalStateSplitter())
+				.name("ONEPASS_GLOBAL_STATE_SPLITTER");
+
+		onePassGlobalStateChunks
+				.addSink(onePassGlobalStateKp.getProducer())
+				.name("ONEPASS_GLOBAL_STATE_TOPIC_OUTPUT");
+
 		finalStream.addSink(kp.getProducer());
 
 		/*
@@ -270,7 +325,40 @@ public class Run {
 						.name("ONEPASS_COORDINATOR")
 						.setParallelism(1);
 
-		onePassCoordinatorOutput.addSink(kp.getProducer()).name("ONEPASS_COORDINATOR_OUTPUT");
+		DataStream<Estimation> onePassCoordinatorRequestOutput = onePassCoordinatorOutput
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return isOnePassCoordinatorRequestCommand(value);
+					}
+				}).name("ONEPASS_COORDINATOR_REQUEST_OUTPUT");
+
+		DataStream<Estimation> onePassCoordinatorEstimationOutput = onePassCoordinatorOutput
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return !isOnePassCoordinatorRequestCommand(value);
+					}
+				}).name("ONEPASS_COORDINATOR_ESTIMATION_OUTPUT");
+
+		/*
+		 * requestID == 7 is serialized as Request by kafkaProducerEstimation.
+		 * This must go to requestTopic.
+		 */
+		onePassCoordinatorRequestOutput
+				.addSink(pRequest.getProducer())
+				.name("ONEPASS_COORDINATOR_REQUEST_TOPIC_OUTPUT");
+
+		/*
+		 * Readiness/status events stay in estimationTopic.
+		 */
+		onePassCoordinatorEstimationOutput
+				.addSink(kp.getProducer())
+				.name("ONEPASS_COORDINATOR_OUTPUT");
 
 		env.execute("Streaming SDE");
 
@@ -286,7 +374,29 @@ public class Run {
 		}
 
 		String type = firstParam(value);
-		return value.getRequestID() == 70 && "DATA_BARRIER_ACK".equals(type);
+
+		if (value.getRequestID() == 70 && "DATA_BARRIER_ACK".equals(type)) {
+			return true;
+		}
+
+		if (value.getRequestID() == 75 && "INSTALL_GLOBAL_INDEX_ACK".equals(type)) {
+			return true;
+		}
+
+		return false;
+	}
+
+	private static boolean isOnePassCoordinatorRequestCommand(Estimation value) {
+		if (value == null) {
+			return false;
+		}
+
+		if (value.getSynopsisID() != 30) {
+			return false;
+		}
+
+		String type = firstParam(value);
+		return value.getRequestID() == 7 && "INSTALL_GLOBAL_INDEX".equals(type);
 	}
 
 	private static boolean isOnePassPostReduceCoordinatorMessage(Estimation value) {
@@ -354,6 +464,11 @@ public class Run {
 			kafkaBrokersList = args[3];
 			//kafkaBrokersList = "localhost:9092";
 			parallelism = Integer.parseInt(args[4]);
+			if (args.length > 5) {
+				kafkaOnePassGlobalStateTopic = args[5];
+			} else {
+				kafkaOnePassGlobalStateTopic = "globalStateTopic";
+			}
 			//parallelism2 = Integer.parseInt(args[5]);
 			//multi = Integer.parseInt(args[5]);
 
@@ -372,6 +487,7 @@ public class Run {
 			kafkaBrokersList = "localhost:9092";
 			//kafkaBrokersList = "159.69.32.166:9092";
 			kafkaOutputTopic = "estimationTopic";
+			kafkaOnePassGlobalStateTopic = "globalStateTopic";
 		}
 	}
 }

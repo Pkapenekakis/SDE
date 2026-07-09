@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Estimation;
 import infore.SDE.reduceFunctions.ReduceFunction;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -16,21 +17,22 @@ import java.util.Set;
 /**
  * Phase 1 parallel merge for OnePass*.
  *
- * Input:
- *   LOCAL_PHASE1_RESULT from each worker.
+ * This reducer supports multi-level / multi-alias Phase 1.
  *
- * Output:
- *   GLOBAL_PHASE1_RESULT as a JSON string.
+ * Example WQ3:
  *
- * For now this reducer merges the debug/exported edge index representation:
+ *   1. activeAlias = l, activeEdgeId = l<->o
+ *      -> sum l<->o across workers
  *
- *   edgeIndexes: {
- *      edgeId: {
- *          joinKeyString: weight
- *      }
- *   }
+ *   2. activeAlias = o, activeEdgeId = c<->o
+ *      -> every worker already has the global l<->o index
+ *      -> copy l<->o only once
+ *      -> sum only c<->o across workers
+ *
+ * This prevents already-global child indexes from being multiplied by
+ * the number of workers during later Phase 1 aliases.
  */
-public final class OnePassIndexReduceFunction extends ReduceFunction {
+public final class OnePassIndexReduceFunction extends ReduceFunction implements Serializable {
 
     private static final long serialVersionUID = 1L;
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -43,20 +45,21 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
     private final Map<String, Long> mergedSeenTuplesByAlias =
             new LinkedHashMap<String, Long>();
 
+    private boolean stableEdgesCopied = false;
+    private boolean stableSeenCopied = false;
+
     private int uid = -1;
     private String phase = "PHASE1";
     private String resultId = "PHASE1_RESULT";
     private String queryName = "";
     private String rootAlias = "";
+    private String baseKey = "";
+    private String activeAlias = "";
+    private String activeEdgeId = "";
+
     private int expectedWorkers;
 
-    public OnePassIndexReduceFunction(
-            int nOfP,
-            int count,
-            String[] parameters,
-            int synID,
-            int rqid) {
-
+    public OnePassIndexReduceFunction(int nOfP, int count, String[] parameters, int synID, int rqid) {
         super(nOfP, count, parameters, synID, rqid);
         this.expectedWorkers = nOfP <= 0 ? 1 : nOfP;
     }
@@ -84,6 +87,39 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
             queryName = textField(payload, "queryName", "");
             rootAlias = textField(payload, "rootAlias", "");
 
+            String payloadBaseKey = textField(payload, "baseKey", "");
+
+            if (payloadBaseKey != null && !payloadBaseKey.trim().isEmpty()) {
+                if (baseKey == null || baseKey.trim().isEmpty()) {
+                    baseKey = payloadBaseKey.trim();
+                }
+            }
+
+            String payloadActiveAlias = resolveActiveAlias(payload, e);
+            String payloadActiveEdgeId = textField(payload, "activeEdgeId", "");
+
+            if (activeAlias == null || activeAlias.trim().isEmpty()) {
+                activeAlias = payloadActiveAlias;
+            } else if (payloadActiveAlias != null
+                    && !payloadActiveAlias.trim().isEmpty()
+                    && !activeAlias.equals(payloadActiveAlias)) {
+                throw new IllegalStateException(
+                        "Mismatching activeAlias values in same reduce group: "
+                                + activeAlias + " vs " + payloadActiveAlias
+                );
+            }
+
+            if (activeEdgeId == null || activeEdgeId.trim().isEmpty()) {
+                activeEdgeId = payloadActiveEdgeId;
+            } else if (payloadActiveEdgeId != null
+                    && !payloadActiveEdgeId.trim().isEmpty()
+                    && !activeEdgeId.equals(payloadActiveEdgeId)) {
+                throw new IllegalStateException(
+                        "Mismatching activeEdgeId values in same reduce group: "
+                                + activeEdgeId + " vs " + payloadActiveEdgeId
+                );
+            }
+
             int workerId = intField(payload, "workerId", -1);
             int payloadExpectedWorkers = intField(payload, "expectedWorkers", e.getNoOfP());
 
@@ -98,20 +134,24 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
 
             if (!receivedWorkers.add(workerId)) {
                 System.out.println("[OnePassPhase1Reduce] Duplicate worker ignored: workerId=" + workerId
-                        + ", resultId=" + resultId);
+                        + ", resultId=" + resultId
+                        + ", activeAlias=" + activeAlias);
                 return false;
             }
 
             JsonNode phaseOneResult = payload.get("phaseOneResult");
 
             if (phaseOneResult != null && !phaseOneResult.isNull()) {
-                mergePhaseOneResult(phaseOneResult);
+                mergePhaseOneResult(phaseOneResult, activeAlias, activeEdgeId);
             }
 
             count = receivedWorkers.size();
 
             System.out.println("[OnePassPhase1Reduce] Received worker "
-                    + workerId + " for " + resultId
+                    + workerId
+                    + " for resultId=" + resultId
+                    + ", activeAlias=" + activeAlias
+                    + ", activeEdgeId=" + activeEdgeId
                     + " (" + count + "/" + expectedWorkers + ")");
 
             return count >= expectedWorkers;
@@ -129,12 +169,20 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
             ArrayList<Integer> workers = new ArrayList<Integer>(receivedWorkers);
             Collections.sort(workers);
 
+            if (baseKey == null || baseKey.trim().isEmpty()) {
+                baseKey = "onepass-phase1-" + uid;
+            }
+
             payload.put("type", "GLOBAL_PHASE1_RESULT");
             payload.put("uid", uid);
             payload.put("phase", phase);
             payload.put("resultId", resultId);
             payload.put("queryName", queryName);
             payload.put("rootAlias", rootAlias);
+            payload.put("baseKey", baseKey);
+            payload.put("activeAlias", activeAlias == null ? "" : activeAlias);
+            payload.put("activeEdgeId", activeEdgeId == null ? "" : activeEdgeId);
+            payload.put("stateRef", uid + "_PHASE1_" + resultId + "_GLOBAL_STATE");
             payload.put("expectedWorkers", expectedWorkers);
             payload.put("receivedWorkers", workers);
             payload.put("localResultCount", receivedWorkers.size());
@@ -142,6 +190,8 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
             Map<String, Object> globalPhaseOneResult = new LinkedHashMap<String, Object>();
             globalPhaseOneResult.put("queryName", queryName);
             globalPhaseOneResult.put("rootAlias", rootAlias);
+            globalPhaseOneResult.put("activeAlias", activeAlias == null ? "" : activeAlias);
+            globalPhaseOneResult.put("activeEdgeId", activeEdgeId == null ? "" : activeEdgeId);
             globalPhaseOneResult.put("seenTuplesByAlias", new LinkedHashMap<String, Long>(mergedSeenTuplesByAlias));
             globalPhaseOneResult.put("edgeIndexes", deepCopyEdgeIndexes());
             globalPhaseOneResult.put("edgeSummaries", buildEdgeSummaries());
@@ -155,30 +205,45 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
         }
     }
 
-    private void mergePhaseOneResult(JsonNode phaseOneResult) {
+    private void mergePhaseOneResult(JsonNode phaseOneResult, String activeAlias, String activeEdgeId) {
         JsonNode seenTuples = phaseOneResult.get("seenTuplesByAlias");
-
-        if (seenTuples != null && seenTuples.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = seenTuples.fields();
-
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-
-                String alias = entry.getKey();
-                long value = entry.getValue().asLong(0L);
-
-                Long current = mergedSeenTuplesByAlias.get(alias);
-
-                if (current == null) {
-                    current = 0L;
-                }
-
-                mergedSeenTuplesByAlias.put(alias, current + value);
-            }
-        }
+        mergeSeenTuples(seenTuples, activeAlias);
 
         JsonNode edgeIndexes = phaseOneResult.get("edgeIndexes");
 
+        if (edgeIndexes == null || !edgeIndexes.isObject()) {
+            return;
+        }
+
+        if (activeEdgeId == null || activeEdgeId.trim().isEmpty()) {
+            /*
+             * Backward-compatible fallback for older one-alias tests.
+             * Without activeEdgeId, the only safe assumption is the old behavior:
+             * sum all edges across workers.
+             */
+            mergeAllEdges(edgeIndexes);
+            return;
+        }
+
+        /*
+         * Copy already-global/stable edges once.
+         * Sum only the currently active edge across workers.
+         */
+        if (!stableEdgesCopied) {
+            copyStableEdgesOnce(edgeIndexes, activeEdgeId);
+            stableEdgesCopied = true;
+        }
+
+        JsonNode activeIndex = edgeIndexes.get(activeEdgeId);
+
+        if (activeIndex != null && activeIndex.isObject()) {
+            mergeOneEdge(activeEdgeId, activeIndex);
+        } else if (!mergedEdgeIndexes.containsKey(activeEdgeId)) {
+            mergedEdgeIndexes.put(activeEdgeId, new LinkedHashMap<String, Double>());
+        }
+    }
+
+    private void copyStableEdgesOnce(JsonNode edgeIndexes, String activeEdgeId) {
         if (edgeIndexes == null || !edgeIndexes.isObject()) {
             return;
         }
@@ -189,17 +254,22 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
             Map.Entry<String, JsonNode> edgeEntry = edgeFields.next();
 
             String edgeId = edgeEntry.getKey();
-            JsonNode joinWeights = edgeEntry.getValue();
 
-            if (joinWeights == null || !joinWeights.isObject()) {
+            if (activeEdgeId != null && activeEdgeId.equals(edgeId)) {
                 continue;
             }
 
-            Map<String, Double> mergedJoinWeights = mergedEdgeIndexes.get(edgeId);
+            JsonNode joinWeights = edgeEntry.getValue();
 
-            if (mergedJoinWeights == null) {
-                mergedJoinWeights = new LinkedHashMap<String, Double>();
-                mergedEdgeIndexes.put(edgeId, mergedJoinWeights);
+            Map<String, Double> target = mergedEdgeIndexes.get(edgeId);
+
+            if (target == null) {
+                target = new LinkedHashMap<String, Double>();
+                mergedEdgeIndexes.put(edgeId, target);
+            }
+
+            if (joinWeights == null || !joinWeights.isObject()) {
+                continue;
             }
 
             Iterator<Map.Entry<String, JsonNode>> joinFields = joinWeights.fields();
@@ -207,18 +277,109 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
             while (joinFields.hasNext()) {
                 Map.Entry<String, JsonNode> joinEntry = joinFields.next();
 
-                String joinKey = joinEntry.getKey();
-                double weight = joinEntry.getValue().asDouble(0.0d);
-
-                Double current = mergedJoinWeights.get(joinKey);
-
-                if (current == null) {
-                    current = 0.0d;
-                }
-
-                mergedJoinWeights.put(joinKey, current + weight);
+                target.put(joinEntry.getKey(), joinEntry.getValue().asDouble(0.0d));
             }
         }
+    }
+
+    private void mergeOneEdge(String edgeId, JsonNode joinWeights) {
+        if (edgeId == null || edgeId.trim().isEmpty()) {
+            return;
+        }
+
+        Map<String, Double> target = mergedEdgeIndexes.get(edgeId);
+
+        if (target == null) {
+            target = new LinkedHashMap<String, Double>();
+            mergedEdgeIndexes.put(edgeId, target);
+        }
+
+        if (joinWeights == null || !joinWeights.isObject()) {
+            return;
+        }
+
+        Iterator<Map.Entry<String, JsonNode>> joinFields = joinWeights.fields();
+
+        while (joinFields.hasNext()) {
+            Map.Entry<String, JsonNode> joinEntry = joinFields.next();
+
+            String joinKey = joinEntry.getKey();
+            double delta = joinEntry.getValue().asDouble(0.0d);
+
+            Double current = target.get(joinKey);
+
+            if (current == null) {
+                current = 0.0d;
+            }
+
+            target.put(joinKey, current + delta);
+        }
+    }
+
+    private void mergeAllEdges(JsonNode edgeIndexes) {
+        if (edgeIndexes == null || !edgeIndexes.isObject()) {
+            return;
+        }
+
+        Iterator<Map.Entry<String, JsonNode>> edgeFields = edgeIndexes.fields();
+
+        while (edgeFields.hasNext()) {
+            Map.Entry<String, JsonNode> edgeEntry = edgeFields.next();
+
+            mergeOneEdge(edgeEntry.getKey(), edgeEntry.getValue());
+        }
+    }
+
+    private void mergeSeenTuples(JsonNode seenTuplesByAlias, String activeAlias) {
+        if (seenTuplesByAlias == null || !seenTuplesByAlias.isObject()) {
+            return;
+        }
+
+        if (activeAlias == null || activeAlias.trim().isEmpty()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = seenTuplesByAlias.fields();
+
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+
+                addSeen(entry.getKey(), entry.getValue().asLong(0L));
+            }
+
+            return;
+        }
+
+        if (!stableSeenCopied) {
+            Iterator<Map.Entry<String, JsonNode>> fields = seenTuplesByAlias.fields();
+
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+
+                if (!activeAlias.equals(entry.getKey())) {
+                    mergedSeenTuplesByAlias.put(entry.getKey(), entry.getValue().asLong(0L));
+                }
+            }
+
+            stableSeenCopied = true;
+        }
+
+        JsonNode activeSeen = seenTuplesByAlias.get(activeAlias);
+
+        if (activeSeen != null && !activeSeen.isNull()) {
+            addSeen(activeAlias, activeSeen.asLong(0L));
+        }
+    }
+
+    private void addSeen(String alias, long delta) {
+        if (alias == null || alias.trim().isEmpty()) {
+            return;
+        }
+
+        Long current = mergedSeenTuplesByAlias.get(alias);
+
+        if (current == null) {
+            current = 0L;
+        }
+
+        mergedSeenTuplesByAlias.put(alias, current + delta);
     }
 
     private Map<String, Map<String, Double>> deepCopyEdgeIndexes() {
@@ -232,8 +393,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
     }
 
     private Map<String, Map<String, Object>> buildEdgeSummaries() {
-        Map<String, Map<String, Object>> summaries =
-                new LinkedHashMap<String, Map<String, Object>>();
+        Map<String, Map<String, Object>> summaries = new LinkedHashMap<String, Map<String, Object>>();
 
         for (Map.Entry<String, Map<String, Double>> edgeEntry : mergedEdgeIndexes.entrySet()) {
             String edgeId = edgeEntry.getKey();
@@ -277,6 +437,26 @@ public final class OnePassIndexReduceFunction extends ReduceFunction {
         }
 
         return MAPPER.valueToTree(estimation);
+    }
+
+    private static String resolveActiveAlias(JsonNode payload, Estimation e) {
+        String value = textField(payload, "activeAlias", "");
+
+        if (value != null && !value.trim().isEmpty()) {
+            return value.trim();
+        }
+
+        String[] param = e.getParam();
+
+        if (param != null && param.length > 3 && param[3] != null) {
+            value = param[3];
+
+            if (!value.trim().isEmpty()) {
+                return value.trim();
+            }
+        }
+
+        return "";
     }
 
     private static String textField(JsonNode node, String fieldName, String defaultValue) {

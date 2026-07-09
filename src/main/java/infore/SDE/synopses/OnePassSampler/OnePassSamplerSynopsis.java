@@ -183,6 +183,50 @@ public final class OnePassSamplerSynopsis implements Serializable {
         return phaseOneResult;
     }
 
+    public OnePassPhaseOneResult installGlobalPhaseOneResult(
+            OnePassPhaseOneResult globalPhaseOneResult) {
+
+        return installGlobalPhaseOneResult(globalPhaseOneResult, true);
+    }
+
+    public OnePassPhaseOneResult installGlobalPhaseOneResult(
+            OnePassPhaseOneResult globalPhaseOneResult,
+            boolean phaseOneComplete) {
+
+        if (globalPhaseOneResult == null) {
+            throw new IllegalArgumentException("globalPhaseOneResult must not be null");
+        }
+
+        if (phase != Phase.PHASE_1 && phase != Phase.PHASE_2) {
+            throw new IllegalStateException(
+                    "installGlobalPhaseOneResult() is only valid during PHASE_1 or PHASE_2. Current phase: "
+                            + phase
+            );
+        }
+
+        /*
+         * Important for multi-alias Phase 1:
+         *
+         * The installed global result must become the Phase 1 working state.
+         * Example:
+         *   after l is merged globally, every worker must use global l<->o
+         *   while processing o.
+         */
+        this.phaseOneState.replaceWith(globalPhaseOneResult);
+        this.phaseOneResult = globalPhaseOneResult;
+        this.phaseTwoResult = null;
+
+        if (phaseOneComplete) {
+            this.phaseTwoState = new OnePassPhaseTwoState(globalPhaseOneResult);
+            this.phase = Phase.PHASE_2;
+        } else {
+            this.phaseTwoState = null;
+            this.phase = Phase.PHASE_1;
+        }
+
+        return this.phaseOneResult;
+    }
+
     /**
      * Completes Phase 2.
      *

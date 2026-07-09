@@ -129,4 +129,52 @@ public class OnePassPhaseOneState implements Serializable {
             this.seenTuplesByAlias.put(e.getKey(), cur + e.getValue());
         }
     }
+
+    public void replaceWith(OnePassPhaseOneResult result) {
+        if (result == null) {
+            throw new IllegalArgumentException("result must not be null");
+        }
+
+        this.indexByEdgeId.clear();
+
+        Map<String, Phase1LinkWeightIndex> rawIndexes = result.copyRawIndexesByEdgeId();
+
+        for (Map.Entry<String, Phase1LinkWeightIndex> entry : rawIndexes.entrySet()) {
+            Phase1LinkWeightIndex index = entry.getValue();
+
+            if (index == null) {
+                this.indexByEdgeId.put(entry.getKey(), new Phase1LinkWeightIndex(entry.getKey()));
+            } else {
+                this.indexByEdgeId.put(entry.getKey(), index.copy());
+            }
+        }
+
+        /*
+         * Keep empty indexes for every non-root edge, even if the current
+         * global result has not filled that edge yet.
+         */
+        for (String alias : plan.getAliases()) {
+            if (!plan.isRoot(alias)) {
+                CompiledOnePassPlan.DirectedJoinEdge parentEdge =
+                        plan.getParentEdge(alias);
+
+                if (parentEdge != null
+                        && !this.indexByEdgeId.containsKey(parentEdge.getEdgeId())) {
+                    this.indexByEdgeId.put(
+                            parentEdge.getEdgeId(),
+                            new Phase1LinkWeightIndex(parentEdge.getEdgeId())
+                    );
+                }
+            }
+        }
+
+        this.seenTuplesByAlias.clear();
+        this.seenTuplesByAlias.putAll(result.getSeenTuplesByAlias());
+
+        for (String alias : plan.getAliases()) {
+            if (!this.seenTuplesByAlias.containsKey(alias)) {
+                this.seenTuplesByAlias.put(alias, 0L);
+            }
+        }
+    }
 }

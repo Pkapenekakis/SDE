@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.messages.Request;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
 import infore.SDE.synopses.Synopsis;
@@ -12,7 +13,7 @@ import infore.SDE.transformations.onepass.OnePassRequestParser;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassCompletedSample;
 import com.fasterxml.jackson.databind.JsonNode;
-
+import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
 import java.util.*;
 
 /**
@@ -716,7 +717,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
     }
 
     public Estimation buildLocalPhaseOneResultEstimation(Request request, int workerId, int expectedWorkers,
-                                                         int actualParallelism, String resultId) {
+                                                         int actualParallelism, String resultId, String activeAlias) {
 
         OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
 
@@ -727,6 +728,8 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         }
 
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        String workerKey = request.getKey();
+        String baseKey = stripOnePassWorkerSuffix(workerKey, expectedWorkers, workerId);
 
         payload.put("type", "LOCAL_PHASE1_RESULT");
         payload.put("uid", request.getUID());
@@ -737,6 +740,22 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         payload.put("resultId", resultId);
         payload.put("queryName", plan.getQueryName());
         payload.put("rootAlias", plan.getRootAlias());
+        payload.put("workerKey", workerKey);
+        payload.put("baseKey", baseKey);
+
+        String activeEdgeId = "";
+
+        if (activeAlias != null && !activeAlias.trim().isEmpty() && !plan.isRoot(activeAlias.trim())) {
+            CompiledOnePassPlan.DirectedJoinEdge parentEdge =
+                    plan.getParentEdge(activeAlias.trim());
+
+            if (parentEdge != null) {
+                activeEdgeId = parentEdge.getEdgeId();
+            }
+        }
+
+        payload.put("activeAlias", activeAlias == null ? "" : activeAlias.trim());
+        payload.put("activeEdgeId", activeEdgeId);
 
     /*
      * Small test Payload
@@ -752,7 +771,8 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             throw new IllegalStateException("Could not serialize LOCAL_PHASE1_RESULT", e);
         }
 
-        String[] param = new String[] {"LOCAL_PHASE1_RESULT", resultId, "PHASE1", "",
+        String[] param = new String[] {"LOCAL_PHASE1_RESULT", resultId, "PHASE1",
+                activeAlias == null ? "" : activeAlias.trim(),
                 Integer.toString(workerId), Integer.toString(expectedWorkers)};
 
         /*
@@ -765,6 +785,160 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
         return new Estimation(request.getUID(), reduceKey, 72, 30,
                 reduceKey, json, param, expectedWorkers);
+    }
+
+    private static String stripOnePassWorkerSuffix(String workerKey, int expectedWorkers, int workerId) {
+        if (workerKey == null) {
+            return "";
+        }
+
+        String suffix = "_" + expectedWorkers + "_KEYED_" + workerId;
+
+        if (workerKey.endsWith(suffix)) {
+            return workerKey.substring(0, workerKey.length() - suffix.length());
+        }
+
+        return workerKey;
+    }
+
+    public Map<String, Object> installGlobalPhaseOneIndex(JsonNode state, String activeAlias) {
+        if (state == null || state.isNull()) {
+            throw new IllegalArgumentException("Global Phase 1 state must not be null");
+        }
+
+        Map<String, Phase1LinkWeightIndex> indexes = new LinkedHashMap<String, Phase1LinkWeightIndex>();
+
+        JsonNode edgeSummaries = state.get("edgeSummaries");
+
+        if (edgeSummaries != null && edgeSummaries.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = edgeSummaries.fields();
+
+            while (fields.hasNext()) {
+                String edgeId = fields.next().getKey();
+                indexes.put(edgeId, new Phase1LinkWeightIndex(edgeId));
+            }
+        }
+
+        JsonNode entries = state.get("entries");
+
+        if (entries != null && entries.isArray()) {
+            for (JsonNode entry : entries) {
+                String edgeId = textField(entry, "edgeId", "");
+                String joinKey = textField(entry, "joinKey", "");
+                double globalWeight = entry.has("globalWeight")
+                        ? entry.get("globalWeight").asDouble(0.0d)
+                        : 0.0d;
+
+                if (edgeId == null || edgeId.trim().isEmpty()) {
+                    continue;
+                }
+
+                if (joinKey == null || joinKey.trim().isEmpty()) {
+                    continue;
+                }
+
+                Phase1LinkWeightIndex index = indexes.get(edgeId);
+
+                if (index == null) {
+                    index = new Phase1LinkWeightIndex(edgeId);
+                    indexes.put(edgeId, index);
+                }
+
+                index.add(parseJoinValue(joinKey), globalWeight);
+            }
+        }
+
+        Map<String, Long> seenTuplesByAlias = new LinkedHashMap<String, Long>();
+
+        JsonNode seen = state.get("seenTuplesByAlias");
+
+        if (seen != null && seen.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = seen.fields();
+
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                seenTuplesByAlias.put(entry.getKey(), entry.getValue().asLong(0L));
+            }
+        }
+
+        OnePassPhaseOneResult globalPhaseOneResult =
+                new OnePassPhaseOneResult(plan, indexes, seenTuplesByAlias);
+
+        String resolvedActiveAlias = activeAlias;
+
+        if (resolvedActiveAlias == null || resolvedActiveAlias.trim().isEmpty()) {
+            resolvedActiveAlias = textField(state, "activeAlias", "");
+        }
+
+        boolean phaseOneComplete = isLastPhaseOneAlias(resolvedActiveAlias);
+
+        lifecycle.installGlobalPhaseOneResult(globalPhaseOneResult, phaseOneComplete);
+
+        Map<String, Object> summary = new LinkedHashMap<String, Object>();
+
+        summary.put("installed", true);
+        summary.put("stateRef", textField(state, "stateRef", ""));
+        summary.put("entryCount", entries != null && entries.isArray() ? entries.size() : 0);
+        summary.put("edgeSummaries", globalPhaseOneResult.getEdgeSummaries(0));
+        summary.put("seenTuplesByAlias", new LinkedHashMap<String, Long>(seenTuplesByAlias));
+        summary.put("activeAlias", resolvedActiveAlias);
+        summary.put("phaseOneComplete", phaseOneComplete);
+        summary.put("nextLifecyclePhase", lifecycle.getPhase().name());
+
+        System.out.println("[OnePassSamplerSdeSynopsis] Installed global Phase 1 index: "
+                + summary);
+
+        return summary;
+    }
+
+    private static JoinValue parseJoinValue(String joinKey) {
+        if (joinKey == null) {
+            throw new IllegalArgumentException("joinKey must not be null");
+        }
+
+        String trimmed = joinKey.trim();
+
+        if (trimmed.indexOf('|') >= 0) {
+            return new JoinValue(Arrays.asList(trimmed.split("\\|", -1)));
+        }
+
+        return JoinValue.ofSingle(trimmed);
+    }
+
+    private static String textField(JsonNode node, String fieldName, String defaultValue) {
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        String value = field.asText();
+
+        if (value == null || value.trim().isEmpty()) {
+            return defaultValue;
+        }
+
+        return value.trim();
+    }
+
+    private boolean isLastPhaseOneAlias(String alias) {
+        if (alias == null || alias.trim().isEmpty()) {
+            return false;
+        }
+
+        List<String> order = plan.getLeafToRootOrder();
+
+        if (order == null || order.isEmpty()) {
+            return true;
+        }
+
+        String last = order.get(order.size() - 1);
+
+        return alias.trim().equals(last);
     }
 
 }

@@ -38,6 +38,9 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
 
     private static final int ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID = 73; //actual merged Phase1 result
     private static final int ONEPASS_GLOBAL_PHASE1_RESULT_READY_REQUEST_ID = 74; //coordinator ready event
+    private static final int ONEPASS_INSTALL_GLOBAL_INDEX_ACK_REQUEST_ID = 75;
+    private static final int ONEPASS_GLOBAL_PHASE1_INDEX_INSTALLED_REQUEST_ID = 76;
+
 
     private static final int ONEPASS_SYNOPSIS_ID = 30;
 
@@ -48,8 +51,15 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
     private static final String TYPE_GLOBAL_PHASE1_RESULT = "GLOBAL_PHASE1_RESULT";
     private static final String TYPE_GLOBAL_PHASE1_RESULT_READY = "GLOBAL_PHASE1_RESULT_READY";
 
+    private static final String TYPE_INSTALL_GLOBAL_INDEX = "INSTALL_GLOBAL_INDEX";
+    private static final String TYPE_INSTALL_GLOBAL_INDEX_ACK = "INSTALL_GLOBAL_INDEX_ACK";
+    private static final String TYPE_GLOBAL_PHASE1_INDEX_INSTALLED = "GLOBAL_PHASE1_INDEX_INSTALLED";
+
     private final Map<BarrierKey, BarrierAccumulator> barriers = new HashMap<BarrierKey, BarrierAccumulator>();
     private final Map<ResultKey, ResultAccumulator> phaseOneResults = new HashMap<ResultKey, ResultAccumulator>();
+    private final Map<InstallKey, InstallAccumulator> installAccumulators = new HashMap<InstallKey, InstallAccumulator>();
+
+    private final Set<InstallKey> completedInstalls = new HashSet<InstallKey>();
 
     private final Set<ResultKey> completedPhaseOneResults = new HashSet<ResultKey>();
     /*
@@ -86,6 +96,12 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
 
         if (input.getRequestID() == ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID && TYPE_GLOBAL_PHASE1_RESULT.equals(type)) {
             handleGlobalPhaseOneResult(input, payload, out);
+        }
+
+        if (input.getRequestID() == ONEPASS_INSTALL_GLOBAL_INDEX_ACK_REQUEST_ID
+                && TYPE_INSTALL_GLOBAL_INDEX_ACK.equals(type)) {
+            handleInstallGlobalIndexAck(input, payload, out);
+            return;
         }
     }
 
@@ -177,6 +193,9 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         );
 
         out.collect(ready);
+
+        Estimation installCommand = buildInstallGlobalIndexCommand(input, payload, stateRef, expectedWorkers);
+        out.collect(installCommand);
 
         System.out.println("[OnePassCoordinator] GLOBAL_PHASE1_RESULT_READY emitted: "
                 + "uid=" + uid
@@ -544,4 +563,235 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
             return receivedWorkers.size() >= expectedWorkers;
         }
     }
+
+    private static final class InstallKey {
+        private final int uid;
+        private final String stateRef;
+
+        private InstallKey(int uid, String stateRef) {
+            this.uid = uid;
+            this.stateRef = stateRef == null ? "" : stateRef;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof InstallKey)) {
+                return false;
+            }
+
+            InstallKey other = (InstallKey) o;
+
+            return uid == other.uid
+                    && Objects.equals(stateRef, other.stateRef);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(uid, stateRef);
+        }
+
+        @Override
+        public String toString() {
+            return "InstallKey{uid=" + uid + ", stateRef='" + stateRef + "'}";
+        }
+    }
+
+    private static final class InstallAccumulator {
+        private final int uid;
+        private final String stateRef;
+        private final String phase;
+        private final String rootAlias;
+
+        private int expectedWorkers;
+
+        private final TreeSet<Integer> receivedWorkers = new TreeSet<Integer>();
+        private final TreeSet<Integer> failedWorkers = new TreeSet<Integer>();
+
+        private InstallAccumulator(
+                int uid,
+                String stateRef,
+                String phase,
+                String rootAlias,
+                int expectedWorkers) {
+
+            this.uid = uid;
+            this.stateRef = stateRef;
+            this.phase = phase;
+            this.rootAlias = rootAlias;
+            this.expectedWorkers = expectedWorkers <= 0 ? 1 : expectedWorkers;
+        }
+
+        private boolean isComplete() {
+            return receivedWorkers.size() >= expectedWorkers;
+        }
+    }
+
+    private Estimation buildInstallGlobalIndexCommand(
+            Estimation input,
+            JsonNode payload,
+            String stateRef,
+            int expectedWorkers) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String phase = textField(payload, "phase", "PHASE1");
+        String resultId = textField(payload, "resultId", "PHASE1_RESULT_" + uid);
+        String rootAlias = textField(payload, "rootAlias", "");
+        String baseKey = textField(payload, "baseKey", "");
+        String activeAlias = textField(payload, "activeAlias", "");
+        String activeEdgeId = textField(payload, "activeEdgeId", "");
+
+        if (baseKey == null || baseKey.trim().isEmpty()) {
+            baseKey = input.getKey();
+        }
+
+        Map<String, Object> commandPayload = new LinkedHashMap<String, Object>();
+
+        commandPayload.put("type", TYPE_INSTALL_GLOBAL_INDEX);
+        commandPayload.put("uid", uid);
+        commandPayload.put("phase", phase);
+        commandPayload.put("resultId", resultId);
+        commandPayload.put("rootAlias", rootAlias);
+        commandPayload.put("stateRef", stateRef);
+        commandPayload.put("baseKey", baseKey);
+        commandPayload.put("expectedWorkers", expectedWorkers);
+        commandPayload.put("activeAlias", activeAlias);
+        commandPayload.put("activeEdgeId", activeEdgeId);
+
+        String json = MAPPER.writeValueAsString(commandPayload);
+
+        String[] param = new String[] {
+                TYPE_INSTALL_GLOBAL_INDEX,
+                stateRef,
+                resultId,
+                activeAlias,
+                phase,
+                rootAlias,
+                Integer.toString(expectedWorkers)
+        };
+
+        /*
+         * Important:
+         * kafkaProducerEstimation serializes requestID == 7 as Request(element).
+         * Request(Estimation) uses estimationkey as DataSetkey.
+         * Therefore, estimationkey must be the logical baseKey.
+         */
+        return new Estimation(
+                uid,
+                baseKey,
+                7,
+                ONEPASS_SYNOPSIS_ID,
+                baseKey,
+                json,
+                param,
+                expectedWorkers
+        );
+    }
+
+    private void handleInstallGlobalIndexAck(
+            Estimation input,
+            JsonNode payload,
+            Collector<Estimation> out) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String stateRef = textField(payload, "stateRef", "");
+        String phase = textField(payload, "phase", "PHASE1");
+        String rootAlias = textField(payload, "rootAlias", "");
+
+        int workerId = intField(payload, "workerId", -1);
+        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
+        boolean installed = booleanField(payload, "installed", false);
+        String stateChecksum = textField(payload, "stateChecksum", "");
+
+        if (workerId < 0) {
+            System.out.println("[OnePassCoordinator] Ignoring INSTALL ACK with invalid workerId: "
+                    + payload);
+            return;
+        }
+
+        if (expectedWorkers <= 0) {
+            expectedWorkers = input.getNoOfP() > 0 ? input.getNoOfP() : 1;
+        }
+
+        InstallKey key = new InstallKey(uid, stateRef);
+
+        if (completedInstalls.contains(key)) {
+            System.out.println("[OnePassCoordinator] Ignoring late duplicate install ACK: "
+                    + key + ", workerId=" + workerId);
+            return;
+        }
+
+        InstallAccumulator acc = installAccumulators.get(key);
+
+        if (acc == null) {
+            acc = new InstallAccumulator(uid, stateRef, phase, rootAlias, expectedWorkers);
+            installAccumulators.put(key, acc);
+        }
+
+        acc.expectedWorkers = Math.max(acc.expectedWorkers, expectedWorkers);
+        acc.receivedWorkers.add(workerId);
+
+        if (!installed) {
+            acc.failedWorkers.add(workerId);
+        }
+
+        System.out.println("[OnePassCoordinator] INSTALL_GLOBAL_INDEX_ACK received: "
+                + key
+                + ", workerId=" + workerId
+                + ", installed=" + installed
+                + ", checksum=" + stateChecksum
+                + ", received=" + acc.receivedWorkers.size() + "/" + acc.expectedWorkers);
+
+        if (acc.isComplete()) {
+            Estimation installedReady = buildGlobalPhaseOneIndexInstalled(acc);
+
+            out.collect(installedReady);
+
+            installAccumulators.remove(key);
+            completedInstalls.add(key);
+
+            System.out.println("[OnePassCoordinator] GLOBAL_PHASE1_INDEX_INSTALLED emitted: "
+                    + key
+                    + ", receivedWorkers=" + acc.receivedWorkers
+                    + ", failedWorkers=" + acc.failedWorkers);
+        }
+    }
+
+    private Estimation buildGlobalPhaseOneIndexInstalled(InstallAccumulator acc) throws Exception {
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+
+        payload.put("type", TYPE_GLOBAL_PHASE1_INDEX_INSTALLED);
+        payload.put("uid", acc.uid);
+        payload.put("phase", acc.phase);
+        payload.put("rootAlias", acc.rootAlias);
+        payload.put("stateRef", acc.stateRef);
+        payload.put("expectedWorkers", acc.expectedWorkers);
+        payload.put("receivedWorkers", acc.receivedWorkers);
+        payload.put("failedWorkers", acc.failedWorkers);
+        payload.put("installedWorkerCount", acc.receivedWorkers.size());
+
+        String json = MAPPER.writeValueAsString(payload);
+
+        String[] param = new String[] {
+                TYPE_GLOBAL_PHASE1_INDEX_INSTALLED,
+                acc.stateRef,
+                acc.phase,
+                acc.rootAlias,
+                Integer.toString(acc.receivedWorkers.size()),
+                Integer.toString(acc.expectedWorkers)
+        };
+
+        String estimationKey = acc.uid + "_PHASE1_INDEX_INSTALLED_" + acc.stateRef;
+
+        return new Estimation(
+                acc.uid,
+                estimationKey,
+                ONEPASS_GLOBAL_PHASE1_INDEX_INSTALLED_REQUEST_ID,
+                ONEPASS_SYNOPSIS_ID,
+                estimationKey,
+                json,
+                param,
+                acc.expectedWorkers
+        );
+    }
+
 }
