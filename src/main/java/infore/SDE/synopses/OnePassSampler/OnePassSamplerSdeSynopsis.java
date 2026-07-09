@@ -1099,6 +1099,102 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return summary;
     }
 
+    public Estimation buildLocalPhaseThreeAliasResultEstimation(
+            Request request,
+            int workerId,
+            int expectedWorkers,
+            int actualParallelism,
+            String resultId,
+            String alias) {
+
+        Map<String, Object> localChoices = lifecycle.exportPhaseThreeActiveAliasLocalChoices();
+
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        String workerKey = request.getKey();
+        String baseKey = stripOnePassWorkerSuffix(workerKey, expectedWorkers, workerId);
+
+        payload.put("type", "LOCAL_PHASE3_ALIAS_RESULT");
+        payload.put("uid", request.getUID());
+        payload.put("workerId", workerId);
+        payload.put("expectedWorkers", expectedWorkers);
+        payload.put("actualParallelism", actualParallelism);
+        payload.put("phase", "PHASE3");
+        payload.put("resultId", resultId);
+        payload.put("queryName", plan.getQueryName());
+        payload.put("rootAlias", plan.getRootAlias());
+        payload.put("phaseThreeAlias", alias);
+        payload.put("alias", alias);
+        payload.put("sampleSize", plan.getSampleSize());
+        payload.put("workerKey", workerKey);
+        payload.put("baseKey", baseKey);
+        payload.putAll(localChoices);
+
+        String json;
+
+        try {
+            json = MAPPER.writeValueAsString(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not serialize LOCAL_PHASE3_ALIAS_RESULT", e);
+        }
+
+        String[] param = new String[] {
+                "LOCAL_PHASE3_ALIAS_RESULT",
+                resultId,
+                alias,
+                Integer.toString(workerId),
+                Integer.toString(expectedWorkers)
+        };
+
+        String reduceKey = request.getUID() + "_PHASE3_ALIAS_" + resultId;
+
+        Estimation out = new Estimation(
+                request.getUID(),
+                reduceKey,
+                92,
+                30,
+                reduceKey,   // IMPORTANT: this must be reduceKey, not request.getKey()
+                json,
+                param,
+                expectedWorkers
+        );
+
+        out.setKey(reduceKey);
+        out.setEstimationkey(reduceKey);
+
+        return out;
+    }
+
+    public Map<String, Object> installGlobalPhaseThreeAliasSelections(JsonNode state) {
+        if (state == null || state.isNull()) {
+            throw new IllegalArgumentException("state must not be null");
+        }
+
+        String alias = textField(state, "phaseThreeAlias", textField(state, "alias", ""));
+
+        if (alias == null || alias.trim().isEmpty()) {
+            throw new IllegalArgumentException("Missing phaseThreeAlias in global selections state: " + state);
+        }
+
+        JsonNode entries = state.get("entries");
+
+        if (entries == null || !entries.isArray()) {
+            throw new IllegalArgumentException("Missing entries array in global selections state: " + state);
+        }
+
+        lifecycle.installGlobalPhaseThreeAliasSelections(alias, entries);
+
+        Map<String, Object> summary = new LinkedHashMap<String, Object>();
+        summary.put("type", "INSTALL_PHASE3_ALIAS_SELECTIONS_SUMMARY");
+        summary.put("queryName", plan.getQueryName());
+        summary.put("rootAlias", plan.getRootAlias());
+        summary.put("phaseThreeAlias", alias);
+        summary.put("entryCount", entries.size());
+        summary.put("phase", lifecycle.getPhase().name());
+        summary.put("phaseThreeAliasActive", lifecycle.isPhaseThreeAliasActive());
+
+        return summary;
+    }
+
     private static long longField(JsonNode node, String fieldName, long defaultValue) {
         if (node == null || node.isNull()) return defaultValue;
         JsonNode field = node.get(fieldName);

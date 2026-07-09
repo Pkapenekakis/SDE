@@ -306,7 +306,19 @@ public class Run {
 				.addSink(onePassGlobalStateKp.getProducer())
 				.name("ONEPASS_GLOBAL_STATE_TOPIC_OUTPUT");
 
-		finalStream.addSink(kp.getProducer());
+		DataStream<Estimation> finalStreamExternalOutput = finalStream
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return !isOnePassLargeGlobalStateResult(value);
+					}
+				}).name("FINAL_STREAM_EXTERNAL_OUTPUT_FILTER");
+
+		finalStreamExternalOutput
+				.addSink(kp.getProducer())
+				.name("FINAL_STREAM_EXTERNAL_OUTPUT");
 
 		/*
 		 * Single OnePass coordinator stage.
@@ -386,6 +398,9 @@ public class Run {
 		if (value.getRequestID() == 85 && "INSTALL_ROOT_SAMPLE_ACK".equals(type)) {
 			return true;
 		}
+		if (value.getRequestID() == 95 && "INSTALL_PHASE3_ALIAS_SELECTIONS_ACK".equals(type)) {
+			return true;
+		}
 
 		return false;
 	}
@@ -400,7 +415,10 @@ public class Run {
 		}
 
 		String type = firstParam(value);
-		return value.getRequestID() == 7 && ("INSTALL_GLOBAL_INDEX".equals(type) || "INSTALL_ROOT_SAMPLE".equals(type));
+		return value.getRequestID() == 7
+				&& ("INSTALL_GLOBAL_INDEX".equals(type)
+				|| "INSTALL_ROOT_SAMPLE".equals(type)
+				|| "INSTALL_PHASE3_ALIAS_SELECTIONS".equals(type));
 	}
 
 	private static boolean isOnePassPostReduceCoordinatorMessage(Estimation value) {
@@ -418,6 +436,10 @@ public class Run {
 		}
 
 		if (value.getRequestID() == 83 && "GLOBAL_PHASE2_ROOT_SAMPLE".equals(type)) {
+			return true;
+		}
+
+		if (value.getRequestID() == 93 && "GLOBAL_PHASE3_ALIAS_RESULT".equals(type)) {
 			return true;
 		}
 
@@ -462,6 +484,32 @@ public class Run {
 
 		return "FINISH_PHASE_1".equals(type) || "FINISH_PHASE_2".equals(type) || "START_PHASE_3_ALIAS".equals(type)
 				|| "FINISH_PHASE_3_ALIAS".equals(type) || "FINISH_PHASE_3".equals(type) || "STATUS".equals(type);
+	}
+
+	private static boolean isOnePassLargeGlobalStateResult(Estimation value) {
+		if (value == null) {
+			return false;
+		}
+
+		if (value.getSynopsisID() != 30) {
+			return false;
+		}
+
+		String type = firstParam(value);
+
+		if (value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(type)) {
+			return true;
+		}
+
+		if (value.getRequestID() == 83 && "GLOBAL_PHASE2_ROOT_SAMPLE".equals(type)) {
+			return true;
+		}
+
+		if (value.getRequestID() == 93 && "GLOBAL_PHASE3_ALIAS_RESULT".equals(type)) {
+			return true;
+		}
+
+		return false;
 	}
 
 	private static void initializeParameters(String[] args) {

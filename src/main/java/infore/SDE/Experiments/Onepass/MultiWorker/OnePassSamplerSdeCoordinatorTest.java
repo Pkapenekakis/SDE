@@ -70,13 +70,13 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String TEST_ONEPASS_SQL =
             "SELECT * FROM wq3_alias WEIGHTED BY (" +
                     "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
-                    "LIMIT 100 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+                    "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
     /*
      * Use -1 for the whole file.
      * Keep this modest while debugging.
      */
-    private static final long TEST_ROW_LIMIT = 14000L;
+    private static final long TEST_ROW_LIMIT = 1000000L;
 
     private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
 
@@ -85,10 +85,11 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final int REQUEST_UPDATE = 7;
 
     private static final int EXPECTED_WORKERS = 4;
-    private static final long TIMEOUT_MS = 120000L;
+    private static final long TIMEOUT_MS = 30L * 60L * 1000L;
 
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
-    private static final boolean PRINT_MATCHED_PAYLOADS = true;
+    private static final boolean PRINT_MATCHED_PAYLOADS = false;
+    private static final boolean WAIT_FOR_FULL_GLOBAL_RESULTS = false;
 
     private static final boolean EXPORT_FINAL_PHASE1_INDEX = false;
     private static final String PHASE1_INDEX_EXPORT_DIR = "/tmp/onepass_wq3_alias_phase1_full_indexes.json";
@@ -243,25 +244,32 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseOneRequest);
                 producer.flush();
 
-                System.out.println("Waiting for GLOBAL_PHASE1_RESULT for alias " + phaseOneAlias + "...");
-                JsonNode globalPhaseOneResult = waitForCoordinatorMessage(
-                        consumer,
-                        uid,
-                        "GLOBAL_PHASE1_RESULT",
-                        "resultId",
-                        resultId,
-                        EXPECTED_WORKERS,
-                        TIMEOUT_MS
-                );
+                JsonNode globalPhaseOneResult = null;
 
-                finalGlobalPhaseOneResult = globalPhaseOneResult;
-                finalPhaseOneAlias = phaseOneAlias;
-                finalPhaseOneEdgeId = expectedEdgeId;
+                if (WAIT_FOR_FULL_GLOBAL_RESULTS) {
+                    System.out.println("Waiting for GLOBAL_PHASE1_RESULT for alias " + phaseOneAlias + "...");
+                    globalPhaseOneResult = waitForCoordinatorMessage(
+                            consumer,
+                            uid,
+                            "GLOBAL_PHASE1_RESULT",
+                            "resultId",
+                            resultId,
+                            EXPECTED_WORKERS,
+                            TIMEOUT_MS
+                    );
 
-                validateGlobalPhaseOneResult(globalPhaseOneResult, expectedEdgeId, EXPECTED_WORKERS);
-                validateActiveAlias(globalPhaseOneResult, phaseOneAlias);
-                printMatchedPayload("GLOBAL_PHASE1_RESULT " + phaseOneAlias, globalPhaseOneResult);
+                    finalGlobalPhaseOneResult = globalPhaseOneResult;
+                    finalPhaseOneAlias = phaseOneAlias;
+                    finalPhaseOneEdgeId = expectedEdgeId;
 
+                    validateGlobalPhaseOneResult(globalPhaseOneResult, expectedEdgeId, EXPECTED_WORKERS);
+                    validateActiveAlias(globalPhaseOneResult, phaseOneAlias);
+                    printMatchedPayload("GLOBAL_PHASE1_RESULT " + phaseOneAlias, globalPhaseOneResult);
+                } else {
+                    System.out.println("Skipping full GLOBAL_PHASE1_RESULT wait for large-scale mode, alias=" + phaseOneAlias);
+                    finalPhaseOneAlias = phaseOneAlias;
+                    finalPhaseOneEdgeId = expectedEdgeId;
+                }
                 System.out.println("Waiting for GLOBAL_PHASE1_RESULT_READY for alias " + phaseOneAlias + "...");
                 JsonNode globalPhaseOneReady = waitForCoordinatorMessage(
                         consumer,
@@ -295,6 +303,12 @@ public final class OnePassSamplerSdeCoordinatorTest {
             }
 
             if (EXPORT_FINAL_PHASE1_INDEX) {
+                if (!WAIT_FOR_FULL_GLOBAL_RESULTS) {
+                    throw new IllegalStateException(
+                            "EXPORT_FINAL_PHASE1_INDEX requires WAIT_FOR_FULL_GLOBAL_RESULTS=true."
+                    );
+                }
+
                 writeFinalPhaseOneIndexForPythonValidator(
                         finalGlobalPhaseOneResult,
                         uid,
@@ -392,37 +406,284 @@ public final class OnePassSamplerSdeCoordinatorTest {
             sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseTwoRequest);
             producer.flush();
 
-            System.out.println("Waiting for GLOBAL_PHASE2_ROOT_SAMPLE...");
+            if (WAIT_FOR_FULL_GLOBAL_RESULTS) {
+                System.out.println("Waiting for GLOBAL_PHASE2_ROOT_SAMPLE...");
 
-            JsonNode globalPhaseTwoRootSample = waitForCoordinatorMessage(
+                JsonNode globalPhaseTwoRootSample = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_PHASE2_ROOT_SAMPLE",
+                        "resultId",
+                        phaseTwoResultId,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validateGlobalPhaseTwoRootSample(
+                        globalPhaseTwoRootSample,
+                        rootAlias,
+                        plan.getSampleSize(),
+                        EXPECTED_WORKERS
+                );
+
+                printMatchedPayload("GLOBAL_PHASE2_ROOT_SAMPLE", globalPhaseTwoRootSample);
+            } else {
+                System.out.println("Skipping full GLOBAL_PHASE2_ROOT_SAMPLE wait for large-scale mode.");
+            }
+
+            System.out.println("Waiting for GLOBAL_PHASE2_ROOT_SAMPLE_READY...");
+            JsonNode phaseTwoReady = waitForCoordinatorMessage(
                     consumer,
                     uid,
-                    "GLOBAL_PHASE2_ROOT_SAMPLE",
+                    "GLOBAL_PHASE2_ROOT_SAMPLE_READY",
                     "resultId",
                     phaseTwoResultId,
                     EXPECTED_WORKERS,
                     TIMEOUT_MS
             );
 
-            validateGlobalPhaseTwoRootSample(
-                    globalPhaseTwoRootSample,
+            validateGlobalPhaseTwoRootSampleReady(
+                    phaseTwoReady,
                     rootAlias,
                     plan.getSampleSize(),
                     EXPECTED_WORKERS
             );
 
-            printMatchedPayload("GLOBAL_PHASE2_ROOT_SAMPLE", globalPhaseTwoRootSample);
+            String phaseTwoStateRef = textField(phaseTwoReady, "stateRef", "");
+
+            System.out.println("Waiting for GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED...");
+            JsonNode phaseTwoInstalled = waitForCoordinatorMessage(
+                    consumer,
+                    uid,
+                    "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED",
+                    "stateRef",
+                    phaseTwoStateRef,
+                    EXPECTED_WORKERS,
+                    TIMEOUT_MS
+            );
+
+            validateGenericInstalled(phaseTwoInstalled, EXPECTED_WORKERS, "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED");
+
+            validateGlobalPhaseTwoInstalled(phaseTwoInstalled, rootAlias, EXPECTED_WORKERS);
+            printMatchedPayload("GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED", phaseTwoInstalled);
 
             System.out.println();
-            System.out.println("SUCCESS: PHASE_2 global root sample produced.");
+            System.out.println("SUCCESS: PHASE_2 global root sample produced and installed.");
             System.out.println("rootAlias=" + rootAlias
                     + ", rootRowsSent=" + rootRowsSent
                     + ", sampleSize=" + plan.getSampleSize()
                     + ", expectedWorkers=" + EXPECTED_WORKERS);
 
+            /*
+             * PHASE 3:
+             *
+             * Replay side aliases in root-to-leaf order, excluding the root alias.
+             * For WQ3 rooted at c this should be: o -> l.
+             *
+             * Each alias is extended in a distributed way:
+             *   START_PHASE_3_ALIAS(alias)
+             *   stream alias tuples
+             *   data barrier
+             *   FINISH_PHASE_3_ALIAS(alias)
+             *   wait GLOBAL_PHASE3_ALIAS_RESULT
+             *   wait GLOBAL_PHASE3_ALIAS_RESULT_READY
+             *   wait PHASE3_ALIAS_SELECTIONS_INSTALLED
+             */
+            int phaseThreePosition = 0;
+
+            for (String phaseThreeAlias : plan.getRootToLeafOrder()) {
+                if (rootAlias.equals(phaseThreeAlias)) {
+                    continue;
+                }
+
+                phaseThreePosition++;
+
+                String phaseThreeResultId = "PHASE3_ALIAS_" + phaseThreeAlias + "_" + uid;
+                String phaseThreeBarrierId = "TPCH_PHASE3_" + phaseThreeAlias + "_" + uid + "_" + System.nanoTime();
+                String expectedPhaseThreeStateRef = uid
+                        + "_PHASE3_ALIAS_"
+                        + phaseThreeResultId
+                        + "_GLOBAL_SELECTIONS";
+
+                System.out.println();
+                System.out.println("=======================================================");
+                System.out.println("PHASE_3 alias " + phaseThreePosition + ": " + phaseThreeAlias);
+                System.out.println("phaseThreeResultId = " + phaseThreeResultId);
+                System.out.println("phaseThreeBarrierId = " + phaseThreeBarrierId);
+                System.out.println("expectedPhaseThreeStateRef = " + expectedPhaseThreeStateRef);
+                System.out.println("=======================================================");
+                System.out.println();
+
+                System.out.println("Sending START_PHASE_3_ALIAS request for alias " + phaseThreeAlias + "...");
+                ObjectNode startPhaseThreeAliasRequest = buildStartPhaseThreeAliasRequest(
+                        baseKey,
+                        streamId,
+                        uid,
+                        phaseThreeAlias,
+                        EXPECTED_WORKERS
+                );
+
+                sendJson(producer, REQUEST_TOPIC, baseKey, startPhaseThreeAliasRequest);
+                producer.flush();
+
+                /*
+                 * START_PHASE_3_ALIAS is a control command. Give it a short moment to
+                 * reach all workers before replaying the alias stream.
+                 */
+                Thread.sleep(1000L);
+
+                System.out.println("Streaming PHASE_3 alias from TPC-H: " + phaseThreeAlias + "...");
+                long phaseThreeRowsSent = streamAlias(
+                        producer,
+                        DATA_TOPIC,
+                        baseKey,
+                        streamId,
+                        catalog,
+                        plan,
+                        phaseThreeAlias,
+                        TEST_ROW_LIMIT,
+                        plan.getRequiredFieldsByAlias()
+                );
+                producer.flush();
+
+                if (phaseThreeRowsSent <= 0L) {
+                    throw new IllegalStateException("No rows were streamed for Phase 3 alias " + phaseThreeAlias);
+                }
+
+                System.out.println("Rows sent for PHASE_3 alias " + phaseThreeAlias + ": " + phaseThreeRowsSent);
+                System.out.println();
+
+                System.out.println("Sending PHASE_3 data barrier for alias " + phaseThreeAlias + "...");
+                ObjectNode phaseThreeBarrierDatapoint = buildDataBarrierDatapoint(
+                        baseKey,
+                        streamId,
+                        uid,
+                        "PHASE3",
+                        phaseThreeAlias,
+                        phaseThreeBarrierId,
+                        EXPECTED_WORKERS
+                );
+
+                sendJson(producer, DATA_TOPIC, baseKey, phaseThreeBarrierDatapoint);
+                producer.flush();
+
+                System.out.println("Waiting for GLOBAL_BARRIER_READY for PHASE_3 alias " + phaseThreeAlias + "...");
+                JsonNode phaseThreeBarrierReady = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_BARRIER_READY",
+                        "barrierId",
+                        phaseThreeBarrierId,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validateNoMissingSynopsisWorkers(phaseThreeBarrierReady);
+                printMatchedPayload("GLOBAL_BARRIER_READY PHASE3 " + phaseThreeAlias, phaseThreeBarrierReady);
+
+                System.out.println("Sending FINISH_PHASE_3_ALIAS request for alias " + phaseThreeAlias + "...");
+                ObjectNode finishPhaseThreeAliasRequest = buildFinishPhaseThreeAliasRequest(
+                        baseKey,
+                        streamId,
+                        uid,
+                        phaseThreeResultId,
+                        phaseThreeAlias,
+                        EXPECTED_WORKERS
+                );
+
+                sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseThreeAliasRequest);
+                producer.flush();
+
+                if (WAIT_FOR_FULL_GLOBAL_RESULTS) {
+                    System.out.println("Waiting for GLOBAL_PHASE3_ALIAS_RESULT for alias " + phaseThreeAlias + "...");
+
+                    JsonNode globalPhaseThreeAliasResult = waitForCoordinatorMessage(
+                            consumer,
+                            uid,
+                            "GLOBAL_PHASE3_ALIAS_RESULT",
+                            "resultId",
+                            phaseThreeResultId,
+                            EXPECTED_WORKERS,
+                            TIMEOUT_MS
+                    );
+
+                    validateGlobalPhaseThreeAliasResult(
+                            globalPhaseThreeAliasResult,
+                            phaseThreeAlias,
+                            plan.getSampleSize(),
+                            EXPECTED_WORKERS
+                    );
+
+                    printMatchedPayload("GLOBAL_PHASE3_ALIAS_RESULT " + phaseThreeAlias, globalPhaseThreeAliasResult);
+                } else {
+                    System.out.println("Skipping full GLOBAL_PHASE3_ALIAS_RESULT wait for large-scale mode, alias="
+                            + phaseThreeAlias);
+                }
+
+                System.out.println("Waiting for GLOBAL_PHASE3_ALIAS_RESULT_READY for alias " + phaseThreeAlias + "...");
+                JsonNode globalPhaseThreeAliasReady = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "GLOBAL_PHASE3_ALIAS_RESULT_READY",
+                        "resultId",
+                        phaseThreeResultId,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validateGlobalPhaseThreeAliasReady(
+                        globalPhaseThreeAliasReady,
+                        expectedPhaseThreeStateRef,
+                        phaseThreeAlias,
+                        EXPECTED_WORKERS
+                );
+                printMatchedPayload("GLOBAL_PHASE3_ALIAS_RESULT_READY " + phaseThreeAlias, globalPhaseThreeAliasReady);
+
+                System.out.println("Waiting for PHASE3_ALIAS_SELECTIONS_INSTALLED for alias " + phaseThreeAlias + "...");
+                JsonNode phaseThreeSelectionsInstalled = waitForCoordinatorMessage(
+                        consumer,
+                        uid,
+                        "PHASE3_ALIAS_SELECTIONS_INSTALLED",
+                        "stateRef",
+                        expectedPhaseThreeStateRef,
+                        EXPECTED_WORKERS,
+                        TIMEOUT_MS
+                );
+
+                validatePhaseThreeAliasSelectionsInstalled(
+                        phaseThreeSelectionsInstalled,
+                        phaseThreeAlias,
+                        EXPECTED_WORKERS
+                );
+                printMatchedPayload("PHASE3_ALIAS_SELECTIONS_INSTALLED " + phaseThreeAlias, phaseThreeSelectionsInstalled);
+
+                System.out.println("Phase 3 alias " + phaseThreeAlias + " completed and installed on all workers.");
+            }
+
+            System.out.println("Sending FINISH_PHASE_3 request...");
+            ObjectNode finishPhaseThreeRequest = buildFinishPhaseThreeRequest(
+                    baseKey,
+                    streamId,
+                    uid,
+                    EXPECTED_WORKERS
+            );
+
+            sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseThreeRequest);
+            producer.flush();
+
+            /*
+             * FINISH_PHASE_3 currently finalizes the lifecycle inside SDEcoFlatMap.
+             * Some SDE versions drop lightweight control ACKs from estimationTopic,
+             * so the distributed validation milestone is the successful installation
+             * of every Phase 3 alias selection above.
+             */
+            Thread.sleep(1000L);
+
             System.out.println();
-            System.out.println("SUCCESS: test passed.");
-            System.out.println("Validated aliases=" + plan.getLeafToRootOrder() + ", expectedWorkers=" + EXPECTED_WORKERS);
+            System.out.println("SUCCESS: SQL/TPC-H multi-worker OnePass* Phase 1 + Phase 2 + Phase 3 test passed.");
+            System.out.println("Validated Phase 1 aliases=" + plan.getLeafToRootOrder());
+            System.out.println("Validated Phase 3 aliases=" + nonRootRootToLeafAliases(plan));
+            System.out.println("expectedWorkers=" + EXPECTED_WORKERS);
 
         } finally {
             try {
@@ -518,6 +779,99 @@ public final class OnePassSamplerSdeCoordinatorTest {
         ObjectNode parameters = MAPPER.createObjectNode();
         parameters.put("onePassCommand", "FINISH_PHASE_2");
         parameters.put("onePassResultId", resultId);
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+
+    private static ObjectNode buildStartPhaseThreeAliasRequest(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String alias,
+            int noOfP) {
+
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_UPDATE);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("START_PHASE_3_ALIAS");
+        param.add(alias);
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassCommand", "START_PHASE_3_ALIAS");
+        parameters.put("onePassAlias", alias);
+        parameters.put("phaseThreeAlias", alias);
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static ObjectNode buildFinishPhaseThreeAliasRequest(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String resultId,
+            String alias,
+            int noOfP) {
+
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_UPDATE);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("FINISH_PHASE_3_ALIAS");
+        param.add(alias);
+        param.add(resultId);
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassCommand", "FINISH_PHASE_3_ALIAS");
+        parameters.put("onePassResultId", resultId);
+        parameters.put("onePassAlias", alias);
+        parameters.put("phaseThreeAlias", alias);
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static ObjectNode buildFinishPhaseThreeRequest(
+            String datasetKey,
+            String streamId,
+            int uid,
+            int noOfP) {
+
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_UPDATE);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("FINISH_PHASE_3");
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+        parameters.put("onePassCommand", "FINISH_PHASE_3");
         request.set("parameters", parameters);
 
         return request;
@@ -999,6 +1353,255 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 + ", sampleInstanceCount=" + sampleInstanceCount);
     }
 
+
+
+    private static void validateGlobalPhaseTwoReady(
+            JsonNode payload,
+            String expectedStateRef,
+            String expectedRootAlias,
+            int expectedSampleSize,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"GLOBAL_PHASE2_ROOT_SAMPLE_READY".equals(type)) {
+            throw new IllegalStateException("Expected GLOBAL_PHASE2_ROOT_SAMPLE_READY, got "
+                    + type + ". Payload: " + payload);
+        }
+
+        String stateRef = textField(payload, "stateRef", "");
+
+        if (!expectedStateRef.equals(stateRef)) {
+            throw new IllegalStateException("Expected Phase 2 stateRef=" + expectedStateRef
+                    + ", got " + stateRef + ". Payload: " + payload);
+        }
+
+        String rootAlias = textField(payload, "rootAlias", "");
+
+        if (!expectedRootAlias.equals(rootAlias)) {
+            throw new IllegalStateException("Expected rootAlias=" + expectedRootAlias
+                    + ", got " + rootAlias + ". Payload: " + payload);
+        }
+
+        int sampleSize = intField(payload, "sampleSize", -1);
+
+        if (sampleSize != expectedSampleSize) {
+            throw new IllegalStateException("Expected Phase 2 ready sampleSize=" + expectedSampleSize
+                    + ", got " + sampleSize + ". Payload: " + payload);
+        }
+
+        int expected = intField(payload, "expectedWorkers", -1);
+
+        if (expected != expectedWorkers) {
+            throw new IllegalStateException("Expected expectedWorkers=" + expectedWorkers
+                    + ", got " + expected + ". Payload: " + payload);
+        }
+    }
+
+    private static void validateGlobalPhaseTwoInstalled(
+            JsonNode payload,
+            String expectedRootAlias,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type)) {
+            throw new IllegalStateException("Expected GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED, got "
+                    + type + ". Payload: " + payload);
+        }
+
+        String rootAlias = textField(payload, "rootAlias", "");
+
+        if (!expectedRootAlias.equals(rootAlias)) {
+            throw new IllegalStateException("Expected rootAlias=" + expectedRootAlias
+                    + ", got " + rootAlias + ". Payload: " + payload);
+        }
+
+        validateInstallWorkers(payload, expectedWorkers);
+    }
+
+    private static void validateGlobalPhaseThreeAliasResult(
+            JsonNode payload,
+            String expectedAlias,
+            int expectedSampleSize,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"GLOBAL_PHASE3_ALIAS_RESULT".equals(type)) {
+            throw new IllegalStateException("Expected GLOBAL_PHASE3_ALIAS_RESULT, got "
+                    + type + ". Payload: " + payload);
+        }
+
+        String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+
+        if (!expectedAlias.equals(alias)) {
+            throw new IllegalStateException("Expected phaseThreeAlias=" + expectedAlias
+                    + ", got " + alias + ". Payload: " + payload);
+        }
+
+        int localResultCount = intField(payload, "localResultCount", -1);
+
+        if (localResultCount != expectedWorkers) {
+            throw new IllegalStateException("Expected localResultCount=" + expectedWorkers
+                    + ", got " + localResultCount + ". Payload: " + payload);
+        }
+
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers == null || !receivedWorkers.isArray() || receivedWorkers.size() != expectedWorkers) {
+            throw new IllegalStateException("Expected receivedWorkers size=" + expectedWorkers
+                    + ", got " + receivedWorkers + ". Payload: " + payload);
+        }
+
+        int selectionCount = intField(payload, "selectionCount", -1);
+
+        if (selectionCount != expectedSampleSize) {
+            throw new IllegalStateException("Expected selectionCount=" + expectedSampleSize
+                    + ", got " + selectionCount + ". Payload: " + payload);
+        }
+
+        JsonNode selections = payload.get("selections");
+
+        if (selections == null || !selections.isArray() || selections.size() != expectedSampleSize) {
+            throw new IllegalStateException("Expected selections size=" + expectedSampleSize
+                    + ", got " + selections + ". Payload: " + payload);
+        }
+
+        int selectedRows = 0;
+
+        for (JsonNode selection : selections) {
+            if (selection != null
+                    && selection.has("hasSelection")
+                    && selection.get("hasSelection").asBoolean(false)) {
+                selectedRows++;
+            }
+        }
+
+        if (selectedRows != expectedSampleSize) {
+            throw new IllegalStateException("Expected every Phase 3 selection to have hasSelection=true. selectedRows="
+                    + selectedRows + ", expected=" + expectedSampleSize + ". Payload: " + payload);
+        }
+
+        long totalCandidatesSeen = longField(payload, "totalCandidatesSeen", -1L);
+        double totalCandidateWeight = doubleField(payload, "totalCandidateWeight", 0.0d);
+
+        if (totalCandidatesSeen <= 0L) {
+            throw new IllegalStateException("Expected totalCandidatesSeen > 0, got "
+                    + totalCandidatesSeen + ". Payload: " + payload);
+        }
+
+        if (totalCandidateWeight <= 0.0d) {
+            throw new IllegalStateException("Expected totalCandidateWeight > 0, got "
+                    + totalCandidateWeight + ". Payload: " + payload);
+        }
+
+        System.out.println("Validated GLOBAL_PHASE3_ALIAS_RESULT: alias=" + alias
+                + ", selectionCount=" + selectionCount
+                + ", totalCandidatesSeen=" + totalCandidatesSeen
+                + ", totalCandidateWeight=" + totalCandidateWeight);
+    }
+
+    private static void validateGlobalPhaseThreeAliasReady(
+            JsonNode payload,
+            String expectedStateRef,
+            String expectedAlias,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"GLOBAL_PHASE3_ALIAS_RESULT_READY".equals(type)) {
+            throw new IllegalStateException("Expected GLOBAL_PHASE3_ALIAS_RESULT_READY, got "
+                    + type + ". Payload: " + payload);
+        }
+
+        String stateRef = textField(payload, "stateRef", "");
+
+        if (!expectedStateRef.equals(stateRef)) {
+            throw new IllegalStateException("Expected Phase 3 stateRef=" + expectedStateRef
+                    + ", got " + stateRef + ". Payload: " + payload);
+        }
+
+        String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+
+        if (!expectedAlias.equals(alias)) {
+            throw new IllegalStateException("Expected phaseThreeAlias=" + expectedAlias
+                    + ", got " + alias + ". Payload: " + payload);
+        }
+
+        int expected = intField(payload, "expectedWorkers", -1);
+
+        if (expected != expectedWorkers) {
+            throw new IllegalStateException("Expected expectedWorkers=" + expectedWorkers
+                    + ", got " + expected + ". Payload: " + payload);
+        }
+    }
+
+    private static void validatePhaseThreeAliasSelectionsInstalled(
+            JsonNode payload,
+            String expectedAlias,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"PHASE3_ALIAS_SELECTIONS_INSTALLED".equals(type)) {
+            throw new IllegalStateException("Expected PHASE3_ALIAS_SELECTIONS_INSTALLED, got "
+                    + type + ". Payload: " + payload);
+        }
+
+        String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+
+        if (!expectedAlias.equals(alias)) {
+            throw new IllegalStateException("Expected phaseThreeAlias=" + expectedAlias
+                    + ", got " + alias + ". Payload: " + payload);
+        }
+
+        validateInstallWorkers(payload, expectedWorkers);
+    }
+
+    private static void validateInstallWorkers(JsonNode payload, int expectedWorkers) {
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers == null || !receivedWorkers.isArray() || receivedWorkers.size() != expectedWorkers) {
+            throw new IllegalStateException("Expected receivedWorkers size=" + expectedWorkers
+                    + ", got " + receivedWorkers + ". Payload: " + payload);
+        }
+
+        JsonNode failedWorkers = payload.get("failedWorkers");
+
+        if (failedWorkers != null && failedWorkers.isArray() && failedWorkers.size() > 0) {
+            throw new IllegalStateException("Expected failedWorkers to be empty, got: " + failedWorkers
+                    + ". Payload: " + payload);
+        }
+
+        int installedWorkerCount = intField(payload, "installedWorkerCount", -1);
+
+        if (installedWorkerCount >= 0 && installedWorkerCount != expectedWorkers) {
+            throw new IllegalStateException("Expected installedWorkerCount=" + expectedWorkers
+                    + ", got " + installedWorkerCount + ". Payload: " + payload);
+        }
+    }
+
+    private static List<String> nonRootRootToLeafAliases(CompiledOnePassPlan plan) {
+        List<String> aliases = new java.util.ArrayList<String>();
+
+        if (plan == null) {
+            return aliases;
+        }
+
+        String rootAlias = plan.getRootAlias();
+
+        for (String alias : plan.getRootToLeafOrder()) {
+            if (rootAlias != null && rootAlias.equals(alias)) {
+                continue;
+            }
+
+            aliases.add(alias);
+        }
+
+        return aliases;
+    }
+
     private static JsonNode waitForCoordinatorMessage(
             KafkaConsumer<String, String> consumer,
             int uid,
@@ -1190,7 +1793,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
         props.put("retries", "3");
         props.put("batch.size", "16384");
         props.put("linger.ms", "1");
-        props.put("buffer.memory", "33554432");
+        props.put("buffer.memory", "268435456");
+        props.put("max.request.size", "104857600");
+        props.put("delivery.timeout.ms", "900000");
+        props.put("request.timeout.ms", "300000");
         props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
         props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
 
@@ -1205,6 +1811,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
         props.put("enable.auto.commit", "true");
         props.put("auto.commit.interval.ms", "1000");
         props.put("session.timeout.ms", "30000");
+        props.put("request.timeout.ms", "300000");
+        props.put("fetch.max.bytes", "104857600");
+        props.put("max.partition.fetch.bytes", "104857600");
         props.put("auto.offset.reset", "latest");
         props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
@@ -1328,5 +1937,87 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println("finalAlias=" + finalAlias);
         System.out.println("finalEdgeId=" + finalEdgeId);
         System.out.println();
+    }
+
+    private static void validateGlobalPhaseTwoRootSampleReady(
+            JsonNode payload,
+            String expectedRootAlias,
+            int expectedSampleSize,
+            int expectedWorkers) {
+
+        String type = textField(payload, "type", "");
+
+        if (!"GLOBAL_PHASE2_ROOT_SAMPLE_READY".equals(type)) {
+            throw new IllegalStateException("Expected GLOBAL_PHASE2_ROOT_SAMPLE_READY, got " + type
+                    + ". Payload: " + payload);
+        }
+
+        String rootAlias = textField(payload, "rootAlias", "");
+
+        if (!expectedRootAlias.equals(rootAlias)) {
+            throw new IllegalStateException("Expected rootAlias=" + expectedRootAlias
+                    + ", got " + rootAlias + ". Payload: " + payload);
+        }
+
+        int expected = intField(payload, "expectedWorkers", -1);
+
+        if (expected != expectedWorkers) {
+            throw new IllegalStateException("Expected expectedWorkers=" + expectedWorkers
+                    + ", got " + expected + ". Payload: " + payload);
+        }
+
+        int sampleSize = intField(payload, "sampleSize", -1);
+        int sampleInstanceCount = intField(payload, "sampleInstanceCount", -1);
+
+        if (sampleSize != expectedSampleSize) {
+            throw new IllegalStateException("Expected sampleSize=" + expectedSampleSize
+                    + ", got " + sampleSize + ". Payload: " + payload);
+        }
+
+        if (sampleInstanceCount != expectedSampleSize) {
+            throw new IllegalStateException("Expected sampleInstanceCount=" + expectedSampleSize
+                    + ", got " + sampleInstanceCount + ". Payload: " + payload);
+        }
+
+        if (longField(payload, "rootTuplesSeen", 0L) <= 0L) {
+            throw new IllegalStateException("Expected rootTuplesSeen > 0. Payload: " + payload);
+        }
+
+        if (longField(payload, "positiveRootCandidatesSeen", 0L) <= 0L) {
+            throw new IllegalStateException("Expected positiveRootCandidatesSeen > 0. Payload: " + payload);
+        }
+
+        if (doubleField(payload, "totalRootGroupWeight", 0.0d) <= 0.0d) {
+            throw new IllegalStateException("Expected totalRootGroupWeight > 0. Payload: " + payload);
+        }
+    }
+
+    private static void validateGenericInstalled(JsonNode payload, int expectedWorkers, String expectedType) {
+        String type = textField(payload, "type", "");
+
+        if (!expectedType.equals(type)) {
+            throw new IllegalStateException("Expected type=" + expectedType
+                    + ", got " + type + ". Payload: " + payload);
+        }
+
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers == null || !receivedWorkers.isArray() || receivedWorkers.size() != expectedWorkers) {
+            throw new IllegalStateException("Expected receivedWorkers size=" + expectedWorkers
+                    + ", got " + receivedWorkers + ". Payload: " + payload);
+        }
+
+        JsonNode failedWorkers = payload.get("failedWorkers");
+
+        if (failedWorkers != null && failedWorkers.isArray() && failedWorkers.size() > 0) {
+            throw new IllegalStateException("Expected failedWorkers to be empty, got: " + failedWorkers);
+        }
+
+        int installedWorkerCount = intField(payload, "installedWorkerCount", -1);
+
+        if (installedWorkerCount != expectedWorkers) {
+            throw new IllegalStateException("Expected installedWorkerCount=" + expectedWorkers
+                    + ", got " + installedWorkerCount + ". Payload: " + payload);
+        }
     }
 }

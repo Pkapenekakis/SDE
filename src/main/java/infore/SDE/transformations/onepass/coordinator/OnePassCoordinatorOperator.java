@@ -44,6 +44,11 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
     private static final int ONEPASS_INSTALL_ROOT_SAMPLE_ACK_REQUEST_ID = 85;
     private static final int ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED_REQUEST_ID = 86;
 
+    private static final int ONEPASS_GLOBAL_PHASE3_ALIAS_RESULT_REQUEST_ID = 93;
+    private static final int ONEPASS_GLOBAL_PHASE3_ALIAS_RESULT_READY_REQUEST_ID = 94;
+    private static final int ONEPASS_INSTALL_PHASE3_ALIAS_SELECTIONS_ACK_REQUEST_ID = 95;
+    private static final int ONEPASS_PHASE3_ALIAS_SELECTIONS_INSTALLED_REQUEST_ID = 96;
+
 
     private static final int ONEPASS_SYNOPSIS_ID = 30;
 
@@ -63,6 +68,12 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
     private static final String TYPE_INSTALL_ROOT_SAMPLE = "INSTALL_ROOT_SAMPLE";
     private static final String TYPE_INSTALL_ROOT_SAMPLE_ACK = "INSTALL_ROOT_SAMPLE_ACK";
     private static final String TYPE_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED = "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED";
+
+    private static final String TYPE_GLOBAL_PHASE3_ALIAS_RESULT = "GLOBAL_PHASE3_ALIAS_RESULT";
+    private static final String TYPE_GLOBAL_PHASE3_ALIAS_RESULT_READY = "GLOBAL_PHASE3_ALIAS_RESULT_READY";
+    private static final String TYPE_INSTALL_PHASE3_ALIAS_SELECTIONS = "INSTALL_PHASE3_ALIAS_SELECTIONS";
+    private static final String TYPE_INSTALL_PHASE3_ALIAS_SELECTIONS_ACK = "INSTALL_PHASE3_ALIAS_SELECTIONS_ACK";
+    private static final String TYPE_PHASE3_ALIAS_SELECTIONS_INSTALLED = "PHASE3_ALIAS_SELECTIONS_INSTALLED";
 
     private final Map<BarrierKey, BarrierAccumulator> barriers = new HashMap<BarrierKey, BarrierAccumulator>();
     private final Map<ResultKey, ResultAccumulator> phaseOneResults = new HashMap<ResultKey, ResultAccumulator>();
@@ -103,8 +114,10 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
             return;
         }
 
-        if (input.getRequestID() == ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID && TYPE_GLOBAL_PHASE1_RESULT.equals(type)) {
+        if (input.getRequestID() == ONEPASS_GLOBAL_PHASE1_RESULT_REQUEST_ID
+                && TYPE_GLOBAL_PHASE1_RESULT.equals(type)) {
             handleGlobalPhaseOneResult(input, payload, out);
+            return;
         }
 
         if (input.getRequestID() == ONEPASS_INSTALL_GLOBAL_INDEX_ACK_REQUEST_ID
@@ -112,6 +125,7 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
             handleInstallGlobalIndexAck(input, payload, out);
             return;
         }
+
         if (input.getRequestID() == ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_REQUEST_ID
                 && TYPE_GLOBAL_PHASE2_ROOT_SAMPLE.equals(type)) {
             handleGlobalPhaseTwoRootSample(input, payload, out);
@@ -121,6 +135,18 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         if (input.getRequestID() == ONEPASS_INSTALL_ROOT_SAMPLE_ACK_REQUEST_ID
                 && TYPE_INSTALL_ROOT_SAMPLE_ACK.equals(type)) {
             handleInstallRootSampleAck(input, payload, out);
+            return;
+        }
+
+        if (input.getRequestID() == ONEPASS_GLOBAL_PHASE3_ALIAS_RESULT_REQUEST_ID
+                && TYPE_GLOBAL_PHASE3_ALIAS_RESULT.equals(type)) {
+            handleGlobalPhaseThreeAliasResult(input, payload, out);
+            return;
+        }
+
+        if (input.getRequestID() == ONEPASS_INSTALL_PHASE3_ALIAS_SELECTIONS_ACK_REQUEST_ID
+                && TYPE_INSTALL_PHASE3_ALIAS_SELECTIONS_ACK.equals(type)) {
+            handleInstallPhaseThreeAliasSelectionsAck(input, payload, out);
             return;
         }
     }
@@ -242,8 +268,8 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         String json = MAPPER.writeValueAsString(payload);
 
         String[] param = new String[] {TYPE_GLOBAL_PHASE1_RESULT_READY, acc.resultId, acc.phase, "",
-                        Integer.toString(acc.receivedWorkers.size()), Integer.toString(acc.expectedWorkers)
-                };
+                Integer.toString(acc.receivedWorkers.size()), Integer.toString(acc.expectedWorkers)
+        };
 
         String estimationKey = acc.uid + "_" + acc.resultId + "_GLOBAL_PHASE1_READY";
 
@@ -356,7 +382,7 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         };
 
         String estimationKey = acc.uid + "_" + acc.phase + "_" + normalizeAlias(acc.alias)
-                        + "_" + acc.barrierId + "_GLOBAL_READY";
+                + "_" + acc.barrierId + "_GLOBAL_READY";
 
         return new Estimation(
                 acc.uid,
@@ -567,7 +593,7 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
         private final Map<Integer, String> localPhaseOneResultsByWorker = new LinkedHashMap<Integer, String>();
 
         private ResultAccumulator(int uid, String phase, String resultId, int expectedWorkers,
-                int actualParallelism, String datasetKey, String queryName, String rootAlias) {
+                                  int actualParallelism, String datasetKey, String queryName, String rootAlias) {
 
             this.uid = uid;
             this.phase = phase;
@@ -990,6 +1016,267 @@ public final class OnePassCoordinatorOperator extends RichFlatMapFunction<Estima
 
             installAccumulators.remove(key);
             completedInstalls.add(key);
+        }
+    }
+
+
+    private void handleGlobalPhaseThreeAliasResult(
+            Estimation input,
+            JsonNode payload,
+            Collector<Estimation> out) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String resultId = textField(payload, "resultId", "PHASE3_ALIAS_RESULT_" + uid);
+
+        String alias = textField(payload, "phaseThreeAlias", "");
+
+        if (alias == null || alias.trim().isEmpty()) {
+            alias = textField(payload, "alias", "");
+        }
+
+        String stateRef = textField(
+                payload,
+                "stateRef",
+                uid + "_PHASE3_ALIAS_" + resultId + "_GLOBAL_SELECTIONS"
+        );
+
+        String baseKey = textField(payload, "baseKey", "");
+
+        if (baseKey == null || baseKey.trim().isEmpty()) {
+            baseKey = input.getKey();
+        }
+
+        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
+
+        if (expectedWorkers <= 0) {
+            expectedWorkers = input.getNoOfP() > 0 ? input.getNoOfP() : 1;
+        }
+
+        int localResultCount = intField(payload, "localResultCount", expectedWorkers);
+        int selectionCount = intField(payload, "selectionCount", 0);
+        long totalCandidatesSeen = longField(payload, "totalCandidatesSeen", 0L);
+        double totalCandidateWeight = doubleField(payload, "totalCandidateWeight", 0.0d);
+
+        Map<String, Object> readyPayload = new LinkedHashMap<String, Object>();
+
+        readyPayload.put("type", TYPE_GLOBAL_PHASE3_ALIAS_RESULT_READY);
+        readyPayload.put("uid", uid);
+        readyPayload.put("phase", "PHASE3");
+        readyPayload.put("resultId", resultId);
+        readyPayload.put("phaseThreeAlias", alias);
+        readyPayload.put("alias", alias);
+        readyPayload.put("stateRef", stateRef);
+        readyPayload.put("baseKey", baseKey);
+        readyPayload.put("expectedWorkers", expectedWorkers);
+        readyPayload.put("localResultCount", localResultCount);
+        readyPayload.put("selectionCount", selectionCount);
+        readyPayload.put("totalCandidatesSeen", totalCandidatesSeen);
+        readyPayload.put("totalCandidateWeight", totalCandidateWeight);
+
+        JsonNode receivedWorkers = payload.get("receivedWorkers");
+
+        if (receivedWorkers != null && !receivedWorkers.isNull()) {
+            readyPayload.put("receivedWorkers", MAPPER.convertValue(receivedWorkers, Object.class));
+        }
+
+        String readyJson = MAPPER.writeValueAsString(readyPayload);
+        String readyKey = uid + "_PHASE3_ALIAS_" + resultId + "_READY";
+
+        out.collect(new Estimation(
+                uid,
+                readyKey,
+                ONEPASS_GLOBAL_PHASE3_ALIAS_RESULT_READY_REQUEST_ID,
+                ONEPASS_SYNOPSIS_ID,
+                readyKey,
+                readyJson,
+                new String[] {
+                        TYPE_GLOBAL_PHASE3_ALIAS_RESULT_READY,
+                        resultId,
+                        alias,
+                        stateRef,
+                        Integer.toString(expectedWorkers)
+                },
+                expectedWorkers
+        ));
+
+        out.collect(buildInstallPhaseThreeAliasSelectionsCommand(
+                input,
+                payload,
+                stateRef,
+                alias,
+                expectedWorkers
+        ));
+
+        System.out.println("[OnePassCoordinator] GLOBAL_PHASE3_ALIAS_RESULT_READY emitted: "
+                + "uid=" + uid
+                + ", resultId=" + resultId
+                + ", alias=" + alias
+                + ", stateRef=" + stateRef
+                + ", localResultCount=" + localResultCount
+                + ", expectedWorkers=" + expectedWorkers);
+    }
+
+    private Estimation buildInstallPhaseThreeAliasSelectionsCommand(
+            Estimation input,
+            JsonNode payload,
+            String stateRef,
+            String alias,
+            int expectedWorkers) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String resultId = textField(payload, "resultId", "PHASE3_ALIAS_RESULT_" + uid);
+        String baseKey = textField(payload, "baseKey", "");
+
+        if (baseKey == null || baseKey.trim().isEmpty()) {
+            baseKey = input.getKey();
+        }
+
+        Map<String, Object> commandPayload = new LinkedHashMap<String, Object>();
+
+        commandPayload.put("type", TYPE_INSTALL_PHASE3_ALIAS_SELECTIONS);
+        commandPayload.put("uid", uid);
+        commandPayload.put("phase", "PHASE3");
+        commandPayload.put("resultId", resultId);
+        commandPayload.put("phaseThreeAlias", alias);
+        commandPayload.put("alias", alias);
+        commandPayload.put("stateRef", stateRef);
+        commandPayload.put("baseKey", baseKey);
+        commandPayload.put("expectedWorkers", expectedWorkers);
+
+        String json = MAPPER.writeValueAsString(commandPayload);
+
+        String[] param = new String[] {
+                TYPE_INSTALL_PHASE3_ALIAS_SELECTIONS,
+                stateRef,
+                resultId,
+                alias,
+                "PHASE3",
+                Integer.toString(expectedWorkers)
+        };
+
+        /*
+         * requestID == 7 is serialized as a Request and broadcast/routed by the
+         * normal OnePass command path. Use baseKey here, not a worker-specific key.
+         */
+        return new Estimation(
+                uid,
+                baseKey,
+                7,
+                ONEPASS_SYNOPSIS_ID,
+                baseKey,
+                json,
+                param,
+                expectedWorkers
+        );
+    }
+
+    private void handleInstallPhaseThreeAliasSelectionsAck(
+            Estimation input,
+            JsonNode payload,
+            Collector<Estimation> out) throws Exception {
+
+        int uid = intField(payload, "uid", input.getUID());
+        String stateRef = textField(payload, "stateRef", "");
+        String phase = textField(payload, "phase", "PHASE3");
+
+        String alias = textField(payload, "phaseThreeAlias", "");
+
+        if (alias == null || alias.trim().isEmpty()) {
+            alias = textField(payload, "alias", "");
+        }
+
+        if (alias == null || alias.trim().isEmpty()) {
+            alias = textField(payload, "rootAlias", "");
+        }
+
+        int workerId = intField(payload, "workerId", -1);
+        int expectedWorkers = intField(payload, "expectedWorkers", input.getNoOfP());
+        boolean installed = booleanField(payload, "installed", false);
+        String stateChecksum = textField(payload, "stateChecksum", "");
+
+        if (workerId < 0) {
+            System.out.println("[OnePassCoordinator] Ignoring INSTALL_PHASE3_ALIAS_SELECTIONS_ACK with invalid workerId: "
+                    + payload);
+            return;
+        }
+
+        if (expectedWorkers <= 0) {
+            expectedWorkers = input.getNoOfP() > 0 ? input.getNoOfP() : 1;
+        }
+
+        InstallKey key = new InstallKey(uid, stateRef);
+
+        if (completedInstalls.contains(key)) {
+            System.out.println("[OnePassCoordinator] Ignoring late duplicate Phase3 install ACK: "
+                    + key + ", workerId=" + workerId);
+            return;
+        }
+
+        InstallAccumulator acc = installAccumulators.get(key);
+
+        if (acc == null) {
+            acc = new InstallAccumulator(uid, stateRef, phase, alias, expectedWorkers);
+            installAccumulators.put(key, acc);
+        }
+
+        acc.expectedWorkers = Math.max(acc.expectedWorkers, expectedWorkers);
+        acc.receivedWorkers.add(workerId);
+
+        if (!installed) {
+            acc.failedWorkers.add(workerId);
+        }
+
+        System.out.println("[OnePassCoordinator] INSTALL_PHASE3_ALIAS_SELECTIONS_ACK received: "
+                + key
+                + ", alias=" + alias
+                + ", workerId=" + workerId
+                + ", installed=" + installed
+                + ", checksum=" + stateChecksum
+                + ", received=" + acc.receivedWorkers.size() + "/" + acc.expectedWorkers);
+
+        if (acc.isComplete()) {
+            Map<String, Object> installedPayload = new LinkedHashMap<String, Object>();
+
+            installedPayload.put("type", TYPE_PHASE3_ALIAS_SELECTIONS_INSTALLED);
+            installedPayload.put("uid", acc.uid);
+            installedPayload.put("phase", acc.phase);
+            installedPayload.put("phaseThreeAlias", acc.rootAlias);
+            installedPayload.put("alias", acc.rootAlias);
+            installedPayload.put("stateRef", acc.stateRef);
+            installedPayload.put("expectedWorkers", acc.expectedWorkers);
+            installedPayload.put("receivedWorkers", acc.receivedWorkers);
+            installedPayload.put("failedWorkers", acc.failedWorkers);
+            installedPayload.put("installedWorkerCount", acc.receivedWorkers.size());
+
+            String json = MAPPER.writeValueAsString(installedPayload);
+            String estimationKey = acc.uid + "_PHASE3_ALIAS_SELECTIONS_INSTALLED_" + acc.stateRef;
+
+            out.collect(new Estimation(
+                    acc.uid,
+                    estimationKey,
+                    ONEPASS_PHASE3_ALIAS_SELECTIONS_INSTALLED_REQUEST_ID,
+                    ONEPASS_SYNOPSIS_ID,
+                    estimationKey,
+                    json,
+                    new String[] {
+                            TYPE_PHASE3_ALIAS_SELECTIONS_INSTALLED,
+                            acc.stateRef,
+                            acc.phase,
+                            acc.rootAlias,
+                            Integer.toString(acc.receivedWorkers.size()),
+                            Integer.toString(acc.expectedWorkers)
+                    },
+                    acc.expectedWorkers
+            ));
+
+            installAccumulators.remove(key);
+            completedInstalls.add(key);
+
+            System.out.println("[OnePassCoordinator] PHASE3_ALIAS_SELECTIONS_INSTALLED emitted: "
+                    + key
+                    + ", alias=" + acc.rootAlias
+                    + ", receivedWorkers=" + acc.receivedWorkers
+                    + ", failedWorkers=" + acc.failedWorkers);
         }
     }
 

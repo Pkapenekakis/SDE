@@ -170,6 +170,29 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
             value.setParam(new String[] {"GLOBAL_PHASE2_ROOT_SAMPLE", resultId, "PHASE2", "", "",
                     Integer.toString(value.getNoOfP())});
         }
+
+        if (value.getRequestID() == 92 && param != null && param.length > 0 && "LOCAL_PHASE3_ALIAS_RESULT".equals(param[0])) {
+
+            String resultId = "PHASE3_ALIAS_RESULT_" + value.getUID();
+            String alias = "";
+
+            if (param.length > 1 && param[1] != null && !param[1].trim().isEmpty()) {
+                resultId = param[1].trim();
+            }
+
+            if (param.length > 2 && param[2] != null && !param[2].trim().isEmpty()) {
+                alias = param[2].trim();
+            }
+
+            String globalKey = value.getUID() + "_PHASE3_ALIAS_" + resultId + "_GLOBAL";
+
+            value.setRequestID(93);
+            value.setEstimationkey(globalKey);
+            value.setKey(globalKey);
+
+            value.setParam(new String[] {"GLOBAL_PHASE3_ALIAS_RESULT", resultId, alias, "PHASE3",
+                    Integer.toString(value.getNoOfP())});
+        }
     }
 
 }

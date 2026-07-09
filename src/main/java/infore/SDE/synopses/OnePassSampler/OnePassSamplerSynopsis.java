@@ -1,5 +1,6 @@
 package infore.SDE.synopses.OnePassSampler;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneState;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassWeightEvaluator;
@@ -11,6 +12,7 @@ import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 
 import java.io.Serializable;
+import java.util.Map;
 
 /**
  * One-pass* lifecycle coordinator.
@@ -436,5 +438,33 @@ public final class OnePassSamplerSynopsis implements Serializable {
         this.phase = Phase.PHASE_3;
 
         return this.phaseTwoResult;
+    }
+
+    public Map<String, Object> exportPhaseThreeActiveAliasLocalChoices() {
+        if (phase != Phase.PHASE_3) {
+            throw new IllegalStateException(
+                    "exportPhaseThreeActiveAliasLocalChoices() is only valid during PHASE_3. Current phase: "
+                            + phase);
+        }
+
+        if (phaseThreeState == null) {
+            throw new IllegalStateException("Phase 3 state has not been initialized");
+        }
+
+        return phaseThreeState.exportActiveAliasLocalChoices();
+    }
+
+    public void installGlobalPhaseThreeAliasSelections(String alias, JsonNode selectionsNode) {
+        if (phase != Phase.PHASE_3) {
+            throw new IllegalStateException(
+                    "installGlobalPhaseThreeAliasSelections() is only valid during PHASE_3. Current phase: "
+                            + phase);
+        }
+
+        if (phaseThreeState == null) {
+            throw new IllegalStateException("Phase 3 state has not been initialized");
+        }
+
+        phaseThreeState.installGlobalAliasSelections(alias, selectionsNode);
     }
 }

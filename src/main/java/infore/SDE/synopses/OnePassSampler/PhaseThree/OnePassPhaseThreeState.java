@@ -554,4 +554,119 @@ public final class OnePassPhaseThreeState implements Serializable {
         this.activeChoicesBySampleId = null;
         this.activeSampleIdsByParentKey = null;
     }
+
+    public Map<String, Object> exportActiveAliasLocalChoices() {
+        if (activeAlias == null) {
+            throw new IllegalStateException("No active Phase 3 alias to export.");
+        }
+
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+        List<Map<String, Object>> selections = new ArrayList<Map<String, Object>>();
+
+        long totalCandidatesSeen = 0L;
+        double totalCandidateWeight = 0.0d;
+
+        for (Map.Entry<Long, OnePassExtensionChoice> entry : activeChoicesBySampleId.entrySet()) {
+            Long sampleId = entry.getKey();
+            OnePassExtensionChoice choice = entry.getValue();
+
+            Map<String, Object> row = new LinkedHashMap<String, Object>();
+            row.put("sampleInstanceId", sampleId);
+            row.put("phaseThreeAlias", activeAlias);
+            row.put("alias", activeAlias);
+            row.put("parentEdgeId", activeParentEdge.getEdgeId());
+            row.put("hasSelection", choice.hasSelection());
+            row.put("candidatesSeen", choice.getCandidatesSeen());
+            row.put("cumulativeWeight", choice.getCumulativeWeight());
+            row.put("selectedWeight", choice.getSelectedWeight());
+
+            if (choice.hasSelection()) {
+                row.put("tuple", choice.getSelectedTuple().getRawJson());
+            }
+
+            totalCandidatesSeen += choice.getCandidatesSeen();
+            totalCandidateWeight += choice.getCumulativeWeight();
+
+            selections.add(row);
+        }
+
+        out.put("phaseThreeAlias", activeAlias);
+        out.put("alias", activeAlias);
+        out.put("parentEdgeId", activeParentEdge.getEdgeId());
+        out.put("selectionCount", selections.size());
+        out.put("totalCandidatesSeen", totalCandidatesSeen);
+        out.put("totalCandidateWeight", totalCandidateWeight);
+        out.put("selections", selections);
+
+        return out;
+    }
+
+    public void installGlobalAliasSelections(String alias, JsonNode selectionsNode) {
+        if (alias == null || alias.trim().isEmpty()) {
+            throw new IllegalArgumentException("alias must not be blank");
+        }
+
+        String trimmedAlias = alias.trim();
+
+        if (activeAlias == null) {
+            startAlias(trimmedAlias);
+        }
+
+        if (!trimmedAlias.equals(activeAlias)) {
+            throw new IllegalStateException("Cannot install selections for alias '"
+                    + trimmedAlias + "' while active alias is '" + activeAlias + "'");
+        }
+
+        if (selectionsNode == null || !selectionsNode.isArray()) {
+            throw new IllegalArgumentException("selectionsNode must be an array");
+        }
+
+        Map<Long, Boolean> installedBySampleId = new LinkedHashMap<Long, Boolean>();
+
+        for (JsonNode selection : selectionsNode) {
+            if (selection == null || selection.isNull()) {
+                continue;
+            }
+
+            long sampleId = selection.has("sampleInstanceId")
+                    ? selection.get("sampleInstanceId").asLong(-1L)
+                    : -1L;
+
+            if (sampleId < 0L) {
+                continue;
+            }
+
+            boolean hasSelection = selection.has("hasSelection")
+                    && selection.get("hasSelection").asBoolean(false);
+
+            if (!hasSelection) {
+                continue;
+            }
+
+            JsonNode tupleJson = selection.get("tuple");
+
+            if (tupleJson == null || tupleJson.isNull()) {
+                throw new IllegalStateException("Selection for sample " + sampleId
+                        + " hasSelection=true but missing tuple: " + selection);
+            }
+
+            OnePassPartialSample partial = partialSamplesById.get(sampleId);
+
+            if (partial == null) {
+                throw new IllegalStateException("Missing partial sample " + sampleId);
+            }
+
+            partial.putTuple(trimmedAlias, new OnePassTuple(trimmedAlias, tupleJson));
+            installedBySampleId.put(sampleId, Boolean.TRUE);
+        }
+
+        for (OnePassPartialSample partial : partialSamplesById.values()) {
+            if (!partial.hasAlias(trimmedAlias)) {
+                throw new IllegalStateException("Global Phase 3 selections did not install alias '"
+                        + trimmedAlias + "' for sample " + partial.getSampleInstanceId());
+            }
+        }
+
+        clearActiveAlias();
+    }
 }
