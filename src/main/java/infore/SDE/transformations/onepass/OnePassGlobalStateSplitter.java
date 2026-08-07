@@ -257,17 +257,7 @@ public final class OnePassGlobalStateSplitter extends RichFlatMapFunction<Estima
             sampleInstances = MAPPER.createArrayNode();
         }
 
-        /*
-         * Large-scale mode:
-         *
-         * Do NOT put all sampleInstances into one Kafka message.
-         * With LIMIT 10000, a single root-sample chunk can easily exceed the
-         * Kafka producer max.request.size. Split Phase 2 exactly like Phase 3:
-         * entries == a slice of sampleInstances.
-         *
-         * Also do NOT duplicate globalReservoir in every install chunk. Workers
-         * only need the final explicit sampleInstances to initialize Phase 3.
-         */
+        //Large-scale mode:
         int sampleInstanceCount = sampleInstances.size();
         int chunkCount = Math.max(1, (sampleInstanceCount + maxEntriesPerChunk - 1) / maxEntriesPerChunk);
 

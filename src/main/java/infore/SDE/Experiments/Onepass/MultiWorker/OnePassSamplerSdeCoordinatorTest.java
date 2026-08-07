@@ -31,24 +31,26 @@ import java.io.FileWriter;
 /**
  * Multi-worker OnePass* coordinator test using real query compilation and TPC-H input.
 
- * For WQ3 the expected flow is:
+ * For WQ3 the Phase 1 flow under the new protocol is:
  *
  *   alias l:
  *     stream l
- *     barrier
- *     FINISH_PHASE_1(resultId, alias=l)
- *     merge/install global l<->o
- *     workers stay in PHASE_1
+ *     END_ALIAS(l)
+ *     merge GLOBAL_PHASE1_RESULT
+ *     RequestTopic: BEGIN / CHUNK... / COMMIT
+ *     START_NEXT_ALIAS(o, requiredStateRef)
  *
  *   alias o:
  *     stream o
- *     workers use installed global l<->o
- *     barrier
- *     FINISH_PHASE_1(resultId, alias=o)
- *     merge/install global c<->o
- *     workers move to PHASE_2
+ *     END_ALIAS(o)
+ *     merge GLOBAL_PHASE1_RESULT
+ *     RequestTopic: BEGIN / CHUNK... / COMMIT
+ *     START_PHASE_2(c, requiredStateRef)
  *
- * This test stops after the complete Phase 1 index is installed.
+ * Phase 1 no longer waits for DATA_BARRIER_ACK / INSTALL_GLOBAL_INDEX_ACK.
+ *
+ * Phase 2 and Phase 3 remain on the legacy barrier/install-ACK protocol in
+ * this mixed-mode integration test.
  */
 public final class OnePassSamplerSdeCoordinatorTest {
 
@@ -76,7 +78,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * Use -1 for the whole file.
      * Keep this modest while debugging.
      */
-    private static final long TEST_ROW_LIMIT = 1000000L;
+    private static final long TEST_ROW_LIMIT = 10000L;
 
     private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
 
@@ -101,7 +103,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
         int uid = Math.abs(UUID.randomUUID().toString().hashCode());
 
         String streamId = "onepass-coordinator-tpch-test";
-        String phase = "PHASE1";
         String baseKey = "onepass-phase1-" + uid;
 
         System.out.println("=== OnePassSamplerSdeCoordinatorTest: SQL/TPC-H multi-alias Phase 1 ===");
@@ -131,12 +132,25 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println();
 
         KafkaProducer<String, String> producer = createProducer();
-        KafkaConsumer<String, String> consumer = createConsumer("onepass-coordinator-tpch-test-" + uid);
+        KafkaConsumer<String, String> consumer =
+                createConsumer("onepass-coordinator-tpch-test-" + uid);
+
+        /*
+         * Separate consumer group used only by this integration test to observe
+         * the Phase 1 feedback messages written to RequestTopic.
+         *
+         * It does not consume records away from the running SDE job because
+         * Kafka consumer groups are independent.
+         */
+        KafkaConsumer<String, String> feedbackConsumer =
+                createConsumer("onepass-phase1-feedback-test-" + uid);
 
         consumer.subscribe(Collections.singletonList(ESTIMATION_TOPIC));
+        feedbackConsumer.subscribe(Collections.singletonList(REQUEST_TOPIC));
 
         try {
             drainConsumer(consumer);
+            drainConsumer(feedbackConsumer);
 
             System.out.println("1. Sending ADD OnePass request with SQL and noOfP=" + EXPECTED_WORKERS + "...");
             ObjectNode addRequest = buildOnePassAddRequest(baseKey, streamId, uid, EXPECTED_WORKERS);
@@ -153,9 +167,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
             int aliasPosition = 0;
 
-            JsonNode finalGlobalPhaseOneResult = null;
             String finalPhaseOneAlias = "";
             String finalPhaseOneEdgeId = "";
+            PhaseOneFeedbackTrace finalPhaseOneFeedback = null;
 
             for (String phaseOneAlias : plan.getLeafToRootOrder()) {
                 aliasPosition++;
@@ -164,25 +178,56 @@ public final class OnePassSamplerSdeCoordinatorTest {
                         plan.getParentEdge(phaseOneAlias);
 
                 if (parentEdge == null) {
-                    throw new IllegalStateException("Phase 1 alias has no parent edge: " + phaseOneAlias);
+                    throw new IllegalStateException(
+                            "Phase 1 alias has no parent edge: " + phaseOneAlias
+                    );
                 }
 
                 String expectedEdgeId = parentEdge.getEdgeId();
                 String resultId = "PHASE1_" + phaseOneAlias + "_" + uid;
-                String barrierId = "TPCH_PHASE1_" + phaseOneAlias + "_" + uid + "_" + System.nanoTime();
                 String expectedStateRef = uid + "_PHASE1_" + resultId + "_GLOBAL_STATE";
+
+                boolean lastPhaseOneAlias =
+                        aliasPosition == plan.getLeafToRootOrder().size();
+
+                String nextCommand;
+                String nextAlias;
+
+                if (lastPhaseOneAlias) {
+                    nextCommand = "START_PHASE_2";
+                    nextAlias = plan.getRootAlias();
+                } else {
+                    nextCommand = "START_NEXT_ALIAS";
+
+                    /*
+                     * aliasPosition is 1-based here.
+                     * For WQ3, position 1 is l, so index 1 is o.
+                     */
+                    nextAlias = plan.getLeafToRootOrder().get(aliasPosition);
+                }
 
                 System.out.println();
                 System.out.println("=======================================================");
-                System.out.println("PHASE_1 alias " + aliasPosition + "/" + plan.getLeafToRootOrder().size()
-                        + ": " + phaseOneAlias);
+                System.out.println("PHASE_1 alias "
+                        + aliasPosition
+                        + "/"
+                        + plan.getLeafToRootOrder().size()
+                        + ": "
+                        + phaseOneAlias);
                 System.out.println("expectedEdgeId = " + expectedEdgeId);
                 System.out.println("resultId = " + resultId);
                 System.out.println("expectedStateRef = " + expectedStateRef);
+                System.out.println("nextCommand = " + nextCommand);
+                System.out.println("nextAlias = " + nextAlias);
                 System.out.println("=======================================================");
                 System.out.println();
 
-                System.out.println("Streaming PHASE_1 alias from TPC-H: " + phaseOneAlias + "...");
+                System.out.println(
+                        "Streaming PHASE_1 alias from TPC-H: "
+                                + phaseOneAlias
+                                + "..."
+                );
+
                 long rowsSent = streamAlias(
                         producer,
                         DATA_TOPIC,
@@ -194,123 +239,133 @@ public final class OnePassSamplerSdeCoordinatorTest {
                         TEST_ROW_LIMIT,
                         plan.getRequiredFieldsByAlias()
                 );
+
                 producer.flush();
 
                 if (rowsSent <= 0L) {
-                    throw new IllegalStateException("No rows were streamed for alias " + phaseOneAlias);
-                }
-
-                System.out.println("Rows sent for alias " + phaseOneAlias + ": " + rowsSent);
-                System.out.println();
-
-                System.out.println("Sending Phase 1 data barrier for alias " + phaseOneAlias + "...");
-                ObjectNode barrierDatapoint = buildDataBarrierDatapoint(
-                        baseKey,
-                        streamId,
-                        uid,
-                        phase,
-                        phaseOneAlias,
-                        barrierId,
-                        EXPECTED_WORKERS
-                );
-
-                sendJson(producer, DATA_TOPIC, baseKey, barrierDatapoint);
-                producer.flush();
-
-                System.out.println("Waiting for GLOBAL_BARRIER_READY for alias " + phaseOneAlias + "...");
-                JsonNode barrierReady = waitForCoordinatorMessage(
-                        consumer,
-                        uid,
-                        "GLOBAL_BARRIER_READY",
-                        "barrierId",
-                        barrierId,
-                        EXPECTED_WORKERS,
-                        TIMEOUT_MS
-                );
-
-                validateNoMissingSynopsisWorkers(barrierReady);
-                printMatchedPayload("GLOBAL_BARRIER_READY " + phaseOneAlias, barrierReady);
-
-                System.out.println("Sending FINISH_PHASE_1 request for alias " + phaseOneAlias + "...");
-                ObjectNode finishPhaseOneRequest = buildFinishPhaseOneRequest(
-                        baseKey,
-                        streamId,
-                        uid,
-                        resultId,
-                        phaseOneAlias,
-                        EXPECTED_WORKERS
-                );
-
-                sendJson(producer, REQUEST_TOPIC, baseKey, finishPhaseOneRequest);
-                producer.flush();
-
-                JsonNode globalPhaseOneResult = null;
-
-                if (WAIT_FOR_FULL_GLOBAL_RESULTS) {
-                    System.out.println("Waiting for GLOBAL_PHASE1_RESULT for alias " + phaseOneAlias + "...");
-                    globalPhaseOneResult = waitForCoordinatorMessage(
-                            consumer,
-                            uid,
-                            "GLOBAL_PHASE1_RESULT",
-                            "resultId",
-                            resultId,
-                            EXPECTED_WORKERS,
-                            TIMEOUT_MS
+                    throw new IllegalStateException(
+                            "No rows were streamed for alias "
+                                    + phaseOneAlias
                     );
-
-                    finalGlobalPhaseOneResult = globalPhaseOneResult;
-                    finalPhaseOneAlias = phaseOneAlias;
-                    finalPhaseOneEdgeId = expectedEdgeId;
-
-                    validateGlobalPhaseOneResult(globalPhaseOneResult, expectedEdgeId, EXPECTED_WORKERS);
-                    validateActiveAlias(globalPhaseOneResult, phaseOneAlias);
-                    printMatchedPayload("GLOBAL_PHASE1_RESULT " + phaseOneAlias, globalPhaseOneResult);
-                } else {
-                    System.out.println("Skipping full GLOBAL_PHASE1_RESULT wait for large-scale mode, alias=" + phaseOneAlias);
-                    finalPhaseOneAlias = phaseOneAlias;
-                    finalPhaseOneEdgeId = expectedEdgeId;
                 }
-                System.out.println("Waiting for GLOBAL_PHASE1_RESULT_READY for alias " + phaseOneAlias + "...");
-                JsonNode globalPhaseOneReady = waitForCoordinatorMessage(
-                        consumer,
-                        uid,
-                        "GLOBAL_PHASE1_RESULT_READY",
-                        "resultId",
-                        resultId,
-                        EXPECTED_WORKERS,
-                        TIMEOUT_MS
+
+                System.out.println(
+                        "Rows sent for alias "
+                                + phaseOneAlias
+                                + ": "
+                                + rowsSent
                 );
 
-                validateGlobalPhaseOneReady(globalPhaseOneReady, expectedStateRef, EXPECTED_WORKERS);
-                validateActiveAlias(globalPhaseOneReady, phaseOneAlias);
-                printMatchedPayload("GLOBAL_PHASE1_RESULT_READY " + phaseOneAlias, globalPhaseOneReady);
-
-                System.out.println("Waiting for GLOBAL_PHASE1_INDEX_INSTALLED for alias " + phaseOneAlias + "...");
-                JsonNode installed = waitForCoordinatorMessage(
-                        consumer,
-                        uid,
-                        "GLOBAL_PHASE1_INDEX_INSTALLED",
-                        "stateRef",
-                        expectedStateRef,
-                        EXPECTED_WORKERS,
-                        TIMEOUT_MS
+                /*
+                 * New Phase 1 completion protocol:
+                 *
+                 * END_ALIAS travels on DataTopic and is broadcast by the
+                 * OnePass-aware router to every logical OnePass worker.
+                 *
+                 * Each worker exports LOCAL_PHASE1_RESULT directly.
+                 * No DATA_BARRIER_ACK and no FINISH_PHASE_1 request are used.
+                 */
+                System.out.println(
+                        "Sending END_ALIAS for PHASE_1 alias "
+                                + phaseOneAlias
+                                + "..."
                 );
 
-                validateGlobalPhaseOneIndexInstalled(installed, EXPECTED_WORKERS);
-                printMatchedPayload("GLOBAL_PHASE1_INDEX_INSTALLED " + phaseOneAlias, installed);
+                ObjectNode endAliasDatapoint =
+                        buildEndAliasDatapoint(
+                                baseKey,
+                                streamId,
+                                uid,
+                                phaseOneAlias,
+                                aliasPosition,
+                                resultId,
+                                EXPECTED_WORKERS,
+                                nextCommand,
+                                nextAlias
+                        );
 
-                System.out.println("Alias " + phaseOneAlias + " completed and installed on all workers.");
+                sendJson(
+                        producer,
+                        DATA_TOPIC,
+                        baseKey,
+                        endAliasDatapoint
+                );
+
+                producer.flush();
+
+                /*
+                 * Observe the actual Kafka feedback path:
+                 *
+                 *   GLOBAL_PHASE1_RESULT
+                 *   -> splitter
+                 *   -> BEGIN / CHUNK... / COMMIT
+                 *   -> coordinator
+                 *   -> START_NEXT_ALIAS / START_PHASE_2
+                 *   -> RequestTopic
+                 */
+                System.out.println(
+                        "Waiting for Phase 1 RequestTopic feedback: "
+                                + "BEGIN / CHUNK... / COMMIT / "
+                                + nextCommand
+                                + "..."
+                );
+
+                PhaseOneFeedbackTrace feedback =
+                        waitForPhaseOneFeedbackSequence(
+                                feedbackConsumer,
+                                uid,
+                                resultId,
+                                expectedStateRef,
+                                nextCommand,
+                                nextAlias,
+                                EXPORT_FINAL_PHASE1_INDEX && lastPhaseOneAlias,
+                                TIMEOUT_MS
+                        );
+
+                if (feedback.totalEntryCount <= 0) {
+                    throw new IllegalStateException(
+                            "Expected a non-empty global Phase 1 index for alias "
+                                    + phaseOneAlias
+                                    + ", but totalEntryCount="
+                                    + feedback.totalEntryCount
+                    );
+                }
+
+                System.out.println(
+                        "Phase 1 feedback complete:"
+                                + " alias="
+                                + phaseOneAlias
+                                + ", stateRef="
+                                + feedback.stateRef
+                                + ", chunkCount="
+                                + feedback.chunkCount
+                                + ", totalEntryCount="
+                                + feedback.totalEntryCount
+                                + ", nextCommand="
+                                + feedback.nextCommand
+                                + ", nextAlias="
+                                + feedback.nextAlias
+                );
+
+                finalPhaseOneAlias = phaseOneAlias;
+                finalPhaseOneEdgeId = expectedEdgeId;
+
+                if (lastPhaseOneAlias) {
+                    finalPhaseOneFeedback = feedback;
+                }
             }
 
             if (EXPORT_FINAL_PHASE1_INDEX) {
-                if (!WAIT_FOR_FULL_GLOBAL_RESULTS) {
+
+                if (finalPhaseOneFeedback == null) {
                     throw new IllegalStateException(
-                            "EXPORT_FINAL_PHASE1_INDEX requires WAIT_FOR_FULL_GLOBAL_RESULTS=true."
+                            "Cannot export final Phase 1 index because the final "
+                                    + "Phase 1 feedback trace is null."
                     );
                 }
 
                 writeFinalPhaseOneIndexForPythonValidator(
-                        finalGlobalPhaseOneResult,
+                        finalPhaseOneFeedback,
                         uid,
                         plan.getQueryName(),
                         plan.getRootAlias(),
@@ -339,6 +394,18 @@ public final class OnePassSamplerSdeCoordinatorTest {
             System.out.println("phaseTwoBarrierId = " + phaseTwoBarrierId);
             System.out.println("=======================================================");
             System.out.println();
+
+            /*
+             * Phase 2 is still on the legacy barrier protocol.
+             *
+             * The new Phase 1 transition itself is asynchronous and workers are
+             * protected by requiredStateRef + tuple buffering. The legacy Phase 2
+             * barrier, however, has not yet been converted to the new gate.
+             *
+             * This short grace period is therefore a temporary mixed-mode test
+             * synchronization only. Remove it when Phase 2 is migrated.
+             */
+            Thread.sleep(2000L);
 
             System.out.println("Streaming PHASE_2 root alias from TPC-H: " + rootAlias + "...");
 
@@ -680,7 +747,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
             Thread.sleep(1000L);
 
             System.out.println();
-            System.out.println("SUCCESS: SQL/TPC-H multi-worker OnePass* Phase 1 + Phase 2 + Phase 3 test passed.");
+            System.out.println("SUCCESS: new Phase 1 feedback + legacy Phase 2/3 Kafka/Flink integration test passed.");
             System.out.println("Validated Phase 1 aliases=" + plan.getLeafToRootOrder());
             System.out.println("Validated Phase 3 aliases=" + nonRootRootToLeafAliases(plan));
             System.out.println("expectedWorkers=" + EXPECTED_WORKERS);
@@ -693,6 +760,11 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
             try {
                 consumer.close();
+            } catch (Exception ignored) {
+            }
+
+            try {
+                feedbackConsumer.close();
             } catch (Exception ignored) {
             }
         }
@@ -1602,6 +1674,519 @@ public final class OnePassSamplerSdeCoordinatorTest {
         return aliases;
     }
 
+    /**
+     * RequestTopic trace for one merged Phase 1 state.
+     */
+    private static final class PhaseOneFeedbackTrace {
+
+        private String resultId = "";
+        private String stateRef = "";
+        private int chunkCount = -1;
+        private int totalEntryCount = -1;
+        private String checksum = "";
+        private String nextCommand = "";
+        private String nextAlias = "";
+
+        /*
+         * Populated only when EXPORT_FINAL_PHASE1_INDEX is enabled for the
+         * final Phase 1 alias. This avoids keeping a second full copy of each
+         * intermediate index during normal Kafka/Flink tests.
+         */
+        private JsonNode seenTuplesByAlias;
+        private JsonNode edgeSummaries;
+
+        private final Map<Integer, ArrayNode> capturedChunkEntries =
+                new java.util.HashMap<Integer, ArrayNode>();
+
+        private ObjectNode reconstructedEdgeIndexes;
+    }
+
+    /**
+     * Observes and validates the real Phase 1 Kafka feedback protocol.
+     *
+     * RequestTopic receives one logical copy of:
+     *
+     *   GLOBAL_STATE_BEGIN
+     *   GLOBAL_STATE_CHUNK x N
+     *   GLOBAL_STATE_COMMIT
+     *   START_NEXT_ALIAS / START_PHASE_2
+     *
+     * The test consumer has its own Kafka consumer group, so observing the
+     * records does not interfere with the running SDE RequestTopic consumer.
+     */
+    /**
+     * Observes the Phase 1 feedback protocol on RequestTopic.
+     *
+     * IMPORTANT:
+     * The Kafka/Flink transport is allowed to deliver BEGIN / CHUNK / COMMIT /
+     * transition records to this observer in a different arrival order.
+     * Correctness is based on stateRef + chunkId + chunkCount, not on the
+     * observer seeing BEGIN first.
+     *
+     * This mirrors OnePassPhaseOneWorkerProtocol, which can receive chunks or
+     * the transition before the state is complete and activates the transition
+     * only after requiredStateRef has been installed.
+     */
+    private static PhaseOneFeedbackTrace waitForPhaseOneFeedbackSequence(
+            KafkaConsumer<String, String> consumer,
+            int uid,
+            String expectedResultId,
+            String expectedStateRef,
+            String expectedNextCommand,
+            String expectedNextAlias,
+            boolean captureFullIndex,
+            long timeoutMs) throws Exception {
+
+        long deadline =
+                System.currentTimeMillis()
+                        + timeoutMs;
+
+        PhaseOneFeedbackTrace trace =
+                new PhaseOneFeedbackTrace();
+
+        trace.resultId =
+                expectedResultId;
+
+        boolean beginSeen = false;
+        boolean commitSeen = false;
+        boolean transitionSeen = false;
+
+        Set<Integer> chunksSeen =
+                new java.util.HashSet<Integer>();
+
+        int reconstructedEntryCount = 0;
+        int observedChunkCount = -1;
+        int recordsSeen = 0;
+
+        String commitChecksum = "";
+
+        while (System.currentTimeMillis() < deadline) {
+
+            ConsumerRecords<String, String> records =
+                    consumer.poll(1000);
+
+            for (ConsumerRecord<String, String> record : records) {
+
+                recordsSeen++;
+
+                String value = record.value();
+
+                if (value == null
+                        || value.trim().isEmpty()) {
+                    continue;
+                }
+
+                JsonNode request;
+
+                try {
+                    request = MAPPER.readTree(value);
+                } catch (Exception ignored) {
+                    continue;
+                }
+
+                if (!matchesIntField(request, "uid", uid)) {
+                    continue;
+                }
+
+                if (intField(request, "synopsisID", -1) != SYNOPSIS_ID) {
+                    continue;
+                }
+
+                if (intField(request, "requestID", -1) != REQUEST_UPDATE) {
+                    continue;
+                }
+
+                JsonNode payload = request.get("parameters");
+
+                if (payload == null
+                        || payload.isNull()
+                        || !payload.isObject()) {
+                    continue;
+                }
+
+                String resultId =
+                        textField(payload, "resultId", "");
+
+                if (!expectedResultId.equals(resultId)) {
+                    continue;
+                }
+
+                String stateRef =
+                        textField(payload, "stateRef",
+                                textField(payload, "requiredStateRef", ""));
+
+                if (!expectedStateRef.equals(stateRef)) {
+                    continue;
+                }
+
+                String type =
+                        textField(payload, "type", "");
+
+                if ("GLOBAL_STATE_BEGIN".equals(type)) {
+
+                    if (beginSeen) {
+                        // Identical duplicate delivery is harmless for this E2E observer.
+                        continue;
+                    }
+
+                    trace.stateRef =
+                            textField(payload, "stateRef", "");
+
+                    trace.chunkCount =
+                            intField(payload, "chunkCount", -1);
+
+                    trace.totalEntryCount =
+                            intField(payload, "totalEntryCount", -1);
+
+                    trace.checksum =
+                            textField(payload, "checksum", "");
+
+                    if (trace.chunkCount <= 0) {
+                        throw new IllegalStateException(
+                                "BEGIN has invalid chunkCount: " + payload
+                        );
+                    }
+
+                    if (trace.totalEntryCount < 0) {
+                        throw new IllegalStateException(
+                                "BEGIN has invalid totalEntryCount: " + payload
+                        );
+                    }
+
+                    if (trace.checksum.isEmpty()) {
+                        throw new IllegalStateException(
+                                "BEGIN has no checksum: " + payload
+                        );
+                    }
+
+                    if (observedChunkCount > 0
+                            && observedChunkCount != trace.chunkCount) {
+                        throw new IllegalStateException(
+                                "BEGIN chunkCount="
+                                        + trace.chunkCount
+                                        + " conflicts with previously observed chunkCount="
+                                        + observedChunkCount
+                        );
+                    }
+
+                    observedChunkCount = trace.chunkCount;
+                    beginSeen = true;
+
+                    if (captureFullIndex) {
+
+                        JsonNode seenTuplesByAlias =
+                                payload.get(
+                                        "seenTuplesByAlias"
+                                );
+
+                        JsonNode edgeSummaries =
+                                payload.get(
+                                        "edgeSummaries"
+                                );
+
+                        if (seenTuplesByAlias != null
+                                && !seenTuplesByAlias.isNull()) {
+
+                            trace.seenTuplesByAlias =
+                                    seenTuplesByAlias.deepCopy();
+                        }
+
+                        if (edgeSummaries != null
+                                && !edgeSummaries.isNull()) {
+
+                            trace.edgeSummaries =
+                                    edgeSummaries.deepCopy();
+                        }
+                    }
+
+                    System.out.println(
+                            "  Phase1 feedback BEGIN observed: stateRef="
+                                    + trace.stateRef
+                                    + ", chunkCount="
+                                    + trace.chunkCount
+                                    + ", totalEntryCount="
+                                    + trace.totalEntryCount
+                                    + ", chunksAlreadySeen="
+                                    + chunksSeen.size()
+                    );
+                }
+
+                else if ("GLOBAL_STATE_CHUNK".equals(type)) {
+
+                    int chunkId =
+                            intField(payload, "chunkId", -1);
+
+                    int chunkCount =
+                            intField(payload, "chunkCount", -1);
+
+                    if (chunkId < 0
+                            || chunkCount <= 0
+                            || chunkId >= chunkCount) {
+                        throw new IllegalStateException(
+                                "Invalid chunk metadata: " + payload
+                        );
+                    }
+
+                    if (observedChunkCount > 0
+                            && observedChunkCount != chunkCount) {
+                        throw new IllegalStateException(
+                                "Conflicting chunkCount values. previous="
+                                        + observedChunkCount
+                                        + ", current="
+                                        + chunkCount
+                                        + ". Payload="
+                                        + payload
+                        );
+                    }
+
+                    observedChunkCount = chunkCount;
+
+                    if (beginSeen
+                            && trace.chunkCount != chunkCount) {
+                        throw new IllegalStateException(
+                                "Chunk count mismatch. BEGIN="
+                                        + trace.chunkCount
+                                        + ", chunk="
+                                        + chunkCount
+                                        + ". Payload="
+                                        + payload
+                        );
+                    }
+
+                    JsonNode entries = payload.get("entries");
+
+                    if (entries == null
+                            || !entries.isArray()) {
+                        throw new IllegalStateException(
+                                "Chunk has no entries array: " + payload
+                        );
+                    }
+
+                    int entryCount =
+                            intField(payload, "entryCount", -1);
+
+                    if (entryCount != entries.size()) {
+                        throw new IllegalStateException(
+                                "Chunk entryCount mismatch: " + payload
+                        );
+                    }
+
+                    if (chunksSeen.add(chunkId)) {
+                        reconstructedEntryCount += entryCount;
+
+                        if (captureFullIndex) {
+                            trace.capturedChunkEntries.put(
+                                    chunkId,
+                                    (ArrayNode) entries.deepCopy()
+                            );
+                        }
+                    }
+
+                    System.out.println(
+                            "  Phase1 feedback CHUNK observed: "
+                                    + chunkId
+                                    + "/"
+                                    + chunkCount
+                                    + ", beginSeen="
+                                    + beginSeen
+                    );
+                }
+
+                else if ("GLOBAL_STATE_COMMIT".equals(type)) {
+
+                    int commitChunkCount =
+                            intField(payload, "chunkCount", -1);
+
+                    int commitTotalEntryCount =
+                            intField(payload, "totalEntryCount", -1);
+
+                    commitChecksum =
+                            textField(payload, "checksum", "");
+
+                    if (commitChunkCount <= 0
+                            || commitTotalEntryCount < 0
+                            || commitChecksum.isEmpty()) {
+                        throw new IllegalStateException(
+                                "Invalid COMMIT payload: " + payload
+                        );
+                    }
+
+                    if (observedChunkCount > 0
+                            && observedChunkCount != commitChunkCount) {
+                        throw new IllegalStateException(
+                                "COMMIT chunkCount="
+                                        + commitChunkCount
+                                        + " conflicts with observed chunkCount="
+                                        + observedChunkCount
+                        );
+                    }
+
+                    observedChunkCount = commitChunkCount;
+
+                    if (beginSeen) {
+                        if (trace.chunkCount != commitChunkCount) {
+                            throw new IllegalStateException(
+                                    "BEGIN/COMMIT chunkCount mismatch"
+                            );
+                        }
+
+                        if (trace.totalEntryCount != commitTotalEntryCount) {
+                            throw new IllegalStateException(
+                                    "BEGIN/COMMIT totalEntryCount mismatch"
+                            );
+                        }
+
+                        if (!trace.checksum.equals(commitChecksum)) {
+                            throw new IllegalStateException(
+                                    "BEGIN/COMMIT checksum mismatch"
+                            );
+                        }
+                    }
+
+                    String commitNextCommand =
+                            textField(payload, "nextCommand", "");
+
+                    String commitNextAlias =
+                            textField(payload, "nextAlias", "");
+
+                    if (!expectedNextCommand.equals(commitNextCommand)) {
+                        throw new IllegalStateException(
+                                "Expected COMMIT nextCommand="
+                                        + expectedNextCommand
+                                        + ", got "
+                                        + commitNextCommand
+                        );
+                    }
+
+                    if (!expectedNextAlias.equals(commitNextAlias)) {
+                        throw new IllegalStateException(
+                                "Expected COMMIT nextAlias="
+                                        + expectedNextAlias
+                                        + ", got "
+                                        + commitNextAlias
+                        );
+                    }
+
+                    commitSeen = true;
+
+                    System.out.println(
+                            "  Phase1 feedback COMMIT observed: beginSeen="
+                                    + beginSeen
+                                    + ", chunksSeen="
+                                    + chunksSeen.size()
+                                    + "/"
+                                    + commitChunkCount
+                    );
+                }
+
+                else if (expectedNextCommand.equals(type)) {
+
+                    String requiredStateRef =
+                            textField(payload, "requiredStateRef", "");
+
+                    String nextAlias =
+                            textField(payload, "nextAlias", "");
+
+                    if (!expectedStateRef.equals(requiredStateRef)) {
+                        throw new IllegalStateException(
+                                "Expected requiredStateRef="
+                                        + expectedStateRef
+                                        + ", got "
+                                        + requiredStateRef
+                                        + ". Payload="
+                                        + payload
+                        );
+                    }
+
+                    if (!expectedNextAlias.equals(nextAlias)) {
+                        throw new IllegalStateException(
+                                "Expected transition nextAlias="
+                                        + expectedNextAlias
+                                        + ", got "
+                                        + nextAlias
+                                        + ". Payload="
+                                        + payload
+                        );
+                    }
+
+                    trace.nextCommand = type;
+                    trace.nextAlias = nextAlias;
+                    transitionSeen = true;
+
+                    System.out.println(
+                            "  Phase1 feedback transition observed: "
+                                    + type
+                                    + " -> "
+                                    + nextAlias
+                                    + ", commitSeen="
+                                    + commitSeen
+                    );
+                }
+
+                /*
+                 * Do not require arrival order.
+                 * Return only when the complete protocol has been observed.
+                 */
+                if (beginSeen
+                        && commitSeen
+                        && transitionSeen
+                        && trace.chunkCount > 0
+                        && chunksSeen.size() == trace.chunkCount) {
+
+                    if (reconstructedEntryCount
+                            != trace.totalEntryCount) {
+                        throw new IllegalStateException(
+                                "Reconstructed entry count mismatch. expected="
+                                        + trace.totalEntryCount
+                                        + ", actual="
+                                        + reconstructedEntryCount
+                        );
+                    }
+
+                    if (!trace.checksum.equals(commitChecksum)) {
+                        throw new IllegalStateException(
+                                "BEGIN/COMMIT checksum mismatch. begin="
+                                        + trace.checksum
+                                        + ", commit="
+                                        + commitChecksum
+                        );
+                    }
+
+                    if (captureFullIndex) {
+                        trace.reconstructedEdgeIndexes =
+                                reconstructPhaseOneEdgeIndexes(
+                                        trace
+                                );
+                    }
+
+                    return trace;
+                }
+            }
+        }
+
+        throw new IllegalStateException(
+                "Timed out waiting for complete Phase 1 feedback protocol. "
+                        + "uid="
+                        + uid
+                        + ", resultId="
+                        + expectedResultId
+                        + ", stateRef="
+                        + expectedStateRef
+                        + ", beginSeen="
+                        + beginSeen
+                        + ", commitSeen="
+                        + commitSeen
+                        + ", transitionSeen="
+                        + transitionSeen
+                        + ", chunksSeen="
+                        + chunksSeen.size()
+                        + "/"
+                        + (trace.chunkCount > 0 ? trace.chunkCount : observedChunkCount)
+                        + ", recordsSeen="
+                        + recordsSeen
+        );
+    }
+
     private static JsonNode waitForCoordinatorMessage(
             KafkaConsumer<String, String> consumer,
             int uid,
@@ -1840,45 +2425,262 @@ public final class OnePassSamplerSdeCoordinatorTest {
         consumer.poll(500);
     }
 
+    /**
+     * Reconstructs the full Phase 1 edgeIndexes object from the transport
+     * chunks emitted by OnePassPhaseOneRequestSplitter.
+     *
+     * The splitter flattens:
+     *
+     *   edgeId -> joinKey -> globalWeight
+     *
+     * into transport entries:
+     *
+     *   { edgeId, joinKey, globalWeight }
+     *
+     * This method reverses that transport representation for the external
+     * Phase 1 validator.
+     */
+    private static ObjectNode reconstructPhaseOneEdgeIndexes(
+            PhaseOneFeedbackTrace trace) throws Exception {
+
+        if (trace == null) {
+            throw new IllegalArgumentException(
+                    "trace must not be null"
+            );
+        }
+
+        if (trace.chunkCount <= 0) {
+            throw new IllegalStateException(
+                    "Cannot reconstruct Phase 1 index: invalid chunkCount="
+                            + trace.chunkCount
+            );
+        }
+
+        if (trace.capturedChunkEntries.size()
+                != trace.chunkCount) {
+
+            throw new IllegalStateException(
+                    "Cannot reconstruct Phase 1 index. capturedChunks="
+                            + trace.capturedChunkEntries.size()
+                            + "/"
+                            + trace.chunkCount
+            );
+        }
+
+        ObjectNode edgeIndexes =
+                MAPPER.createObjectNode();
+
+        ArrayNode flattenedEntries =
+                MAPPER.createArrayNode();
+
+        int reconstructedEntryCount =
+                0;
+
+        for (int chunkId = 0;
+             chunkId < trace.chunkCount;
+             chunkId++) {
+
+            ArrayNode entries =
+                    trace.capturedChunkEntries
+                            .get(
+                                    chunkId
+                            );
+
+            if (entries == null) {
+                throw new IllegalStateException(
+                        "Missing captured Phase 1 chunk "
+                                + chunkId
+                                + "/"
+                                + trace.chunkCount
+                );
+            }
+
+            for (JsonNode entry : entries) {
+
+                String edgeId =
+                        textField(
+                                entry,
+                                "edgeId",
+                                ""
+                        );
+
+                String joinKey =
+                        textField(
+                                entry,
+                                "joinKey",
+                                ""
+                        );
+
+                JsonNode globalWeightNode =
+                        entry.get(
+                                "globalWeight"
+                        );
+
+                if (edgeId.isEmpty()
+                        || joinKey.isEmpty()
+                        || globalWeightNode == null
+                        || !globalWeightNode.isNumber()) {
+
+                    throw new IllegalStateException(
+                            "Invalid flattened Phase 1 entry: "
+                                    + entry
+                    );
+                }
+
+                ObjectNode edgeIndex;
+
+                JsonNode existingEdge =
+                        edgeIndexes.get(
+                                edgeId
+                        );
+
+                if (existingEdge == null) {
+
+                    edgeIndex =
+                            edgeIndexes.putObject(
+                                    edgeId
+                            );
+
+                } else if (existingEdge.isObject()) {
+
+                    edgeIndex =
+                            (ObjectNode) existingEdge;
+
+                } else {
+
+                    throw new IllegalStateException(
+                            "Invalid reconstructed edge object for edgeId="
+                                    + edgeId
+                    );
+                }
+
+                if (edgeIndex.has(joinKey)) {
+                    throw new IllegalStateException(
+                            "Duplicate Phase 1 index entry for edgeId="
+                                    + edgeId
+                                    + ", joinKey="
+                                    + joinKey
+                    );
+                }
+
+                edgeIndex.set(
+                        joinKey,
+                        globalWeightNode.deepCopy()
+                );
+
+                flattenedEntries.add(
+                        entry.deepCopy()
+                );
+
+                reconstructedEntryCount++;
+            }
+        }
+
+        if (reconstructedEntryCount
+                != trace.totalEntryCount) {
+
+            throw new IllegalStateException(
+                    "Full Phase 1 reconstruction entry-count mismatch. expected="
+                            + trace.totalEntryCount
+                            + ", actual="
+                            + reconstructedEntryCount
+            );
+        }
+
+        /*
+         * Verify that the exact chunk-order reconstruction corresponds to the
+         * state whose checksum was announced in BEGIN/COMMIT.
+         */
+        String reconstructedChecksum =
+                sha256Hex(
+                        flattenedEntries.toString()
+                );
+
+        if (!trace.checksum.equals(
+                reconstructedChecksum
+        )) {
+
+            throw new IllegalStateException(
+                    "Full Phase 1 reconstruction checksum mismatch. expected="
+                            + trace.checksum
+                            + ", actual="
+                            + reconstructedChecksum
+            );
+        }
+
+        return edgeIndexes;
+    }
+
+    private static String sha256Hex(
+            String value) throws Exception {
+
+        java.security.MessageDigest digest =
+                java.security.MessageDigest
+                        .getInstance(
+                                "SHA-256"
+                        );
+
+        byte[] hash =
+                digest.digest(
+                        value.getBytes(
+                                java.nio.charset.StandardCharsets.UTF_8
+                        )
+                );
+
+        StringBuilder out =
+                new StringBuilder(
+                        hash.length * 2
+                );
+
+        for (byte b : hash) {
+            out.append(
+                    String.format(
+                            "%02x",
+                            b & 0xff
+                    )
+            );
+        }
+
+        return out.toString();
+    }
+
+    /**
+     * Writes the final globally merged Phase 1 index in the same top-level
+     * format expected by validate_onepass_catalog_phase1.py.
+     *
+     * Under the new architecture the full GLOBAL_PHASE1_RESULT is no longer
+     * written to estimationTopic. The test therefore reconstructs edgeIndexes
+     * from BEGIN/CHUNK/COMMIT on RequestTopic.
+     */
     private static void writeFinalPhaseOneIndexForPythonValidator(
-            JsonNode globalPhaseOneEnvelope,
+            PhaseOneFeedbackTrace feedback,
             int uid,
             String queryName,
             String rootAlias,
             String finalAlias,
             String finalEdgeId) throws Exception {
 
-        if (globalPhaseOneEnvelope == null || globalPhaseOneEnvelope.isNull()) {
+        if (feedback == null) {
             throw new IllegalStateException(
-                    "Cannot export final Phase 1 index because GLOBAL_PHASE1_RESULT is null."
+                    "Cannot export final Phase 1 index because feedback is null."
             );
         }
 
-        JsonNode globalPhaseOneResult =
-                globalPhaseOneEnvelope.get("globalPhaseOneResult");
+        if (feedback.reconstructedEdgeIndexes == null) {
 
-        if (globalPhaseOneResult == null || globalPhaseOneResult.isNull()) {
             throw new IllegalStateException(
-                    "Cannot export final Phase 1 index. Missing globalPhaseOneResult: "
-                            + globalPhaseOneEnvelope
+                    "Cannot export final Phase 1 index because edgeIndexes "
+                            + "were not captured/reconstructed. Make sure "
+                            + "EXPORT_FINAL_PHASE1_INDEX=true."
             );
         }
 
-        JsonNode edgeIndexes = globalPhaseOneResult.get("edgeIndexes");
+        if (feedback.edgeSummaries == null
+                || !feedback.edgeSummaries.isObject()) {
 
-        if (edgeIndexes == null || !edgeIndexes.isObject()) {
             throw new IllegalStateException(
-                    "Cannot export final Phase 1 index. Missing edgeIndexes: "
-                            + globalPhaseOneResult
-            );
-        }
-
-        JsonNode edgeSummaries = globalPhaseOneResult.get("edgeSummaries");
-
-        if (edgeSummaries == null || !edgeSummaries.isObject()) {
-            throw new IllegalStateException(
-                    "Cannot export final Phase 1 index. Missing edgeSummaries: "
-                            + globalPhaseOneResult
+                    "Cannot export final Phase 1 index because BEGIN did not "
+                            + "contain edgeSummaries."
             );
         }
 
@@ -1886,56 +2688,167 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         /*
          * IMPORTANT:
-         * The Python validator expects edgeIndexes / edgeSummaries at the top level.
-         * Do not nest them under globalPhaseOneResult.
+         * The Python validator expects edgeIndexes / edgeSummaries at the
+         * top level.
          */
-        export.put("type", "ONEPASS_PHASE1_FULL_INDEX_EXPORT");
-        export.put("implementation", "parallel-sde");
-        export.put("uid", uid);
-        export.put("queryName", queryName == null ? "" : queryName);
-        export.put("rootAlias", rootAlias == null ? "" : rootAlias);
-        export.put("finalAlias", finalAlias == null ? "" : finalAlias);
-        export.put("finalEdgeId", finalEdgeId == null ? "" : finalEdgeId);
+        export.put(
+                "type",
+                "ONEPASS_PHASE1_FULL_INDEX_EXPORT"
+        );
 
-        JsonNode resultId = globalPhaseOneEnvelope.get("resultId");
-        JsonNode stateRef = globalPhaseOneEnvelope.get("stateRef");
-        JsonNode seenTuplesByAlias = globalPhaseOneResult.get("seenTuplesByAlias");
+        export.put(
+                "implementation",
+                "parallel-sde"
+        );
 
-        if (resultId != null && !resultId.isNull()) {
-            export.set("resultId", resultId);
+        export.put(
+                "uid",
+                uid
+        );
+
+        export.put(
+                "queryName",
+                queryName == null
+                        ? ""
+                        : queryName
+        );
+
+        export.put(
+                "rootAlias",
+                rootAlias == null
+                        ? ""
+                        : rootAlias
+        );
+
+        export.put(
+                "finalAlias",
+                finalAlias == null
+                        ? ""
+                        : finalAlias
+        );
+
+        export.put(
+                "finalEdgeId",
+                finalEdgeId == null
+                        ? ""
+                        : finalEdgeId
+        );
+
+        export.put(
+                "resultId",
+                feedback.resultId
+        );
+
+        export.put(
+                "stateRef",
+                feedback.stateRef
+        );
+
+        export.put(
+                "chunkCount",
+                feedback.chunkCount
+        );
+
+        export.put(
+                "totalEntryCount",
+                feedback.totalEntryCount
+        );
+
+        export.put(
+                "checksum",
+                feedback.checksum
+        );
+
+        if (feedback.seenTuplesByAlias != null
+                && !feedback.seenTuplesByAlias.isNull()) {
+
+            export.set(
+                    "seenTuplesByAlias",
+                    feedback.seenTuplesByAlias
+                            .deepCopy()
+            );
         }
 
-        if (stateRef != null && !stateRef.isNull()) {
-            export.set("stateRef", stateRef);
-        }
+        export.set(
+                "edgeIndexes",
+                feedback.reconstructedEdgeIndexes
+                        .deepCopy()
+        );
 
-        if (seenTuplesByAlias != null && !seenTuplesByAlias.isNull()) {
-            export.set("seenTuplesByAlias", seenTuplesByAlias);
-        }
+        export.set(
+                "edgeSummaries",
+                feedback.edgeSummaries
+                        .deepCopy()
+        );
 
-        export.set("edgeIndexes", edgeIndexes);
-        export.set("edgeSummaries", edgeSummaries);
+        File outputFile =
+                new File(
+                        PHASE1_INDEX_EXPORT_DIR
+                );
 
-        File outputFile = new File(PHASE1_INDEX_EXPORT_DIR);
-        FileWriter writer = new FileWriter(outputFile);
+        FileWriter writer =
+                new FileWriter(
+                        outputFile
+                );
 
         try {
             writer.write(
                     MAPPER.writerWithDefaultPrettyPrinter()
-                            .writeValueAsString(export)
+                            .writeValueAsString(
+                                    export
+                            )
             );
-            writer.write(System.lineSeparator());
+
+            writer.write(
+                    System.lineSeparator()
+            );
+
         } finally {
             writer.close();
         }
 
         System.out.println();
-        System.out.println("Exported final Phase 1 index for Python validator:");
-        System.out.println(outputFile.getAbsolutePath());
-        System.out.println("queryName=" + queryName);
-        System.out.println("rootAlias=" + rootAlias);
-        System.out.println("finalAlias=" + finalAlias);
-        System.out.println("finalEdgeId=" + finalEdgeId);
+        System.out.println(
+                "Exported final Phase 1 index reconstructed from "
+                        + "RequestTopic feedback:"
+        );
+
+        System.out.println(
+                outputFile.getAbsolutePath()
+        );
+
+        System.out.println(
+                "queryName="
+                        + queryName
+        );
+
+        System.out.println(
+                "rootAlias="
+                        + rootAlias
+        );
+
+        System.out.println(
+                "finalAlias="
+                        + finalAlias
+        );
+
+        System.out.println(
+                "finalEdgeId="
+                        + finalEdgeId
+        );
+
+        System.out.println(
+                "stateRef="
+                        + feedback.stateRef
+        );
+
+        System.out.println(
+                "chunkCount="
+                        + feedback.chunkCount
+                        + ", totalEntryCount="
+                        + feedback.totalEntryCount
+        );
+
         System.out.println();
     }
 
@@ -2019,5 +2932,30 @@ public final class OnePassSamplerSdeCoordinatorTest {
             throw new IllegalStateException("Expected installedWorkerCount=" + expectedWorkers
                     + ", got " + installedWorkerCount + ". Payload: " + payload);
         }
+    }
+
+    private static ObjectNode buildEndAliasDatapoint(String datasetKey, String streamId, int uid, String alias,
+                                                     int epoch, String resultId, int expectedWorkers,
+                                                     String nextCommand, String nextAlias) {
+
+        ObjectNode marker = MAPPER.createObjectNode();
+
+        marker.put("type", "END_ALIAS");
+        marker.put("synopsisID", 30);
+        marker.put("uid", uid);
+        marker.put("phase", "PHASE1");
+        marker.put("alias", alias);
+        marker.put("epoch",epoch);
+        marker.put("resultId", resultId);
+        marker.put("expectedWorkers", expectedWorkers);
+        marker.put("nextCommand", nextCommand);
+        marker.put("nextAlias", nextAlias);
+
+        ObjectNode datapoint = MAPPER.createObjectNode();
+        datapoint.put("dataSetkey", datasetKey);
+        datapoint.put("streamID", streamId);
+        datapoint.set("values", marker);
+
+        return datapoint;
     }
 }

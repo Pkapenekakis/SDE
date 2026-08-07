@@ -2,6 +2,7 @@ package infore.SDE.sources;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import infore.SDE.messages.Request;
+import infore.SDE.transformations.onepass.OnePassFeedbackRequestFactory;
 import lib.WDFT.PAIR;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
@@ -49,12 +50,21 @@ public class kafkaProducerEstimation {
 	@Override
 	public byte[] serializeValue(Estimation element) {
 		//System.out.println("MESSAGE TO WRITE -> " + element.getEstimationkey() +"_"+element.getRequestID());
-		if(element.getRequestID()==7){
-			Request rq = new Request(element);
+		if (element.getRequestID() == 7) {
+			Request request;
+
+			if (element.getSynopsisID() == 30) {
+				//OnePass feedback requires the full JSON state/control payload.
+				request = OnePassFeedbackRequestFactory.fromEstimation(element);
+			} else {
+				request = new Request(element);
+			}
+
 			try {
-				return rq.toKafkaJson();
-			} catch (JsonProcessingException e) {
-				e.printStackTrace();
+				return request.toKafkaJson();
+			} catch (JsonProcessingException exception) {
+				throw new IllegalStateException("Could not serialize Request with requestID=" + element.getRequestID()
+								+ ", synopsisID=" + element.getSynopsisID(), exception);
 			}
 		} else if (element.getSynopsisID()==29) {
 			if(element.getEstimation()!=null) {

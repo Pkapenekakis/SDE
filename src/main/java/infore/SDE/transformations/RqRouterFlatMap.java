@@ -94,7 +94,7 @@ public class RqRouterFlatMap extends RichFlatMapFunction<Request, Request> imple
 		copy.setUID(rq.getUID());
 		copy.setStreamID(rq.getStreamID());
 		copy.setNoOfP(rq.getNoOfP());
-		copy.setParameters(rq.getParameters());
+		copy.setParameters(rq.getParameters() == null ? null : rq.getParameters().deepCopy());
 
 		String[] param = rq.getParam();
 

@@ -56,6 +56,8 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
     private String baseKey = "";
     private String activeAlias = "";
     private String activeEdgeId = "";
+    private String nextCommand = "";
+    private String nextAlias = "";
 
     private int expectedWorkers;
 
@@ -120,6 +122,26 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
                 );
             }
 
+            String payloadNextCommand = textField(payload, "nextCommand", "");
+            String payloadNextAlias = textField(payload, "nextAlias", "");
+
+            if (nextCommand == null || nextCommand.trim().isEmpty()) {
+                nextCommand = payloadNextCommand;
+
+            } else if (payloadNextCommand != null && !payloadNextCommand.trim().isEmpty()
+                    && !nextCommand.equals(payloadNextCommand)) {
+
+                throw new IllegalStateException("Mismatching nextCommand values in same reduce group: " +
+                        nextCommand + " vs " + payloadNextCommand);
+            }
+
+            if (nextAlias == null || nextAlias.trim().isEmpty()) {
+                nextAlias = payloadNextAlias;
+            } else if (payloadNextAlias != null && !payloadNextAlias.trim().isEmpty() && !nextAlias.equals(payloadNextAlias)) {
+                throw new IllegalStateException("Mismatching nextAlias values in same reduce group: " +
+                        nextAlias + " vs " + payloadNextAlias);
+            }
+
             int workerId = intField(payload, "workerId", -1);
             int payloadExpectedWorkers = intField(payload, "expectedWorkers", e.getNoOfP());
 
@@ -182,6 +204,8 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
             payload.put("baseKey", baseKey);
             payload.put("activeAlias", activeAlias == null ? "" : activeAlias);
             payload.put("activeEdgeId", activeEdgeId == null ? "" : activeEdgeId);
+            payload.put("nextCommand", nextCommand == null ? "" : nextCommand);
+            payload.put("nextAlias", nextAlias == null ? "" : nextAlias);
             payload.put("stateRef", uid + "_PHASE1_" + resultId + "_GLOBAL_STATE");
             payload.put("expectedWorkers", expectedWorkers);
             payload.put("receivedWorkers", workers);

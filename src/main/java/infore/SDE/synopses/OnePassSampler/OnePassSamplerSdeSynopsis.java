@@ -722,23 +722,57 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return out;
     }
 
-    public Estimation buildLocalPhaseOneResultEstimation(Request request, int workerId, int expectedWorkers,
-                                                         int actualParallelism, String resultId, String activeAlias) {
+    public Estimation buildLocalPhaseOneResultEstimation(
+            Request request,
+            int workerId,
+            int expectedWorkers,
+            int actualParallelism,
+            String resultId,
+            String activeAlias) {
 
-        OnePassPhaseOneResult phaseOneResult = lifecycle.getPhaseOneResult();
-
-        if (phaseOneResult == null) {
-            throw new IllegalStateException(
-                    "Cannot export LOCAL_PHASE1_RESULT before Phase 1 is complete."
+        if (request == null) {
+            throw new IllegalArgumentException(
+                    "request must not be null"
             );
         }
 
+        return buildLocalPhaseOneResultEstimation(
+                request.getKey(),
+                request.getUID(),
+                workerId,
+                expectedWorkers,
+                actualParallelism,
+                resultId,
+                activeAlias,
+                "",
+                ""
+        );
+    }
+
+    /**
+     * Builds the worker-local Phase 1 merge payload directly from an END_ALIAS
+     * data-path marker.
+     *
+     * This method does NOT advance the OnePass lifecycle.
+     */
+    public Estimation buildLocalPhaseOneResultEstimation(String workerKey, int uid, int workerId, int expectedWorkers,
+                                                         int actualParallelism, String resultId, String activeAlias,
+                                                         String nextCommand, String nextAlias) {
+
+        OnePassPhaseOneResult phaseOneResult = lifecycle.exportLocalPhaseOneResult();
+
+        if (phaseOneResult == null) {
+            throw new IllegalStateException("Cannot export LOCAL_PHASE1_RESULT because local Phase 1 state is null.");
+        }
+
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
-        String workerKey = request.getKey();
-        String baseKey = stripOnePassWorkerSuffix(workerKey, expectedWorkers, workerId);
+
+        String normalizedWorkerKey = workerKey == null ? "" : workerKey.trim();
+
+        String baseKey = stripOnePassWorkerSuffix(normalizedWorkerKey, expectedWorkers, workerId);
 
         payload.put("type", "LOCAL_PHASE1_RESULT");
-        payload.put("uid", request.getUID());
+        payload.put("uid", uid);
         payload.put("workerId", workerId);
         payload.put("expectedWorkers", expectedWorkers);
         payload.put("actualParallelism", actualParallelism);
@@ -746,51 +780,58 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         payload.put("resultId", resultId);
         payload.put("queryName", plan.getQueryName());
         payload.put("rootAlias", plan.getRootAlias());
-        payload.put("workerKey", workerKey);
+        payload.put("workerKey", normalizedWorkerKey);
         payload.put("baseKey", baseKey);
 
+        String normalizedActiveAlias = activeAlias == null ? "" : activeAlias.trim();
         String activeEdgeId = "";
 
-        if (activeAlias != null && !activeAlias.trim().isEmpty() && !plan.isRoot(activeAlias.trim())) {
-            CompiledOnePassPlan.DirectedJoinEdge parentEdge =
-                    plan.getParentEdge(activeAlias.trim());
+        if (!normalizedActiveAlias.isEmpty() && !plan.isRoot(normalizedActiveAlias)) {
+
+            CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(normalizedActiveAlias);
 
             if (parentEdge != null) {
                 activeEdgeId = parentEdge.getEdgeId();
             }
         }
 
-        payload.put("activeAlias", activeAlias == null ? "" : activeAlias.trim());
+        payload.put("activeAlias", normalizedActiveAlias);
         payload.put("activeEdgeId", activeEdgeId);
 
-    /*
-     * Small test Payload
-     * Later will be replaced with a compact merge payload
-     */
+        /*
+         * These fields are carried through the reducer into
+         * GLOBAL_PHASE1_RESULT.
+         *
+         * The Step-3 request splitter will later use them to create the
+         * transition following GLOBAL_STATE_COMMIT.
+         */
+        payload.put("nextCommand", nextCommand == null ? "" : nextCommand.trim());
+
+        payload.put("nextAlias", nextAlias == null ? "" : nextAlias.trim());
+
+        /*
+         * Current merge representation.
+         *
+         * The reducer knows that already-global stable edges must only be
+         * copied once while the active edge is summed across workers.
+         */
         payload.put("phaseOneResult", phaseOneResult.toDebugMap());
 
         String json;
 
         try {
             json = MAPPER.writeValueAsString(payload);
-        } catch (Exception e) {
-            throw new IllegalStateException("Could not serialize LOCAL_PHASE1_RESULT", e);
+        } catch (Exception exception) {
+            throw new IllegalStateException("Could not serialize LOCAL_PHASE1_RESULT", exception);
         }
 
         String[] param = new String[] {"LOCAL_PHASE1_RESULT", resultId, "PHASE1",
-                activeAlias == null ? "" : activeAlias.trim(),
-                Integer.toString(workerId), Integer.toString(expectedWorkers)};
+                        normalizedActiveAlias, Integer.toString(workerId), Integer.toString(expectedWorkers),
+                        nextCommand == null ? "" : nextCommand.trim(), nextAlias == null ? "" : nextAlias.trim()};
 
-        /*
-        String estimationKey = request.getUID() + "_LOCAL_PHASE1_RESULT_" + workerId + "_" + resultId;
+        String reduceKey = uid + "_PHASE1_" + resultId;
 
-        return new Estimation(request.getUID(), estimationKey, 72, 30,
-                request.getKey(), json, param, expectedWorkers); */
-
-        String reduceKey = request.getUID() + "_PHASE1_" + resultId;
-
-        return new Estimation(request.getUID(), reduceKey, 72, 30,
-                reduceKey, json, param, expectedWorkers);
+        return new Estimation(uid, reduceKey, 72, 30, reduceKey, json, param, expectedWorkers);
     }
 
     private static String stripOnePassWorkerSuffix(String workerKey, int expectedWorkers, int workerId) {

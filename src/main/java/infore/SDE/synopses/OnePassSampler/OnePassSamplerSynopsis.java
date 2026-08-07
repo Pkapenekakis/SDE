@@ -467,4 +467,14 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
         phaseThreeState.installGlobalAliasSelections(alias, selectionsNode);
     }
+
+    public OnePassPhaseOneResult exportLocalPhaseOneResult() {
+
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("exportLocalPhaseOneResult() is only valid during PHASE_1. "
+                            + "Current phase: " + phase);
+        }
+
+        return phaseOneState.exportResult();
+    }
 }

@@ -27,6 +27,8 @@ import org.apache.flink.streaming.api.datastream.SplitStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Request;
+import infore.SDE.transformations.onepass.OnePassPhaseOneRequestSplitter;
+import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorFilter;
 
 
 /**
@@ -100,8 +102,8 @@ public class Run {
 						Datapoint dp = objectMapper.readValue(node, Datapoint.class);
 						return dp;
 					}
-			}).name("DATA_SOURCE").keyBy((KeySelector<Datapoint, String>)Datapoint::getKey);
-		
+				}).name("DATA_SOURCE").keyBy((KeySelector<Datapoint, String>)Datapoint::getKey);
+
 		//DataStream<Tuple2<String, String>> dataStream = datastream.flatMap(new IngestionMultiplierFlatMap(multi)).setParallelism(parallelism2).keyBy(0);
 		DataStream<Request> RQ_Stream = RQ_stream
 				.map(new MapFunction<String, Request>() {
@@ -230,17 +232,17 @@ public class Run {
 			@Override
 			public Iterable<String> select(Estimation value) {
 				// TODO Auto-generated method stub
-				 List<String> output = new ArrayList<>();
-				 if (value.getNoOfP() == 1) {
-			            output.add("single");
-			        }
-			        else {
-			            output.add("multy");
-			        }
-			        return output;
+				List<String> output = new ArrayList<>();
+				if (value.getNoOfP() == 1) {
+					output.add("single");
 				}
-			});
-		
+				else {
+					output.add("multy");
+				}
+				return output;
+			}
+		});
+
 		DataStream<Estimation> single = split.select("single");
 		DataStream<Estimation> multy = split.select("multy").keyBy((KeySelector<Estimation, String>) Estimation::getKey);
 		single.addSink(kp.getProducer());
@@ -248,6 +250,27 @@ public class Run {
 
 		DataStream<Estimation> finalStream = partialOutputStream.flatMap(new GReduceFlatMap()).setParallelism(1);
 
+		DataStream<Estimation> onePassPhaseOneGlobalResults = finalStream.filter(new FilterFunction<Estimation>() {
+			private static final long serialVersionUID = 1L;
+			@Override
+			public boolean filter(Estimation value) {
+				return isOnePassPhaseOneGlobalResult(value);
+			}
+		}).name("ONEPASS_PHASE1_GLOBAL_RESULTS");
+
+		/*
+		 * New OnePass-only Phase 1 feedback path.
+		 * Generic SDE estimations do not enter this branch.
+		 */
+		DataStream<Estimation> onePassPhaseOneStateMessages = onePassPhaseOneGlobalResults
+				.flatMap(new OnePassPhaseOneRequestSplitter())
+				.name("ONEPASS_PHASE1_REQUEST_SPLITTER")
+				.setParallelism(1);
+
+		DataStream<Estimation> onePassPhaseOneFeedback = onePassPhaseOneStateMessages
+				.flatMap(new OnePassCoordinatorFilter())
+				.name("ONEPASS_PHASE1_FEEDBACK_COORDINATOR")
+				.setParallelism(1);
 
 		SplitStream<Estimation> split_2 = finalStream.split(new OutputSelector<Estimation>() {
 			private static final long serialVersionUID = 1L;
@@ -277,8 +300,8 @@ public class Run {
 		 * These are already merged OnePass global results.
 		 * The coordinator must not merge them again.
 		 *
-		 * Example:
-		 *   GLOBAL_PHASE1_RESULT -> OnePassCoordinatorOperator -> GLOBAL_PHASE1_RESULT_READY
+		 * Phase 1 is excluded from this old coordinator path.
+		 * Phase 2/3 remain here until they are migrated.
 		 */
 		DataStream<Estimation> onePassPostReduceCoordinatorInput = finalStream.
 				filter(new FilterFunction<Estimation>() {
@@ -294,9 +317,8 @@ public class Run {
 		/*
 		 * Global state payload path.
 		 *
-		 * GLOBAL_PHASE1_RESULT is the heavy merged result.
-		 * The splitter converts it into per-worker chunks and writes them to
-		 * onepass-global-state-topic.
+		 * This is now the legacy Phase 2/3 global-state path only.
+		 * Phase 1 feedback is carried through RequestTopic above.
 		 */
 		DataStream<String> onePassGlobalStateChunks = onePassPostReduceCoordinatorInput
 				.flatMap(new OnePassGlobalStateSplitter())
@@ -332,10 +354,10 @@ public class Run {
 		 *   - GLOBAL_PHASE1_RESULT_READY
 		 */
 		DataStream<Estimation> onePassCoordinatorOutput = onePassPreReduceCoordinatorInput
-						.union(onePassPostReduceCoordinatorInput)
-						.flatMap(new OnePassCoordinatorOperator())
-						.name("ONEPASS_COORDINATOR")
-						.setParallelism(1);
+				.union(onePassPostReduceCoordinatorInput)
+				.flatMap(new OnePassCoordinatorOperator())
+				.name("ONEPASS_COORDINATOR")
+				.setParallelism(1);
 
 		DataStream<Estimation> onePassCoordinatorRequestOutput = onePassCoordinatorOutput
 				.filter(new FilterFunction<Estimation>() {
@@ -359,11 +381,16 @@ public class Run {
 
 		/*
 		 * requestID == 7 is serialized as Request by kafkaProducerEstimation.
-		 * This must go to requestTopic.
+		 *
+		 * Phase 1 uses the new BEGIN/CHUNK/COMMIT + transition path.
+		 * Phase 2/3 still use requests emitted by OnePassCoordinatorOperator.
 		 */
-		onePassCoordinatorRequestOutput
+		DataStream<Estimation> onePassRequestFeedback = onePassPhaseOneFeedback
+				.union(onePassCoordinatorRequestOutput);
+
+		onePassRequestFeedback
 				.addSink(pRequest.getProducer())
-				.name("ONEPASS_COORDINATOR_REQUEST_TOPIC_OUTPUT");
+				.name("ONEPASS_REQUEST_TOPIC_FEEDBACK");
 
 		/*
 		 * Readiness/status events stay in estimationTopic.
@@ -374,7 +401,7 @@ public class Run {
 
 		env.execute("Streaming SDE");
 
-}
+	}
 
 	private static boolean isOnePassPreReduceCoordinatorMessage(Estimation value) {
 		if (value == null) {
@@ -430,10 +457,12 @@ public class Run {
 			return false;
 		}
 
+		/*
+		 * Phase 1 now uses OnePassPhaseOneRequestSplitter +
+		 * OnePassCoordinatorFilter. Keep the old coordinator/globalStateTopic
+		 * path only for the still-unmigrated Phase 2 and Phase 3.
+		 */
 		String type = firstParam(value);
-		if (value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(type)) {
-			return true;
-		}
 
 		if (value.getRequestID() == 83 && "GLOBAL_PHASE2_ROOT_SAMPLE".equals(type)) {
 			return true;
@@ -512,6 +541,20 @@ public class Run {
 		return false;
 	}
 
+	private static boolean isOnePassPhaseOneGlobalResult(
+			Estimation value) {
+
+		if (value == null) {
+			return false;
+		}
+
+		if (value.getSynopsisID() != 30) {
+			return false;
+		}
+
+		return value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(firstParam(value));
+	}
+
 	private static void initializeParameters(String[] args) {
 
 		if (args.length > 4) {
@@ -533,7 +576,7 @@ public class Run {
 			//multi = Integer.parseInt(args[5]);
 
 		}else{
-			
+
 			System.out.println("[INFO] Default values");
 			//Default values
 			//kafkaDataInputTopic = "FAN";

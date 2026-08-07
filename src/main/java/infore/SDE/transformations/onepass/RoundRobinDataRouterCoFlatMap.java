@@ -29,6 +29,9 @@ public final class RoundRobinDataRouterCoFlatMap extends RichCoFlatMapFunction<D
     private final Map<String, Integer> parallelismByBaseKey = new HashMap<String, Integer>();
     private final Map<String, Integer> nextWorkerByBaseKey = new HashMap<String, Integer>();
 
+    private static final String ONEPASS_END_ALIAS_TYPE = "END_ALIAS";
+    private static final int ONEPASS_SYNOPSIS_ID = 30;
+
     @Override
     public void flatMap1(Datapoint value, Collector<Datapoint> out) throws Exception {
         if (value == null) {
@@ -44,7 +47,14 @@ public final class RoundRobinDataRouterCoFlatMap extends RichCoFlatMapFunction<D
             return;
         }
 
-        if (isOnePassDataBarrier(value)) {
+        /*
+         * Control markers that must reach every logical OnePass worker.
+         *
+         * DATA_BARRIER remains only for the still-unmigrated Phase 2/3 path.
+         * END_ALIAS is the new Phase 1 protocol.
+         */
+        if (isOnePassDataBarrier(value) || isOnePassEndAlias(value)) {
+
             for (int worker = 0; worker < p; worker++) {
                 out.collect(copyWithKey(value, routedKey(baseKey, p, worker)));
             }
@@ -109,7 +119,9 @@ public final class RoundRobinDataRouterCoFlatMap extends RichCoFlatMapFunction<D
     }
 
     private static Datapoint copyWithKey(Datapoint source, String newKey) {
-        return new Datapoint(newKey, source.getStreamID(), source.getValues());
+
+        JsonNode valuesCopy = source.getValues() == null ? null : source.getValues().deepCopy();
+        return new Datapoint(newKey, source.getStreamID(),valuesCopy);
     }
 
     private static String routedKey(String baseKey, int parallelism, int workerId) {
@@ -123,5 +135,18 @@ public final class RoundRobinDataRouterCoFlatMap extends RichCoFlatMapFunction<D
 
         JsonNode marker = value.getValues().get(ONEPASS_DATA_BARRIER_FIELD);
         return marker != null && marker.asBoolean(false);
+    }
+
+    public static boolean isOnePassEndAlias(Datapoint value) {
+
+        if (value == null || value.getValues() == null || value.getValues().isNull()) {
+            return false;
+        }
+
+        JsonNode values = value.getValues();
+        String type = values.has("type") ? values.get("type").asText("") : "";
+        int synopsisId = values.has("synopsisID") ? values.get("synopsisID").asInt(-1) : -1;
+
+        return ONEPASS_END_ALIAS_TYPE.equals(type) && synopsisId == ONEPASS_SYNOPSIS_ID;
     }
 }
