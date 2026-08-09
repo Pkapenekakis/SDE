@@ -22,6 +22,7 @@ import java.io.FileReader;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
@@ -78,7 +79,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * Use -1 for the whole file.
      * Keep this modest while debugging.
      */
-    private static final long TEST_ROW_LIMIT = 10000L;
+    private static final long TEST_ROW_LIMIT = 1000000L;
 
     private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
 
@@ -86,7 +87,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final int REQUEST_ADD = 1;
     private static final int REQUEST_UPDATE = 7;
 
-    private static final int EXPECTED_WORKERS = 4;
+    private static final int EXPECTED_WORKERS = 8;
     private static final long TIMEOUT_MS = 30L * 60L * 1000L;
 
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
@@ -96,11 +97,34 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final boolean EXPORT_FINAL_PHASE1_INDEX = false;
     private static final String PHASE1_INDEX_EXPORT_DIR = "/tmp/onepass_wq3_alias_phase1_full_indexes.json";
 
+
+    private static final boolean STOP_AFTER_PHASE1_BENCHMARK = true;
+
+    /*
+     * Phase 1 benchmark output.
+     *
+     * The common metric with the existing single-worker benchmark is
+     * phase1_stream_send. The new asynchronous implementation additionally
+     * records the END_ALIAS -> global merge -> feedback transition time.
+     */
+    private static final Map<String, Long> benchmarkNanos =
+            new LinkedHashMap<String, Long>();
+
+    private static final Map<String, Long> benchmarkCounts =
+            new LinkedHashMap<String, Long>();
+
+    private static final boolean WRITE_PHASE1_BENCHMARK_CSV = true;
+    private static final String PHASE1_BENCHMARK_CSV_PATH =
+            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_benchmark.csv";
+
     private OnePassSamplerSdeCoordinatorTest() {
     }
 
     public static void main(String[] args) throws Exception {
         int uid = Math.abs(UUID.randomUUID().toString().hashCode());
+
+        benchmarkNanos.clear();
+        benchmarkCounts.clear();
 
         String streamId = "onepass-coordinator-tpch-test";
         String baseKey = "onepass-phase1-" + uid;
@@ -171,7 +195,15 @@ public final class OnePassSamplerSdeCoordinatorTest {
             String finalPhaseOneEdgeId = "";
             PhaseOneFeedbackTrace finalPhaseOneFeedback = null;
 
+            /*
+             * Start Phase 1 timing after the temporary ADD synchronization.
+             * This matches the single-worker phase1_stream_send boundary: SQL
+             * compilation and ADD setup are not included.
+             */
+            long phaseOneTotalStartNanos = tic();
+
             for (String phaseOneAlias : plan.getLeafToRootOrder()) {
+                long phaseOneAliasTotalStartNanos = tic();
                 aliasPosition++;
 
                 CompiledOnePassPlan.DirectedJoinEdge parentEdge =
@@ -228,6 +260,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
                                 + "..."
                 );
 
+                long phaseOneAliasStreamStartNanos = tic();
+
                 long rowsSent = streamAlias(
                         producer,
                         DATA_TOPIC,
@@ -241,6 +275,26 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 );
 
                 producer.flush();
+
+                recordDuration(
+                        "phase1_stream_send",
+                        phaseOneAliasStreamStartNanos
+                );
+
+                recordDuration(
+                        "phase1_alias_" + phaseOneAlias + "_stream_send",
+                        phaseOneAliasStreamStartNanos
+                );
+
+                recordCount(
+                        "phase1_rows_sent",
+                        rowsSent
+                );
+
+                recordCount(
+                        "phase1_alias_" + phaseOneAlias + "_rows_sent",
+                        rowsSent
+                );
 
                 if (rowsSent <= 0L) {
                     throw new IllegalStateException(
@@ -270,6 +324,21 @@ public final class OnePassSamplerSdeCoordinatorTest {
                                 + phaseOneAlias
                                 + "..."
                 );
+
+                /*
+                 * This timer is the new-protocol counterpart of the old Phase 1
+                 * completion/control cost. It includes:
+                 *
+                 *   END_ALIAS send
+                 *   -> P local exports
+                 *   -> global reduce/merge
+                 *   -> BEGIN/CHUNK/COMMIT
+                 *   -> START_NEXT_ALIAS / START_PHASE_2 observed on RequestTopic
+                 *
+                 * It does not wait for installation ACKs because the new design
+                 * intentionally has no centralized installation-ACK barrier.
+                 */
+                long phaseOneAliasFeedbackStartNanos = tic();
 
                 ObjectNode endAliasDatapoint =
                         buildEndAliasDatapoint(
@@ -331,6 +400,21 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     );
                 }
 
+                recordDuration(
+                        "phase1_feedback_total",
+                        phaseOneAliasFeedbackStartNanos
+                );
+
+                recordDuration(
+                        "phase1_alias_" + phaseOneAlias + "_feedback",
+                        phaseOneAliasFeedbackStartNanos
+                );
+
+                recordDuration(
+                        "phase1_alias_" + phaseOneAlias + "_total",
+                        phaseOneAliasTotalStartNanos
+                );
+
                 System.out.println(
                         "Phase 1 feedback complete:"
                                 + " alias="
@@ -355,6 +439,22 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 }
             }
 
+            recordDuration(
+                    "phase1_total_observed",
+                    phaseOneTotalStartNanos
+            );
+
+            /*
+             * Print/write immediately after Phase 1. This way a later legacy
+             * Phase 2/3 failure does not lose the Phase 1 benchmark result.
+             * Full-index debug export is deliberately outside the timer.
+             */
+            printPhaseOneBenchmarkSummary(plan);
+            writePhaseOneBenchmarkCsv(
+                    plan,
+                    "SDE_KAFKA_MULTIWORKER_ASYNC_PHASE1"
+            );
+
             if (EXPORT_FINAL_PHASE1_INDEX) {
 
                 if (finalPhaseOneFeedback == null) {
@@ -372,6 +472,17 @@ public final class OnePassSamplerSdeCoordinatorTest {
                         finalPhaseOneAlias,
                         finalPhaseOneEdgeId
                 );
+            }
+
+            if (STOP_AFTER_PHASE1_BENCHMARK) {
+
+                printPhaseOneBenchmarkSummary(plan);
+                //writePhaseOneBenchmarkCsv(plan, "SDE_KAFKA_MULTIWORKER_ASYNC_PHASE1");
+
+                System.out.println();
+                System.out.println("SUCCESS: Phase 1 benchmark completed. " + "Stopping before legacy Phase 2.");
+
+                return;
             }
 
             /*
@@ -754,10 +865,19 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         } finally {
             try {
-                producer.close();
-            } catch (Exception ignored) {
-            }
+                System.out.println("Removing OnePass benchmark synopsis uid=" + uid);
 
+                ObjectNode removeRequest = buildOnePassRemoveRequest(baseKey, streamId, uid, EXPECTED_WORKERS);
+                sendJson(producer, REQUEST_TOPIC, baseKey, removeRequest);
+
+                producer.flush();
+                Thread.sleep(500L);
+
+            } catch (Exception cleanupError) {
+
+                System.err.println("WARNING: OnePass cleanup failed for uid=" + uid);
+                cleanupError.printStackTrace();
+            }
             try {
                 consumer.close();
             } catch (Exception ignored) {
@@ -765,6 +885,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
             try {
                 feedbackConsumer.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                producer.close();
             } catch (Exception ignored) {
             }
         }
@@ -991,7 +1115,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 count++;
 
                 if (count % 5000L == 0L) {
-                    producer.flush();
+                    //producer.flush();
                     System.out.println("    sent " + count + " rows for alias " + alias);
                 }
             }
@@ -1672,6 +1796,516 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         return aliases;
+    }
+
+    private static long tic() {
+        return System.nanoTime();
+    }
+
+    private static void recordDuration(
+            String label,
+            long startNanos) {
+
+        long elapsed =
+                System.nanoTime()
+                        - startNanos;
+
+        benchmarkNanos.merge(
+                label,
+                elapsed,
+                Long::sum
+        );
+    }
+
+    private static long nanosFor(
+            String label) {
+
+        Long value =
+                benchmarkNanos.get(
+                        label
+                );
+
+        return value == null
+                ? 0L
+                : value.longValue();
+    }
+
+    private static double secondsFor(
+            String label) {
+
+        return nanosFor(label)
+                / 1_000_000_000.0d;
+    }
+
+    private static void recordCount(
+            String label,
+            long value) {
+
+        benchmarkCounts.merge(
+                label,
+                value,
+                Long::sum
+        );
+    }
+
+    private static long countFor(
+            String label) {
+
+        Long value =
+                benchmarkCounts.get(
+                        label
+                );
+
+        return value == null
+                ? 0L
+                : value.longValue();
+    }
+
+    private static double rowsPerSecond(
+            long rows,
+            double seconds) {
+
+        if (seconds <= 0.0d) {
+            return 0.0d;
+        }
+
+        return rows / seconds;
+    }
+
+    private static void printTimingLine(
+            String label,
+            double seconds) {
+
+        System.out.printf(
+                "%-45s %12.3f s%n",
+                label,
+                seconds
+        );
+    }
+
+    private static void printRateLine(
+            String label,
+            double rowsPerSecond) {
+
+        System.out.printf(
+                "%-45s %12.3f rows/s%n",
+                label,
+                rowsPerSecond
+        );
+    }
+
+    /**
+     * Phase 1-only summary for direct comparison with the existing
+     * single-worker benchmark.
+     *
+     * Comparable metric:
+     *   phase1_stream_send
+     *
+     * New-protocol completion metric:
+     *   phase1_feedback_total
+     *
+     * For the legacy single-worker test, the closest equivalent to
+     * phase1_feedback_total is:
+     *
+     *   phase1_data_barrier_ack
+     *   + phase1_finish_ack
+     *   + phase1_status
+     *
+     * because all of those were required before Phase 2 could start.
+     */
+    private static void printPhaseOneBenchmarkSummary(
+            CompiledOnePassPlan plan) {
+
+        double streamSeconds =
+                secondsFor(
+                        "phase1_stream_send"
+                );
+
+        double feedbackSeconds =
+                secondsFor(
+                        "phase1_feedback_total"
+                );
+
+        double totalSeconds =
+                secondsFor(
+                        "phase1_total_observed"
+                );
+
+        long rows =
+                countFor(
+                        "phase1_rows_sent"
+                );
+
+        System.out.println();
+        System.out.println(
+                "=== Multi-worker OnePass Phase 1 benchmark ==="
+        );
+
+        System.out.println(
+                "TEST_ROW_LIMIT:  "
+                        + formatRowLimit(
+                        TEST_ROW_LIMIT
+                )
+        );
+
+        System.out.println(
+                "workers:         "
+                        + EXPECTED_WORKERS
+        );
+
+        System.out.println(
+                "leaf-to-root:    "
+                        + plan.getLeafToRootOrder()
+        );
+
+        printTimingLine(
+                "phase1_stream_send",
+                streamSeconds
+        );
+
+        printTimingLine(
+                "phase1_feedback_total",
+                feedbackSeconds
+        );
+
+        printTimingLine(
+                "phase1_total_observed",
+                totalSeconds
+        );
+
+        System.out.println(
+                "phase1_rows_sent: "
+                        + rows
+        );
+
+        printRateLine(
+                "phase1_send_rows_per_sec",
+                rowsPerSecond(
+                        rows,
+                        streamSeconds
+                )
+        );
+
+        printRateLine(
+                "phase1_end_to_end_rows_per_sec",
+                rowsPerSecond(
+                        rows,
+                        totalSeconds
+                )
+        );
+
+        System.out.println();
+        System.out.println(
+                "Per-alias timings:"
+        );
+
+        for (String alias
+                : plan.getLeafToRootOrder()) {
+
+            long aliasRows =
+                    countFor(
+                            "phase1_alias_"
+                                    + alias
+                                    + "_rows_sent"
+                    );
+
+            double aliasStream =
+                    secondsFor(
+                            "phase1_alias_"
+                                    + alias
+                                    + "_stream_send"
+                    );
+
+            double aliasFeedback =
+                    secondsFor(
+                            "phase1_alias_"
+                                    + alias
+                                    + "_feedback"
+                    );
+
+            double aliasTotal =
+                    secondsFor(
+                            "phase1_alias_"
+                                    + alias
+                                    + "_total"
+                    );
+
+            System.out.println(
+                    "  alias="
+                            + alias
+                            + ", rows="
+                            + aliasRows
+                            + ", stream_s="
+                            + aliasStream
+                            + ", feedback_s="
+                            + aliasFeedback
+                            + ", total_s="
+                            + aliasTotal
+            );
+        }
+
+        System.out.println(
+                "============================================"
+        );
+        System.out.println();
+    }
+
+    private static void writePhaseOneBenchmarkCsv(
+            CompiledOnePassPlan plan,
+            String implementation) throws Exception {
+
+        if (!WRITE_PHASE1_BENCHMARK_CSV) {
+            return;
+        }
+
+        double streamSeconds =
+                secondsFor(
+                        "phase1_stream_send"
+                );
+
+        double feedbackSeconds =
+                secondsFor(
+                        "phase1_feedback_total"
+                );
+
+        double totalSeconds =
+                secondsFor(
+                        "phase1_total_observed"
+                );
+
+        long rows =
+                countFor(
+                        "phase1_rows_sent"
+                );
+
+        File csvFile =
+                new File(
+                        PHASE1_BENCHMARK_CSV_PATH
+                );
+
+        boolean writeHeader =
+                !csvFile.exists()
+                        || csvFile.length()
+                        == 0L;
+
+        FileWriter writer =
+                new FileWriter(
+                        csvFile,
+                        true
+                );
+
+        try {
+            if (writeHeader) {
+                writer.write(
+                        "timestamp_ms,"
+                                + "implementation,"
+                                + "workers,"
+                                + "query_name,"
+                                + "seed,"
+                                + "test_row_limit,"
+                                + "sample_size_limit,"
+                                + "root_alias,"
+                                + "leaf_to_root_order,"
+                                + "phase1_rows_sent,"
+                                + "phase1_stream_send_s,"
+                                + "phase1_feedback_total_s,"
+                                + "phase1_total_observed_s,"
+                                + "phase1_send_rows_per_sec,"
+                                + "phase1_end_to_end_rows_per_sec,"
+                                + "phase1_alias_rows_sent,"
+                                + "phase1_alias_stream_send_s,"
+                                + "phase1_alias_feedback_s,"
+                                + "phase1_alias_total_s"
+                                + System.lineSeparator()
+                );
+            }
+
+            writer.write(
+                    Long.toString(
+                            System.currentTimeMillis()
+                    )
+                            + ","
+                            + csv(
+                            implementation
+                    )
+                            + ","
+                            + EXPECTED_WORKERS
+                            + ","
+                            + csv(
+                            plan.getQueryName()
+                    )
+                            + ","
+                            + csv(
+                            plan.getDatasetSeed()
+                    )
+                            + ","
+                            + csv(
+                            formatRowLimit(
+                                    TEST_ROW_LIMIT
+                            )
+                    )
+                            + ","
+                            + plan.getSampleSize()
+                            + ","
+                            + csv(
+                            plan.getRootAlias()
+                    )
+                            + ","
+                            + csv(
+                            String.valueOf(
+                                    plan.getLeafToRootOrder()
+                            )
+                    )
+                            + ","
+                            + rows
+                            + ","
+                            + Double.toString(
+                            streamSeconds
+                    )
+                            + ","
+                            + Double.toString(
+                            feedbackSeconds
+                    )
+                            + ","
+                            + Double.toString(
+                            totalSeconds
+                    )
+                            + ","
+                            + Double.toString(
+                            rowsPerSecond(
+                                    rows,
+                                    streamSeconds
+                            )
+                    )
+                            + ","
+                            + Double.toString(
+                            rowsPerSecond(
+                                    rows,
+                                    totalSeconds
+                            )
+                    )
+                            + ","
+                            + csv(
+                            String.valueOf(
+                                    phaseOneAliasRowsMap(
+                                            plan
+                                    )
+                            )
+                    )
+                            + ","
+                            + csv(
+                            String.valueOf(
+                                    phaseOneAliasSecondsMap(
+                                            plan,
+                                            "stream_send"
+                                    )
+                            )
+                    )
+                            + ","
+                            + csv(
+                            String.valueOf(
+                                    phaseOneAliasSecondsMap(
+                                            plan,
+                                            "feedback"
+                                    )
+                            )
+                    )
+                            + ","
+                            + csv(
+                            String.valueOf(
+                                    phaseOneAliasSecondsMap(
+                                            plan,
+                                            "total"
+                                    )
+                            )
+                    )
+                            + System.lineSeparator()
+            );
+
+        } finally {
+            writer.close();
+        }
+
+        System.out.println(
+                "Phase 1 benchmark CSV appended to: "
+                        + csvFile.getAbsolutePath()
+        );
+    }
+
+    private static Map<String, Long> phaseOneAliasRowsMap(
+            CompiledOnePassPlan plan) {
+
+        Map<String, Long> out =
+                new LinkedHashMap<String, Long>();
+
+        for (String alias
+                : plan.getLeafToRootOrder()) {
+
+            out.put(
+                    alias,
+                    countFor(
+                            "phase1_alias_"
+                                    + alias
+                                    + "_rows_sent"
+                    )
+            );
+        }
+
+        return out;
+    }
+
+    private static Map<String, Double> phaseOneAliasSecondsMap(
+            CompiledOnePassPlan plan,
+            String suffix) {
+
+        Map<String, Double> out =
+                new LinkedHashMap<String, Double>();
+
+        for (String alias
+                : plan.getLeafToRootOrder()) {
+
+            out.put(
+                    alias,
+                    secondsFor(
+                            "phase1_alias_"
+                                    + alias
+                                    + "_"
+                                    + suffix
+                    )
+            );
+        }
+
+        return out;
+    }
+
+    private static String csv(
+            String value) {
+
+        if (value == null) {
+            return "";
+        }
+
+        String escaped =
+                value.replace(
+                        "\"",
+                        "\"\""
+                );
+
+        return "\""
+                + escaped
+                + "\"";
+    }
+
+    private static String formatRowLimit(
+            long rowLimit) {
+
+        if (rowLimit < 0L) {
+            return "FULL";
+        }
+
+        return Long.toString(
+                rowLimit
+        );
     }
 
     /**
@@ -2684,7 +3318,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
             );
         }
 
-        ObjectNode export = MAPPER.createObjectNode();
+        ObjectNode export =
+                MAPPER.createObjectNode();
 
         /*
          * IMPORTANT:
@@ -2957,5 +3592,23 @@ public final class OnePassSamplerSdeCoordinatorTest {
         datapoint.set("values", marker);
 
         return datapoint;
+    }
+
+    private static ObjectNode buildOnePassRemoveRequest(String datasetKey, String streamId, int uid, int noOfP) {
+
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", 2);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("REMOVE");
+        request.set("param", param);
+
+        return request;
     }
 }

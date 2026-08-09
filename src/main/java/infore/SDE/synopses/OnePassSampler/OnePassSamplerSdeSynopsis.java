@@ -17,9 +17,8 @@ import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleCandidate;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.WeightedReservoirEntry;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleCandidate;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleInstance;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
+
 import java.util.*;
 
 /**
@@ -759,16 +758,10 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
                                                          int actualParallelism, String resultId, String activeAlias,
                                                          String nextCommand, String nextAlias) {
 
-        OnePassPhaseOneResult phaseOneResult = lifecycle.exportLocalPhaseOneResult();
-
-        if (phaseOneResult == null) {
-            throw new IllegalStateException("Cannot export LOCAL_PHASE1_RESULT because local Phase 1 state is null.");
-        }
+        //OnePassPhaseOneResult phaseOneResult = lifecycle.exportLocalPhaseOneResult();
 
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
-
         String normalizedWorkerKey = workerKey == null ? "" : workerKey.trim();
-
         String baseKey = stripOnePassWorkerSuffix(normalizedWorkerKey, expectedWorkers, workerId);
 
         payload.put("type", "LOCAL_PHASE1_RESULT");
@@ -795,6 +788,22 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             }
         }
 
+        /*
+         * All workers contribute the active edge.
+         *
+         * Worker 0 additionally carries stable already-global state once.
+         * Since the reducer waits for every expected worker, worker 0 is guaranteed
+         * to participate before the result is emitted.
+         */
+        boolean includesStableState = workerId == 0;
+
+        OnePassPhaseOneResult phaseOneResult =
+                lifecycle.exportLocalP1ResultForDistMerge(normalizedActiveAlias, activeEdgeId, includesStableState);
+
+        if (phaseOneResult == null) {
+            throw new IllegalStateException("Cannot export LOCAL_PHASE1_RESULT because local Phase 1 state is null.");
+        }
+
         payload.put("activeAlias", normalizedActiveAlias);
         payload.put("activeEdgeId", activeEdgeId);
 
@@ -816,6 +825,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
          * copied once while the active edge is summed across workers.
          */
         payload.put("phaseOneResult", phaseOneResult.toDebugMap());
+        payload.put("includesStableState", includesStableState);
 
         String json;
 

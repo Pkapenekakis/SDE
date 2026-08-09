@@ -70,6 +70,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
     public boolean add(Estimation e) {
         try {
             JsonNode payload = parsePayload(e.getEstimation());
+            boolean includesStableState = booleanField( payload,"includesStableState", true);
 
             if (payload == null || payload.isNull()) {
                 System.out.println("[OnePassPhase1Reduce] Ignoring null payload.");
@@ -164,7 +165,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
             JsonNode phaseOneResult = payload.get("phaseOneResult");
 
             if (phaseOneResult != null && !phaseOneResult.isNull()) {
-                mergePhaseOneResult(phaseOneResult, activeAlias, activeEdgeId);
+                mergePhaseOneResult(phaseOneResult, activeAlias, activeEdgeId, includesStableState);
             }
 
             count = receivedWorkers.size();
@@ -229,9 +230,11 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
         }
     }
 
-    private void mergePhaseOneResult(JsonNode phaseOneResult, String activeAlias, String activeEdgeId) {
+    private void mergePhaseOneResult(JsonNode phaseOneResult, String activeAlias, String activeEdgeId,
+                                     boolean includesStableState) {
+
         JsonNode seenTuples = phaseOneResult.get("seenTuplesByAlias");
-        mergeSeenTuples(seenTuples, activeAlias);
+        mergeSeenTuples(seenTuples, activeAlias, includesStableState);
 
         JsonNode edgeIndexes = phaseOneResult.get("edgeIndexes");
 
@@ -253,7 +256,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
          * Copy already-global/stable edges once.
          * Sum only the currently active edge across workers.
          */
-        if (!stableEdgesCopied) {
+        if (includesStableState && !stableEdgesCopied ) {
             copyStableEdgesOnce(edgeIndexes, activeEdgeId);
             stableEdgesCopied = true;
         }
@@ -354,7 +357,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
         }
     }
 
-    private void mergeSeenTuples(JsonNode seenTuplesByAlias, String activeAlias) {
+    private void mergeSeenTuples(JsonNode seenTuplesByAlias, String activeAlias, boolean includesStableState) {
         if (seenTuplesByAlias == null || !seenTuplesByAlias.isObject()) {
             return;
         }
@@ -371,7 +374,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
             return;
         }
 
-        if (!stableSeenCopied) {
+        if (includesStableState && !stableSeenCopied) {
             Iterator<Map.Entry<String, JsonNode>> fields = seenTuplesByAlias.fields();
 
             while (fields.hasNext()) {
@@ -515,5 +518,20 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
         }
 
         return field.asInt(defaultValue);
+    }
+
+    private static boolean booleanField(JsonNode node, String fieldName, boolean defaultValue) {
+
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asBoolean(defaultValue);
     }
 }

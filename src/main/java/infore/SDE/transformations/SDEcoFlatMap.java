@@ -44,7 +44,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 	private final OnePassPhaseOneWorkerProtocol onePassPhaseOneWorkerProtocol = new OnePassPhaseOneWorkerProtocol();
 	private static final int ONEPASS_MAX_BUFFERED_TUPLES_PER_UID =
-			Integer.getInteger("sde.onepass.maxBufferedTuplesPerUid", 10000);
+			Integer.getInteger("sde.onepass.maxBufferedTuplesPerUid", 1000000);
 	private final OnePassTupleBufferGate onePassTupleBufferGate =
 			new OnePassTupleBufferGate(ONEPASS_MAX_BUFFERED_TUPLES_PER_UID);
 
@@ -134,6 +134,20 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		System.out.println(rq.toString());
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(rq.getKey());
 		ArrayList<ContinuousSynopsis>  C_Synopses =  MC_Synopses.get(rq.getKey());
+
+
+		/*
+		 * OnePass explicit cleanup.
+		 * Keep this isolated from generic synopsis removal because OnePass owns
+		 * additional worker-local protocol/gating state outside M_Synopses.
+		 */
+		if (rq.getSynopsisID() == ONEPASS_SYNOPSIS_ID
+				&& rq.getRequestID() % 10 == 2) {
+
+			handleOnePassRemove(rq, Synopses);
+
+			return;
+		}
 
 		/*
 		 * OnePass RequestTopic feedback protocol.
@@ -2007,5 +2021,40 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		completeOnePassEndAlias(pending, synopses, collector);
+	}
+
+	private void handleOnePassRemove(Request request, ArrayList<Synopsis> synopses) {
+
+		int uid = request.getUID();
+
+		//1. Remove the actual OnePass synopsis.
+		if (synopses != null) {
+
+            synopses.removeIf(synopsis -> synopsis instanceof OnePassSamplerSdeSynopsis
+					&& synopsis.getSynopsisID() == uid);
+
+			if (synopses.isEmpty()) {
+				M_Synopses.remove(request.getKey());
+			} else {
+				M_Synopses.put(request.getKey(), synopses);
+			}
+		}
+
+
+		//2. Remove new asynchronous Phase 1 protocol state.
+		onePassPhaseOneWorkerProtocol.clear(uid);
+
+		//3. Remove buffered tuples / active alias / sealed aliases.
+		onePassTupleBufferGate.clear(uid);
+
+		//4. Remove deferred END_ALIAS.
+		String pendingPrefix = uid + "|";
+        pendingOnePassEndAliasByUidAlias.keySet().removeIf(key -> key.startsWith(pendingPrefix));
+
+		//5. Remove END_ALIAS deduplication state.
+        processedOnePassEndAliasMarkers.removeIf(key -> key.startsWith(pendingPrefix));
+
+		System.out.println("[OnePass REMOVE] worker-local state cleared." + " uid=" + uid + ", workerId=" + pId +
+				", key=" + request.getKey());
 	}
 }

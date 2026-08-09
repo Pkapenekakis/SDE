@@ -177,4 +177,74 @@ public class OnePassPhaseOneState implements Serializable {
             }
         }
     }
+
+    /**
+     * Export used by distributed Phase 1 merge.
+     *
+     * Every worker exports its active edge.
+     *
+     * Exactly one designated worker additionally carries the already-global
+     * stable edges so the reducer can construct the complete next global state
+     * without P redundant copies of those stable indexes.
+     */
+    public OnePassPhaseOneResult exportForDistributedMerge(String activeAlias, String activeEdgeId,
+                                                           boolean includeStableState) {
+
+        if (activeAlias == null || activeAlias.trim().isEmpty()) {
+            throw new IllegalArgumentException("activeAlias must not be blank");
+        }
+
+        if (activeEdgeId == null || activeEdgeId.trim().isEmpty()) {
+            throw new IllegalArgumentException("activeEdgeId must not be blank");
+        }
+
+        Map<String, Phase1LinkWeightIndex> selectedIndexes = new LinkedHashMap<String, Phase1LinkWeightIndex>();
+
+        /*
+         * Active edge is required from every worker because it must be summed.
+         */
+        Phase1LinkWeightIndex activeIndex = indexByEdgeId.get(activeEdgeId);
+
+        if (activeIndex == null) {
+            activeIndex = new Phase1LinkWeightIndex(activeEdgeId);
+        }
+
+        selectedIndexes.put(activeEdgeId, activeIndex);
+
+        /*
+         * Stable global edges need to appear only once in the reducer input.
+         */
+        if (includeStableState) {
+            for (Map.Entry<String, Phase1LinkWeightIndex> entry : indexByEdgeId.entrySet()) {
+
+                if (activeEdgeId.equals(entry.getKey())) {
+                    continue;
+                }
+                selectedIndexes.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        Map<String, Long> selectedSeen = new LinkedHashMap<String, Long>();
+
+        Long activeSeen = seenTuplesByAlias.get(activeAlias);
+
+        selectedSeen.put(activeAlias, activeSeen == null ? 0L : activeSeen);
+        /*
+         * Previous aliases were already globally merged, so include those
+         * counters once as stable metadata.
+         */
+        if (includeStableState) {
+
+            for (Map.Entry<String, Long> entry : seenTuplesByAlias.entrySet()) {
+
+                if (activeAlias.equals(entry.getKey())) {
+                    continue;
+                }
+
+                selectedSeen.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        return new OnePassPhaseOneResult(plan, selectedIndexes, selectedSeen);
+    }
 }

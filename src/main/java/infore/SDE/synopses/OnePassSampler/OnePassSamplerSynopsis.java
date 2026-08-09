@@ -477,4 +477,15 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
         return phaseOneState.exportResult();
     }
+
+    public OnePassPhaseOneResult exportLocalP1ResultForDistMerge(String activeAlias, String activeEdgeId,
+                                                                 boolean includeStableState) {
+
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("exportLocalPhaseOneResultForDistributedMerge() "
+                    + "is only valid during PHASE_1. Current phase: " + phase);
+        }
+
+        return phaseOneState.exportForDistributedMerge(activeAlias, activeEdgeId, includeStableState);
+    }
 }

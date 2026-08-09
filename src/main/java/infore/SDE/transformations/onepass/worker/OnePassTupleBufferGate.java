@@ -16,8 +16,7 @@ import java.util.*;
  * This class is intentionally OnePass-specific and contains no generic
  * SDE synopsis logic.
  */
-public final class OnePassTupleBufferGate
-        implements Serializable {
+public final class OnePassTupleBufferGate implements Serializable {
 
     private static final long serialVersionUID = 1L;
     private final int maxBufferedTuplesPerUid;
@@ -34,8 +33,7 @@ public final class OnePassTupleBufferGate
             throw new IllegalArgumentException("maxBufferedTuplesPerUid must be greater than zero");
         }
 
-        this.maxBufferedTuplesPerUid =
-                maxBufferedTuplesPerUid;
+        this.maxBufferedTuplesPerUid = maxBufferedTuplesPerUid;
     }
 
     public void registerIfAbsent(int uid, String initialAlias) {

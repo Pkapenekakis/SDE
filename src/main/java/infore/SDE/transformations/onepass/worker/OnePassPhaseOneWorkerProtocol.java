@@ -8,9 +8,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Worker-local state machine for the OnePass Phase 1 feedback protocol.
@@ -49,6 +47,7 @@ public final class OnePassPhaseOneWorkerProtocol
     private final Map<Integer, String> installedStateRefByUid = new HashMap<Integer, String>();
     private final Map<Integer, Transition> pendingTransitionByUid = new HashMap<Integer, Transition>();
     private final Map<Integer, Transition> activeTransitionByUid = new HashMap<Integer, Transition>();
+    private final Map<Integer, Set<String>> stateRefsByUid = new HashMap<Integer, Set<String>>();
 
     /**
      * Accepts BEGIN, CHUNK, or COMMIT.
@@ -75,6 +74,21 @@ public final class OnePassPhaseOneWorkerProtocol
         }
 
         String stateRef = requiredTextField(payload, "stateRef");
+
+        int uid = intField(payload, "uid", -1);
+
+        if (uid < 0) {
+            throw new IllegalArgumentException("OnePass Phase 1 state message is missing a valid uid: " + payload);
+        }
+
+        Set<String> refs = stateRefsByUid.get(uid);
+
+        if (refs == null) {
+            refs = new HashSet<String>();
+            stateRefsByUid.put(uid, refs);
+        }
+
+        refs.add(stateRef);
 
         if (readyStatesByRef.containsKey(stateRef)) {
             // Duplicate delivery after successful assembly is idempotent.
@@ -127,6 +141,28 @@ public final class OnePassPhaseOneWorkerProtocol
         }
 
         return null;
+    }
+
+    /**
+     * Removes all worker-local Phase 1 protocol state for one OnePass UID.
+     *
+     * Used when the synopsis is explicitly removed, e.g. between benchmark
+     * runs. This has no effect on another UID.
+     */
+    public void clear(int uid) {
+
+        Set<String> refs = stateRefsByUid.remove(uid);
+
+        if (refs != null) {
+            for (String stateRef : refs) {
+                assembliesByRef.remove(stateRef);
+                readyStatesByRef.remove(stateRef);
+            }
+        }
+
+        installedStateRefByUid.remove(uid);
+        pendingTransitionByUid.remove(uid);
+        activeTransitionByUid.remove(uid);
     }
 
     /**

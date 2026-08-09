@@ -583,7 +583,7 @@ public class Run {
 			kafkaDataInputTopic = "dataTopic";
 			kafkaRequestInputTopic = "requestTopic";
 			//kafkaRequestInputTopic = "Rq_FAN";
-			parallelism = 4;
+			parallelism = 8;
 			//parallelism2 = 4;
 			//kafkaBrokersList = "clu02.softnet.tuc.gr:6667,clu03.softnet.tuc.gr:6667,clu04.softnet.tuc.gr:6667,clu06.softnet.tuc.gr:6667";
 			//kafkaBrokersList = "45.10.26.123:19092";

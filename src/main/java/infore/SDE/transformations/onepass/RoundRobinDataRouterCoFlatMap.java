@@ -120,7 +120,8 @@ public final class RoundRobinDataRouterCoFlatMap extends RichCoFlatMapFunction<D
 
     private static Datapoint copyWithKey(Datapoint source, String newKey) {
 
-        JsonNode valuesCopy = source.getValues() == null ? null : source.getValues().deepCopy();
+        //JsonNode valuesCopy = source.getValues() == null ? null : source.getValues().deepCopy();
+        JsonNode valuesCopy = source.getValues();
         return new Datapoint(newKey, source.getStreamID(),valuesCopy);
     }
 
