@@ -157,7 +157,7 @@ public final class OnePassPhaseOneRequestSplitter
         int totalEntryCount = flattenedEntries.size();
         int chunkCount = Math.max(1, (totalEntryCount + maxEntriesPerChunk - 1) / maxEntriesPerChunk);
 
-        String checksum = sha256Hex(flattenedEntries.toString());
+        String checksum = sha256JsonArray(flattenedEntries);
 
         ObjectNode begin = createBaseMessage(
                         uid,
@@ -508,26 +508,46 @@ public final class OnePassPhaseOneRequestSplitter
         return field.asInt(defaultValue);
     }
 
-    private static String sha256Hex(
-            String value) throws Exception {
+    private static String sha256JsonArray(ArrayNode entries) throws Exception {
 
-        MessageDigest digest =
-                MessageDigest.getInstance("SHA-256");
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
 
-        byte[] hash =
-                digest.digest(
-                        value.getBytes(
-                                StandardCharsets.UTF_8
-                        )
-                );
+        /*
+         * ArrayNode.toString() produces compact JSON:
+         *
+         * [entry0,entry1,...]
+         *
+         * Reproduce exactly the same byte sequence incrementally so
+         * checksum semantics remain unchanged without allocating one
+         * enormous String.
+         */
+        digest.update((byte) '[');
 
-        StringBuilder out =
-                new StringBuilder(hash.length * 2);
+        boolean first = true;
+
+        for (JsonNode entry : entries) {
+            if (!first) {
+                digest.update((byte) ',');
+            }
+
+            first = false;
+
+            byte[] entryBytes = entry.toString().getBytes(StandardCharsets.UTF_8);
+
+            digest.update(entryBytes);
+        }
+
+        digest.update((byte) ']');
+
+        return toHex(digest.digest());
+    }
+
+    private static String toHex(byte[] hash) {
+
+        StringBuilder out = new StringBuilder(hash.length * 2);
 
         for (byte b : hash) {
-            out.append(
-                    String.format("%02x", b & 0xff)
-            );
+            out.append(String.format("%02x", b & 0xff));
         }
 
         return out.toString();

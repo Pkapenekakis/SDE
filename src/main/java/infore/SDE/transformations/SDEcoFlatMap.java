@@ -128,10 +128,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 	@Override
 	public void flatMap2(Request rq, Collector<Estimation> collector) throws Exception {
-		System.out.println("[SDEcoFlatMap REQUEST] requestID=" + rq.getRequestID()
+		/*System.out.println("[SDEcoFlatMap REQUEST] requestID=" + rq.getRequestID()
 						+ ", synopsisID=" + rq.getSynopsisID() + ", uid=" + rq.getUID()
 						+ ", key=" + rq.getKey() + ", known keys=" + M_Synopses.keySet());
-		System.out.println(rq.toString());
+		System.out.println(rq.toString()); */
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(rq.getKey());
 		ArrayList<ContinuousSynopsis>  C_Synopses =  MC_Synopses.get(rq.getKey());
 

@@ -28,6 +28,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Future;
 import java.io.FileWriter;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+
+import java.util.ArrayList;
 
 /**
  * Multi-worker OnePass* coordinator test using real query compilation and TPC-H input.
@@ -57,28 +61,37 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    //Local Test variables
+    /*
     private static final String BOOTSTRAP_SERVERS = "localhost:9092";
     private static final String DATA_TOPIC = "dataTopic";
     private static final String ESTIMATION_TOPIC = "estimationTopic";
     private static final String REQUEST_TOPIC = "requestTopic";
-
-    /*
-     * Keep your Run.java default or argument value aligned with this topic name.
-     */
-    @SuppressWarnings("unused")
-    private static final String GLOBAL_STATE_TOPIC = "globalStateTopic";
-
+    private static final String GLOBAL_STATE_TOPIC = "globalStateTopic"; //unused
     private static final String TEST_TPCH_DIR = "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
+    private static final String PHASE1_BENCHMARK_CSV_PATH =
+            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_benchmark.csv";
+    */
+
+    //softnet cluster Test variables
+    private static final String BOOTSTRAP_SERVERS = "clu02.softnet.tuc.gr:6667," + "clu03.softnet.tuc.gr:6667,"
+            + "clu04.softnet.tuc.gr:6667," + "clu06.softnet.tuc.gr:6667";
+    private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
+    private static final String ESTIMATION_TOPIC = "pkapenekakis-estimationTopic";
+    private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
+    private static final String GLOBAL_STATE_TOPIC = "pkapenekakis-globalStateTopic";
+    private static final String TEST_TPCH_DIR = "/home/pkapenekakis/onepass/tpch-data/sf1";
+    private static final String PHASE1_BENCHMARK_CSV_PATH = "/home/pkapenekakis/onepass/results/" +
+            "onepass_multiworker_phase1_benchmark.csv";
+
+    private static final int REQUEST_TOPIC_PARTITIONS = 8;
 
     private static final String TEST_ONEPASS_SQL =
             "SELECT * FROM wq3_alias WEIGHTED BY (" +
                     "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
                     "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
-    /*
-     * Use -1 for the whole file.
-     * Keep this modest while debugging.
-     */
+    //Use -1 for the whole file.
     private static final long TEST_ROW_LIMIT = 1000000L;
 
     private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
@@ -97,8 +110,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final boolean EXPORT_FINAL_PHASE1_INDEX = false;
     private static final String PHASE1_INDEX_EXPORT_DIR = "/tmp/onepass_wq3_alias_phase1_full_indexes.json";
 
-
     private static final boolean STOP_AFTER_PHASE1_BENCHMARK = true;
+    private static final boolean WRITE_PHASE1_BENCHMARK_CSV = true;
 
     /*
      * Phase 1 benchmark output.
@@ -107,15 +120,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * phase1_stream_send. The new asynchronous implementation additionally
      * records the END_ALIAS -> global merge -> feedback transition time.
      */
-    private static final Map<String, Long> benchmarkNanos =
-            new LinkedHashMap<String, Long>();
+    private static final Map<String, Long> benchmarkNanos = new LinkedHashMap<String, Long>();
+    private static final Map<String, Long> benchmarkCounts = new LinkedHashMap<String, Long>();
 
-    private static final Map<String, Long> benchmarkCounts =
-            new LinkedHashMap<String, Long>();
-
-    private static final boolean WRITE_PHASE1_BENCHMARK_CSV = true;
-    private static final String PHASE1_BENCHMARK_CSV_PATH =
-            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_benchmark.csv";
 
     private OnePassSamplerSdeCoordinatorTest() {
     }
@@ -156,25 +163,30 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println();
 
         KafkaProducer<String, String> producer = createProducer();
-        KafkaConsumer<String, String> consumer =
-                createConsumer("onepass-coordinator-tpch-test-" + uid);
+        //KafkaConsumer<String, String> consumer = createConsumer("onepass-coordinator-tpch-test-" + uid);
 
         /*
-         * Separate consumer group used only by this integration test to observe
-         * the Phase 1 feedback messages written to RequestTopic.
+         * Phase 1 asynchronous benchmark observes feedback directly on RequestTopic.
          *
-         * It does not consume records away from the running SDE job because
-         * Kafka consumer groups are independent.
+         * estimationTopic is only required by the still-legacy Phase 2/3 validation.
          */
-        KafkaConsumer<String, String> feedbackConsumer =
-                createConsumer("onepass-phase1-feedback-test-" + uid);
+        KafkaConsumer<String, String> consumer = null;
 
-        consumer.subscribe(Collections.singletonList(ESTIMATION_TOPIC));
-        feedbackConsumer.subscribe(Collections.singletonList(REQUEST_TOPIC));
+        if (!STOP_AFTER_PHASE1_BENCHMARK) {
+            consumer = createConsumer("onepass-coordinator-tpch-test-" + uid);
+
+            consumer.subscribe(Collections.singletonList(ESTIMATION_TOPIC));
+        }
+
+        KafkaConsumer<String, String> feedbackConsumer = createObserverConsumer();
 
         try {
-            drainConsumer(consumer);
-            drainConsumer(feedbackConsumer);
+            if (consumer != null) {
+                drainConsumer(consumer);
+            }
+
+            initializePhaseOneFeedbackObserver(feedbackConsumer, REQUEST_TOPIC);
+
 
             System.out.println("1. Sending ADD OnePass request with SQL and noOfP=" + EXPECTED_WORKERS + "...");
             ObjectNode addRequest = buildOnePassAddRequest(baseKey, streamId, uid, EXPECTED_WORKERS);
@@ -879,7 +891,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 cleanupError.printStackTrace();
             }
             try {
-                consumer.close();
+                if(consumer != null){
+                    consumer.close();
+                }
             } catch (Exception ignored) {
             }
 
@@ -3038,6 +3052,47 @@ public final class OnePassSamplerSdeCoordinatorTest {
         props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
 
         return new KafkaConsumer<String, String>(props);
+    }
+
+    private static KafkaConsumer<String, String> createObserverConsumer() {
+        Properties props = new Properties();
+
+        props.put("bootstrap.servers", BOOTSTRAP_SERVERS);
+
+        //This consumer is a passive test observer. It uses direct partition assignment, not Kafka group coordination.
+        props.put("enable.auto.commit", "false");
+        props.put("auto.offset.reset", "latest");
+        props.put("request.timeout.ms", "300000");
+        props.put("fetch.max.bytes", "104857600");
+        props.put("max.partition.fetch.bytes", "104857600");
+        props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+
+        return new KafkaConsumer<String, String>(props);
+    }
+
+    private static void initializePhaseOneFeedbackObserver(KafkaConsumer<String, String> consumer, String topic) {
+
+        List<TopicPartition> partitions = new ArrayList<TopicPartition>();
+
+        for (int partition = 0; partition < REQUEST_TOPIC_PARTITIONS; partition++) {
+            partitions.add(new TopicPartition(topic, partition));
+        }
+
+        System.out.println("Assigning Phase 1 feedback observer directly to " + partitions.size() + " RequestTopic partitions...");
+        consumer.assign(partitions);
+
+        /*
+         * No group coordination.
+         *
+         * poll() resolves the initial position according to
+         * auto.offset.reset=latest BEFORE the ADD request is sent.
+         */
+        System.out.println("Initializing feedback observer positions...");
+
+        consumer.poll(1000L);
+
+        System.out.println("Phase 1 feedback observer READY on " + topic);
     }
 
     private static void sendJsonAsync(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) {

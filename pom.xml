@@ -13,9 +13,15 @@
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+		<!-- Default/local build -->
 		<flink.version>1.9.3</flink.version>
 		<java.version>1.8</java.version>
 		<scala.binary.version>2.11</scala.binary.version>
+
+		<!-- Default local scope. SoftNet overrides this to provided. -->
+		<flink.scope>compile</flink.scope>
+
 		<maven.compiler.source>${java.version}</maven.compiler.source>
 		<maven.compiler.target>${java.version}</maven.compiler.target>
 	</properties>
@@ -47,13 +53,14 @@
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-java</artifactId>
 			<version>${flink.version}</version>
-			<scope>compile</scope>
+			<scope>${flink.scope}</scope>
 		</dependency>
+
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-streaming-java_${scala.binary.version}</artifactId>
 			<version>${flink.version}</version>
-			<scope>compile</scope>
+			<scope>${flink.scope}</scope>
 		</dependency>
 
 		<!-- https://mvnrepository.com/artifact/org.influxdb/influxdb-java -->
@@ -86,6 +93,7 @@
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-core</artifactId>
 			<version>${flink.version}</version>
+			<scope>${flink.scope}</scope>
 		</dependency>
 
 
@@ -108,8 +116,8 @@
         <!-- https://mvnrepository.com/artifact/org.apache.flink/flink-connector-kafka-->
 		<dependency>
 			<groupId>org.apache.flink</groupId>
-			<artifactId>flink-connector-kafka_2.11</artifactId>
-			<version>1.9.3</version>
+			<artifactId>flink-connector-kafka_${scala.binary.version}</artifactId>
+			<version>${flink.version}</version>
 		</dependency>
 
 
@@ -126,7 +134,7 @@
 		<!-- https://mvnrepository.com/artifact/org.apache.flink/flink-connector-kafka-0.11-->
 
 			<dependency> <groupId>org.apache.flink</groupId>
-			<artifactId>flink-connector-kafka-base_2.11</artifactId>
+				<artifactId>flink-connector-kafka-base_${scala.binary.version}</artifactId>
 				<version>${flink.version}</version>
 			</dependency>
 
@@ -146,8 +154,9 @@
 		<!-- https://mvnrepository.com/artifact/org.apache.flink/flink-queryable-state-runtime -->
 		<dependency>
 			<groupId>org.apache.flink</groupId>
-			<artifactId>flink-queryable-state-runtime_2.11</artifactId>
+			<artifactId>flink-queryable-state-runtime_${scala.binary.version}</artifactId>
 			<version>${flink.version}</version>
+			<scope>${flink.scope}</scope>
 		</dependency>
 
 
@@ -295,5 +304,21 @@
 			</plugins>
 		</pluginManagement>
 	</build>
+
+	<profiles>
+
+		<profile>
+			<id>softnet</id>
+
+			<properties>
+				<flink.version>1.10.0</flink.version>
+				<scala.binary.version>2.12</scala.binary.version>
+				<flink.scope>provided</flink.scope>
+				<java.version>1.8</java.version>
+			</properties>
+
+		</profile>
+
+	</profiles>
 
 </project>

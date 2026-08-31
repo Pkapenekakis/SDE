@@ -388,16 +388,12 @@ public class Run {
 		DataStream<Estimation> onePassRequestFeedback = onePassPhaseOneFeedback
 				.union(onePassCoordinatorRequestOutput);
 
-		onePassRequestFeedback
-				.addSink(pRequest.getProducer())
-				.name("ONEPASS_REQUEST_TOPIC_FEEDBACK");
+		onePassRequestFeedback.addSink(pRequest.getProducer()).name("ONEPASS_REQUEST_TOPIC_FEEDBACK").setParallelism(1);
 
 		/*
 		 * Readiness/status events stay in estimationTopic.
 		 */
-		onePassCoordinatorEstimationOutput
-				.addSink(kp.getProducer())
-				.name("ONEPASS_COORDINATOR_OUTPUT");
+		onePassCoordinatorEstimationOutput.addSink(kp.getProducer()).name("ONEPASS_COORDINATOR_OUTPUT");
 
 		env.execute("Streaming SDE");
 
@@ -583,7 +579,7 @@ public class Run {
 			kafkaDataInputTopic = "dataTopic";
 			kafkaRequestInputTopic = "requestTopic";
 			//kafkaRequestInputTopic = "Rq_FAN";
-			parallelism = 8;
+			parallelism = 4;
 			//parallelism2 = 4;
 			//kafkaBrokersList = "clu02.softnet.tuc.gr:6667,clu03.softnet.tuc.gr:6667,clu04.softnet.tuc.gr:6667,clu06.softnet.tuc.gr:6667";
 			//kafkaBrokersList = "45.10.26.123:19092";

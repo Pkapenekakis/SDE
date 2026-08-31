@@ -218,7 +218,7 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
             globalPhaseOneResult.put("activeAlias", activeAlias == null ? "" : activeAlias);
             globalPhaseOneResult.put("activeEdgeId", activeEdgeId == null ? "" : activeEdgeId);
             globalPhaseOneResult.put("seenTuplesByAlias", new LinkedHashMap<String, Long>(mergedSeenTuplesByAlias));
-            globalPhaseOneResult.put("edgeIndexes", deepCopyEdgeIndexes());
+            globalPhaseOneResult.put("edgeIndexes", mergedEdgeIndexes);
             globalPhaseOneResult.put("edgeSummaries", buildEdgeSummaries());
 
             payload.put("globalPhaseOneResult", globalPhaseOneResult);

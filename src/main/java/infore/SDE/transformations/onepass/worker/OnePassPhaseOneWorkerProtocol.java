@@ -489,8 +489,7 @@ public final class OnePassPhaseOneWorkerProtocol
     }
 
     /** Assembly for one stateRef. */
-    private static final class StateAssembly
-            implements Serializable {
+    private static final class StateAssembly implements Serializable {
 
         private static final long serialVersionUID = 1L;
 
@@ -499,8 +498,7 @@ public final class OnePassPhaseOneWorkerProtocol
         private JsonNode beginPayload;
         private JsonNode commitPayload;
 
-        private final Map<Integer, JsonNode> chunksById =
-                new LinkedHashMap<Integer, JsonNode>();
+        private final Map<Integer, ChunkPart> chunksById = new LinkedHashMap<Integer, ChunkPart>();
 
         private StateAssembly(
                 String stateRef) {
@@ -548,28 +546,68 @@ public final class OnePassPhaseOneWorkerProtocol
                 throw new IllegalArgumentException(
                         "Invalid chunk metadata for stateRef="
                                 + stateRef
-                                + ": "
-                                + payload
                 );
             }
 
-            JsonNode existing =
-                    chunksById.get(chunkId);
+            JsonNode chunkEntries =
+                    payload.get("entries");
 
-            if (existing != null
-                    && !existing.equals(payload)) {
+            if (chunkEntries == null
+                    || !chunkEntries.isArray()) {
 
-                throw new IllegalStateException(
-                        "Conflicting duplicate chunk "
+                throw new IllegalArgumentException(
+                        "Chunk "
                                 + chunkId
-                                + " for stateRef="
+                                + " has no entries array for stateRef="
                                 + stateRef
                 );
             }
 
+            int entryCount =
+                    intField(
+                            payload,
+                            "entryCount",
+                            -1
+                    );
+
+            if (entryCount != chunkEntries.size()) {
+
+                throw new IllegalArgumentException(
+                        "Chunk "
+                                + chunkId
+                                + " entryCount mismatch for stateRef="
+                                + stateRef
+                );
+            }
+
+            ChunkPart existing =
+                    chunksById.get(chunkId);
+
+            if (existing != null) {
+
+                if (!existing.matches(
+                        chunkCount,
+                        entryCount,
+                        chunkEntries)) {
+
+                    throw new IllegalStateException(
+                            "Conflicting duplicate chunk "
+                                    + chunkId
+                                    + " for stateRef="
+                                    + stateRef
+                    );
+                }
+
+                return;
+            }
+
             chunksById.put(
                     chunkId,
-                    payload.deepCopy()
+                    new ChunkPart(
+                            chunkCount,
+                            entryCount,
+                            chunkEntries
+                    )
             );
         }
 
@@ -590,18 +628,11 @@ public final class OnePassPhaseOneWorkerProtocol
         }
 
         private JsonNode tryAssemble() {
-            if (beginPayload == null
-                    || commitPayload == null) {
-
+            if (beginPayload == null || commitPayload == null) {
                 return null;
             }
 
-            int beginChunkCount =
-                    intField(
-                            beginPayload,
-                            "chunkCount",
-                            -1
-                    );
+            int beginChunkCount = intField(beginPayload, "chunkCount", -1);
 
             int commitChunkCount =
                     intField(
@@ -611,14 +642,10 @@ public final class OnePassPhaseOneWorkerProtocol
                     );
 
             if (beginChunkCount <= 0) {
-                throw new IllegalStateException(
-                        "BEGIN has invalid chunkCount for stateRef="
-                                + stateRef
-                );
+                throw new IllegalStateException("BEGIN has invalid chunkCount for stateRef="+ stateRef);
             }
 
-            if (beginChunkCount
-                    != commitChunkCount) {
+            if (beginChunkCount != commitChunkCount) {
 
                 throw new IllegalStateException(
                         "BEGIN/COMMIT chunkCount mismatch for stateRef="
@@ -630,32 +657,24 @@ public final class OnePassPhaseOneWorkerProtocol
                 );
             }
 
-            if (chunksById.size()
-                    < beginChunkCount) {
+            if (chunksById.size() < beginChunkCount) {
 
                 return null;
             }
 
-            ArrayNode entries =
-                    MAPPER.createArrayNode();
+            ArrayNode entries = MAPPER.createArrayNode();
 
             for (int chunkId = 0;
                  chunkId < beginChunkCount;
                  chunkId++) {
 
-                JsonNode chunk =
-                        chunksById.get(chunkId);
+                ChunkPart chunk = chunksById.get(chunkId);
 
                 if (chunk == null) {
                     return null;
                 }
 
-                int chunkDeclaredCount =
-                        intField(
-                                chunk,
-                                "chunkCount",
-                                -1
-                        );
+                int chunkDeclaredCount = chunk.chunkCount;
 
                 if (chunkDeclaredCount
                         != beginChunkCount) {
@@ -672,8 +691,7 @@ public final class OnePassPhaseOneWorkerProtocol
                     );
                 }
 
-                JsonNode chunkEntries =
-                        chunk.get("entries");
+                JsonNode chunkEntries = chunk.entries;
 
                 if (chunkEntries == null
                         || !chunkEntries.isArray()) {
@@ -686,12 +704,7 @@ public final class OnePassPhaseOneWorkerProtocol
                     );
                 }
 
-                int declaredEntryCount =
-                        intField(
-                                chunk,
-                                "entryCount",
-                                -1
-                        );
+                int declaredEntryCount = chunk.entryCount;
 
                 if (declaredEntryCount
                         != chunkEntries.size()) {
@@ -704,12 +717,8 @@ public final class OnePassPhaseOneWorkerProtocol
                     );
                 }
 
-                for (JsonNode entry
-                        : chunkEntries) {
-
-                    entries.add(
-                            entry.deepCopy()
-                    );
+                for (JsonNode entry : chunkEntries) {
+                    entries.add(entry);
                 }
             }
 
@@ -770,10 +779,7 @@ public final class OnePassPhaseOneWorkerProtocol
                 );
             }
 
-            String reconstructedChecksum =
-                    sha256Hex(
-                            entries.toString()
-                    );
+            String reconstructedChecksum = sha256JsonArray(entries);
 
             if (!beginChecksum.equals(
                     reconstructedChecksum)) {
@@ -855,5 +861,116 @@ public final class OnePassPhaseOneWorkerProtocol
                 );
             }
         }
+        private static final class ChunkPart
+                implements Serializable {
+
+            private static final long serialVersionUID = 1L;
+
+            private final int chunkCount;
+            private final int entryCount;
+            private final JsonNode entries;
+
+            private ChunkPart(
+                    int chunkCount,
+                    int entryCount,
+                    JsonNode entries) {
+
+                this.chunkCount = chunkCount;
+                this.entryCount = entryCount;
+
+                /*
+                 * Retain the existing JsonNode.
+                 *
+                 * The Request payload is not mutated after delivery, so there
+                 * is no reason to deep-copy hundreds/thousands of entry nodes.
+                 */
+                this.entries = entries;
+            }
+
+            private boolean matches(
+                    int otherChunkCount,
+                    int otherEntryCount,
+                    JsonNode otherEntries) {
+
+                return chunkCount == otherChunkCount
+                        && entryCount == otherEntryCount
+                        && entries.equals(otherEntries);
+            }
+        }
+    }
+
+    private static String sha256JsonArray(
+            ArrayNode entries) {
+
+        try {
+
+            MessageDigest digest =
+                    MessageDigest.getInstance(
+                            "SHA-256"
+                    );
+
+            digest.update(
+                    (byte) '['
+            );
+
+            boolean first = true;
+
+            for (JsonNode entry : entries) {
+
+                if (!first) {
+                    digest.update(
+                            (byte) ','
+                    );
+                }
+
+                first = false;
+
+                byte[] entryBytes =
+                        entry.toString()
+                                .getBytes(
+                                        StandardCharsets.UTF_8
+                                );
+
+                digest.update(
+                        entryBytes
+                );
+            }
+
+            digest.update(
+                    (byte) ']'
+            );
+
+            return toHex(
+                    digest.digest()
+            );
+
+        } catch (Exception exception) {
+
+            throw new IllegalStateException(
+                    "Could not calculate SHA-256 checksum",
+                    exception
+            );
+        }
+    }
+
+    private static String toHex(
+            byte[] hash) {
+
+        StringBuilder out =
+                new StringBuilder(
+                        hash.length * 2
+                );
+
+        for (byte b : hash) {
+
+            out.append(
+                    String.format(
+                            "%02x",
+                            b & 0xff
+                    )
+            );
+        }
+
+        return out.toString();
     }
 }
