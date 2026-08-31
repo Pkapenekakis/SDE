@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Datapoint;
 import infore.SDE.messages.Request;
-import infore.SDE.transformations.onepass.RoundRobinDataRouterCoFlatMap;
+import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
 import org.apache.flink.util.Collector;
 import org.junit.Test;
 
@@ -25,8 +25,8 @@ public class OnePassEndAliasRouterTest {
     public void shouldBroadcastEndAliasToEveryLogicalWorker()
             throws Exception {
 
-        RoundRobinDataRouterCoFlatMap router =
-                new RoundRobinDataRouterCoFlatMap();
+        OnePassDataRouterCoFlatMap router =
+                new OnePassDataRouterCoFlatMap();
 
         DatapointCollector out =
                 new DatapointCollector();

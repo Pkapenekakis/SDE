@@ -71,9 +71,11 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String TEST_TPCH_DIR = "/home/vboxuser/Desktop/Thesis/tpch-data/sf1";
     private static final String PHASE1_BENCHMARK_CSV_PATH =
             "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_benchmark.csv";
+
     */
 
     //softnet cluster Test variables
+
     private static final String BOOTSTRAP_SERVERS = "clu02.softnet.tuc.gr:6667," + "clu03.softnet.tuc.gr:6667,"
             + "clu04.softnet.tuc.gr:6667," + "clu06.softnet.tuc.gr:6667";
     private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
@@ -84,7 +86,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String PHASE1_BENCHMARK_CSV_PATH = "/home/pkapenekakis/onepass/results/" +
             "onepass_multiworker_phase1_benchmark.csv";
 
-    private static final int REQUEST_TOPIC_PARTITIONS = 8;
+
+
+    private static final int REQUEST_TOPIC_PARTITIONS = 4;
 
     private static final String TEST_ONEPASS_SQL =
             "SELECT * FROM wq3_alias WEIGHTED BY (" +
@@ -100,7 +104,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final int REQUEST_ADD = 1;
     private static final int REQUEST_UPDATE = 7;
 
-    private static final int EXPECTED_WORKERS = 8;
+    private static final int EXPECTED_WORKERS = 4;
     private static final long TIMEOUT_MS = 30L * 60L * 1000L;
 
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;

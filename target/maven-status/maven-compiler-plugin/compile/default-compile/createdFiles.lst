@@ -8,6 +8,7 @@ infore/SDE/experiments/RunSIMTest$4.class
 infore/SDE/experiments/RUNAISTest$3.class
 infore/SDE/synopses/OnePassSampler/PhaseOne/TestOnePassFixtures.class
 infore/SDE/Run$6.class
+infore/SDE/transformations/onepass/OnePassDataRouterCoFlatMap.class
 infore/SDE/synopses/Bloomfilter.class
 infore/SDE/MultySDE$4.class
 infore/SDE/synopses/OnePassSampler/PhaseTwo/OnePassRootSampleResult.class
@@ -119,6 +120,7 @@ infore/SDE/reduceFunctions/TopKReduce.class
 infore/SDE/transformations/oldSDEcoFlatMap$2.class
 infore/SDE/synopses/windowQuantiles.class
 infore/SDE/experiments/RunTests.class
+infore/SDE/transformations/onepass/OnePassDataRouterCoFlatMap$RoutingMode.class
 infore/SDE/synopses/ISWoR.class
 infore/SDE/messages/Onepass/DatasetConfig.class
 infore/SDE/synopses/WDFTSynopsis.class
@@ -246,7 +248,6 @@ infore/SDE/transformations/dataRouterCoFlatMap_2$1.class
 infore/SDE/transformations/onepass/OnePassTupleExtractor.class
 infore/SDE/synopses/MaritimeSketch.class
 infore/SDE/producersForTesting/sendFINTest.class
-infore/SDE/transformations/onepass/RoundRobinDataRouterCoFlatMap.class
 infore/SDE/Run$1.class
 infore/SDE/transformations/onepass/coordinator/OnePassCoordinatorOperator.class
 infore/SDE/transformations/ReduceFlatMap.class

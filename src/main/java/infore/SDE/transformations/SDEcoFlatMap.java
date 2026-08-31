@@ -30,8 +30,6 @@ import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Request;
 import infore.SDE.messages.Datapoint;
 
-import static infore.SDE.transformations.onepass.RoundRobinDataRouterCoFlatMap.isOnePassEndAlias;
-
 public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Estimation> {
 
 	private static final long serialVersionUID = 1L;

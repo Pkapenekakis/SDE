@@ -2,25 +2,19 @@ package infore.SDE;
 
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import infore.SDE.messages.Datapoint;
 import infore.SDE.sources.kafkaProducerEstimation;
 import infore.SDE.sources.kafkaStringConsumer;
 
-import infore.SDE.sources.kafkaStringConsumer_Earliest;
 import infore.SDE.transformations.*;
-import infore.SDE.transformations.onepass.RoundRobinDataRouterCoFlatMap;
+import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
 import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
 import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.java.functions.KeySelector;
-import org.apache.flink.streaming.api.collector.selector.OutputSelector;
 import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.datastream.KeyedStream;
-import org.apache.flink.streaming.api.datastream.SplitStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Request;
@@ -106,7 +100,7 @@ public class RunOnepass {
          *   baseKey -> baseKey_2_KEYED_0, baseKey_2_KEYED_1, ...
          */
         DataStream<Datapoint> routedDataStream = dataStream.connect(RQ_Stream)
-                .flatMap(new RoundRobinDataRouterCoFlatMap()).name("ONEPASS_ROUND_ROBIN_DATA_ROUTER");
+                .flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_ROUND_ROBIN_DATA_ROUTER");
 
         /*
          * Force routed data to the intended physical worker.
@@ -129,7 +123,7 @@ public class RunOnepass {
                         .flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
 
         DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
-                .flatMap(new RoundRobinDataRouterCoFlatMap()).name("ONEPASS_ROUND_ROBIN_DATA_ROUTER")
+                .flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_ROUND_ROBIN_DATA_ROUTER")
                 .keyBy((KeySelector<Datapoint, String>) Datapoint::getKey);
 
         /*
