@@ -1,9 +1,7 @@
 package infore.SDE.synopses.OnePassSampler;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
-import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneState;
-import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassWeightEvaluator;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.*;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
@@ -172,13 +170,10 @@ public final class OnePassSamplerSynopsis implements Serializable {
      */
     public OnePassPhaseOneResult finishPhaseOne() {
         if (phase != Phase.PHASE_1) {
-            throw new IllegalStateException(
-                    "finishPhaseOne() is only valid during PHASE_1. Current phase: "
-                            + phase
-            );
+            throw new IllegalStateException("finishPhaseOne() is only valid during PHASE_1. Current phase: " + phase);
         }
 
-        this.phaseOneResult = phaseOneState.exportResult();
+        //this.phaseOneResult = phaseOneState.exportResult();
         this.phaseTwoState = new OnePassPhaseTwoState(phaseOneResult);
         this.phase = Phase.PHASE_2;
 
@@ -468,16 +463,6 @@ public final class OnePassSamplerSynopsis implements Serializable {
         phaseThreeState.installGlobalAliasSelections(alias, selectionsNode);
     }
 
-    public OnePassPhaseOneResult exportLocalPhaseOneResult() {
-
-        if (phase != Phase.PHASE_1) {
-            throw new IllegalStateException("exportLocalPhaseOneResult() is only valid during PHASE_1. "
-                            + "Current phase: " + phase);
-        }
-
-        return phaseOneState.exportResult();
-    }
-
     public OnePassPhaseOneResult exportLocalP1ResultForDistMerge(String activeAlias, String activeEdgeId,
                                                                  boolean includeStableState) {
 
@@ -487,5 +472,32 @@ public final class OnePassSamplerSynopsis implements Serializable {
         }
 
         return phaseOneState.exportForDistributedMerge(activeAlias, activeEdgeId, includeStableState);
+    }
+
+    public OnePassPhaseOneContribution computePhaseOneContribution(Object payload) {
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException(
+                    "computePhaseOneContribution() is only valid during PHASE_1. Current phase: " + phase);
+        }
+
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+        return phaseOneState.computeContribution(tuple);
+    }
+
+    public void applyPhaseOneContribution(String edgeId, JoinValue joinKey, double delta) {
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException(
+                    "applyPhaseOneContribution() is only valid during PHASE_1. Current phase: " + phase);
+        }
+
+        phaseOneState.applyContribution(edgeId, joinKey, delta);
+    }
+
+    public Map<String, Object> getLocalPhaseOneEdgeSummary(String edgeId) {
+        return phaseOneState.localEdgeSummary(edgeId);
+    }
+
+    public long getLocalPhaseOneSeenTupleCount(String alias) {
+        return phaseOneState.getSeenTupleCount(alias);
     }
 }

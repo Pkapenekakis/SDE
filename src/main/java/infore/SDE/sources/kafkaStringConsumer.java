@@ -20,6 +20,22 @@ public class kafkaStringConsumer {
 
     }
 
+    public kafkaStringConsumer(String server, String topic, boolean readCommitted) {
+        Properties properties = new Properties();
+        properties.setProperty("bootstrap.servers", server);
+        properties.setProperty("group.id", "test");
+
+        if (readCommitted) {
+            properties.setProperty("isolation.level", "read_committed");
+        }
+
+        fc = (FlinkKafkaConsumer<String>) new FlinkKafkaConsumer<>(
+                topic,
+                new SimpleStringSchema(),
+                properties
+        );
+    }
+
     public void cancel() {
 
         fc.cancel();

@@ -28,6 +28,16 @@ public final class OnePassReduceFunctionFactory {
             );
         }
 
+        if ("LOCAL_PHASE1_SHARD_READY".equals(type) || value.getRequestID() == 76) {
+            return new OnePassPhaseOneReadyReduceFunction(
+                    value.getNoOfP(),
+                    0,
+                    value.getParam(),
+                    value.getSynopsisID(),
+                    value.getRequestID()
+            );
+        }
+
         if ("LOCAL_PHASE2_ROOT_SUMMARY".equals(type) || value.getRequestID() == 82) {
             return new OnePassSampleReduceFunction(
                     value.getNoOfP(),

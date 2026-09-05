@@ -18,6 +18,8 @@ import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleCandidate;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.WeightedReservoirEntry;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleInstance;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneContribution;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 
 import java.util.*;
 
@@ -121,7 +123,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             alias = lifecycle.getPhaseThreeActiveAlias().trim();
         }
 
-        if (alias == null || alias.trim().isEmpty()) {
+        if (alias.trim().isEmpty()) {
             alias = "unknown";
         }
 
@@ -615,16 +617,6 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
     @Override
     public Synopsis merge(Synopsis other) {
-        /*
-         * Parallel merge is intentionally not implemented yet.
-         *
-         * Multiworker One-pass* will need explicit global barriers:
-         *
-         *   Phase 1 local states -> global merged Phase 1 result
-         *   Phase 2 local samples -> global merged root sample
-         *
-         * For now the project constraint remains noOfP = 1.
-         */
         return null;
     }
 
@@ -996,6 +988,33 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         String last = order.get(order.size() - 1);
 
         return alias.trim().equals(last);
+    }
+
+    /**
+     * Distributed Phase-1 entry point. The returned contribution is already fully
+     * calculated; only ownership / transfer remains to be decided by SDE.
+     */
+    public OnePassPhaseOneContribution computePhaseOneContribution(Object payload) {
+        String profileKey = profileKeyForPayload(payload);
+        long startNanos = System.nanoTime();
+
+        try {
+            return lifecycle.computePhaseOneContribution(payload);
+        } finally {
+            recordAddProfile(profileKey, System.nanoTime() - startNanos);
+        }
+    }
+
+    public void applyPhaseOneContribution(String edgeId, JoinValue joinKey, double delta) {
+        lifecycle.applyPhaseOneContribution(edgeId, joinKey, delta);
+    }
+
+    public Map<String, Object> getLocalPhaseOneEdgeSummary(String edgeId) {
+        return lifecycle.getLocalPhaseOneEdgeSummary(edgeId);
+    }
+
+    public long getLocalPhaseOneSeenTupleCount(String alias) {
+        return lifecycle.getLocalPhaseOneSeenTupleCount(alias);
     }
 
     public Estimation buildLocalPhaseTwoRootSummaryEstimation(

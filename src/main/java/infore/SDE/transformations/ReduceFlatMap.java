@@ -135,21 +135,19 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
     private void decorateOnePassReducedEstimation(Estimation value) {
         String[] param = value.getParam();
 
-        if (value.getRequestID() == 72 && param != null && param.length > 0 && "LOCAL_PHASE1_RESULT".equals(param[0])) {
+        if (value.getRequestID() == 76 && param != null && param.length > 0 &&
+                "LOCAL_PHASE1_SHARD_READY".equals(param[0])) {
 
-            String resultId = "PHASE1_RESULT_" + value.getUID();
+            String resultId = param.length > 1 ? param[1] : ("PHASE1_" + value.getUID());
+            String alias = param.length > 2 ? param[2] : "";
+            String epoch = param.length > 3 ? param[3] : "";
 
-            if (param.length > 1 && param[1] != null && !param[1].trim().isEmpty()) {
-                resultId = param[1].trim();
-            }
+            String globalKey = value.getUID() + "_PHASE1_READY_" + resultId;
 
-            String globalKey = value.getUID() + "_PHASE1_" + resultId + "_GLOBAL";
-
-            value.setRequestID(73);
+            value.setRequestID(77);
             value.setEstimationkey(globalKey);
             value.setKey(globalKey);
-
-            value.setParam(new String[] {"GLOBAL_PHASE1_RESULT", resultId, "PHASE1", "", "",
+            value.setParam(new String[] {"GLOBAL_PHASE1_ALIAS_READY", resultId, alias, epoch,
                     Integer.toString(value.getNoOfP())});
         }
 

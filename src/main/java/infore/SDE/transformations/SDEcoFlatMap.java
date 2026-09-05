@@ -14,8 +14,11 @@ import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.synopses.OnePassSampler.OnePassSamplerSdeSynopsis;
 import infore.SDE.synopses.OnePassSampler.OnePassSamplerSynopsis;
 import infore.SDE.synopses.OnePassSampler.OnePassTuple;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOne;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneContribution;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
+import infore.SDE.transformations.onepass.OnePassShardOwnership;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 import infore.SDE.transformations.onepass.worker.OnePassPhaseOneWorkerProtocol;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
@@ -29,6 +32,8 @@ import org.apache.flink.util.Collector;
 import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Request;
 import infore.SDE.messages.Datapoint;
+import infore.SDE.transformations.onepass.worker.OnePassPhaseOneTransferBuffer;
+import infore.SDE.transformations.onepass.worker.OnePassPhaseOneCompletionTracker;
 
 public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Estimation> {
 
@@ -56,9 +61,30 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	private static final String ONEPASS_END_ALIAS_TYPE = "END_ALIAS";
 	private final Set<String> processedOnePassEndAliasMarkers = new HashSet<String>();
 
+	private final OnePassPhaseOneTransferBuffer onePassPhaseOneTransferBuffer =
+			new OnePassPhaseOneTransferBuffer();
+
+	private final OnePassPhaseOneCompletionTracker onePassPhaseOneCompletionTracker =
+			new OnePassPhaseOneCompletionTracker();
+
+	private final Map<Integer, Integer> onePassExpectedWorkersByUid =
+			new HashMap<Integer, Integer>();
+
+	private final Map<Integer, String> onePassBaseKeyByUid =
+			new HashMap<Integer, String>();
+
+	private final Map<Integer, Integer> onePassPhaseOneEpochByUid =
+			new HashMap<Integer, Integer>();
+
 	@Override
 	public void flatMap1(Datapoint node, Collector<Estimation> collector) throws JsonProcessingException {
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(node.getKey());
+
+
+		if (isOnePassPhaseOneStateTransfer(node)) {
+			handleOnePassPhaseOneStateTransfer(node, Synopses, collector);
+			return;
+		}
 
 		if (isOnePassGlobalStateChunk(node)) {
 			handleOnePassGlobalStateChunk(node, Synopses, collector);
@@ -89,7 +115,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		if (Synopses != null) {
 			for (Synopsis ski : Synopses) {
 				if (ski instanceof OnePassSamplerSdeSynopsis) {
-					handleOnePassDataTuple((OnePassSamplerSdeSynopsis) ski, node.getValues());
+					handleOnePassDataTuple((OnePassSamplerSdeSynopsis) ski, node.getValues(), collector);
 
 				} else {
 					//Existing synopses keep their original behavior.
@@ -144,6 +170,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 			handleOnePassRemove(rq, Synopses);
 
+			return;
+		}
+
+		if (isOnePassShardedPhaseOneTransitionRequest(rq)) {
+			handleOnePassShardedPhaseOneTransitionRequest(rq, Synopses, collector);
 			return;
 		}
 
@@ -328,6 +359,13 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 				registerOnePassTupleGate((OnePassSamplerSdeSynopsis) sketch);
 
+				int expectedWorkers = rq.getNoOfP() > 0 ? rq.getNoOfP() : 1;
+				String baseKey = OnePassShardOwnership.baseKeyFromWorkerKey(rq.getKey(), expectedWorkers, pId);
+
+				onePassExpectedWorkersByUid.put(rq.getUID(), expectedWorkers);
+				onePassBaseKeyByUid.put(rq.getUID(), baseKey);
+				onePassPhaseOneEpochByUid.put(rq.getUID(), 1);
+
 				tryInstallReadyPhaseOneState(rq, Synopses, collector);
 
 				System.out.println("OnePassSamplerSdeSynopsis added for uid=" + rq.getUID() + ", key=" +
@@ -480,18 +518,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 							int expectedWorkers = rq.getNoOfP() > 0 ? rq.getNoOfP() : actualParallelism;;
 
 							String resultId = resolveOnePassResultId(rq, "PHASE1_RESULT_" + rq.getUID());
-
 							String activeAlias = resolveOnePassPhaseOneAlias(rq);
 
 							Estimation localPhaseOneResult =
-									onePass.buildLocalPhaseOneResultEstimation(
-											rq,
-											pId,
-											expectedWorkers,
-											actualParallelism,
-											resultId,
-											activeAlias
-									);
+									onePass.buildLocalPhaseOneResultEstimation(rq, pId, expectedWorkers,
+											actualParallelism, resultId, activeAlias);
 
 							collector.collect(localPhaseOneResult);
 
@@ -1580,8 +1611,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 	}
 
-	private boolean isOnePassPhaseOneFeedbackRequest(
-			Request request) {
+	private boolean isOnePassPhaseOneFeedbackRequest(Request request) {
 
 		if (request == null) {
 			return false;
@@ -1744,7 +1774,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		onePassTupleBufferGate.registerIfAbsent(uid, firstAlias);
 	}
 
-	private void handleOnePassDataTuple(OnePassSamplerSdeSynopsis onePass, JsonNode payload) {
+	private void handleOnePassDataTuple(
+			OnePassSamplerSdeSynopsis onePass,
+			JsonNode payload,
+			Collector<Estimation> collector) {
 
 		if (onePass == null) {
 			return;
@@ -1752,11 +1785,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		int uid = onePass.getSynopsisID();
 
-		//TODO REMOVE AFTER PHASE 1 IMPLEMENTATION
+		// Keep current Phase 3 behavior until Phase 3 migration.
 		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_3) {
 			onePass.add(payload);
 			return;
 		}
+
 		if (!onePassTupleBufferGate.isRegistered(uid)) {
 			registerOnePassTupleGate(onePass);
 		}
@@ -1764,18 +1798,61 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
 		String alias = tuple.getTable();
 
-		if (onePassTupleBufferGate.isAllowed(uid, alias)) {
-			onePass.add(payload);
+		if (!onePassTupleBufferGate.isAllowed(uid, alias)) {
+			onePassTupleBufferGate.buffer(uid, alias, payload);
 			return;
 		}
 
-		onePassTupleBufferGate.buffer(uid, alias, payload);
+		int expectedWorkers = onePassExpectedWorkersByUid.containsKey(uid)
+				? onePassExpectedWorkersByUid.get(uid)
+				: 1;
 
-		System.out.println("[OnePass BUFFER] uid=" + uid + ", tupleAlias=" + alias
-						+ ", allowedAlias=" + onePassTupleBufferGate.getAllowedAlias(uid)
-						+ ", bufferedForAlias=" + onePassTupleBufferGate.getBufferedCount(uid, alias)
-						+ ", bufferedTotal=" + onePassTupleBufferGate.getBufferedCount(uid)
-						+ ", workerId=" + pId);
+		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_1
+				&& expectedWorkers > 1) {
+
+			processShardedPhaseOneTuple(onePass, payload, collector);
+			return;
+		}
+
+		// Single-worker / not-yet-migrated phases preserve the existing path.
+		onePass.add(payload);
+	}
+
+	private void processShardedPhaseOneTuple(OnePassSamplerSdeSynopsis onePass, JsonNode payload, Collector<Estimation> collector) {
+
+		int uid = onePass.getSynopsisID();
+		int expectedWorkers = onePassExpectedWorkersByUid.get(uid);
+		int epoch = onePassPhaseOneEpochByUid.get(uid);
+		String baseKey = onePassBaseKeyByUid.get(uid);
+
+		OnePassPhaseOneContribution contribution = onePass.computePhaseOneContribution(payload);
+
+		if (contribution == null || contribution.getDelta() == 0.0d) {
+			return;
+		}
+
+		int targetWorker = OnePassShardOwnership.ownerForEdgeKey(
+				contribution.getEdgeId(),
+				contribution.getJoinKey(),
+				expectedWorkers
+		);
+
+		if (targetWorker == pId) {
+			// Local fast path: no Kafka round-trip.
+			onePass.applyPhaseOneContribution(
+					contribution.getEdgeId(),
+					contribution.getJoinKey(),
+					contribution.getDelta()
+			);
+			return;
+		}
+
+		OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+
+		for (Estimation stateMessage : onePassPhaseOneTransferBuffer.addRemoteContribution(uid, baseKey,
+				expectedWorkers, pId, targetWorker, epoch, tuple.getTable(), contribution)) {
+			collector.collect(stateMessage);
+		}
 	}
 
 	private void applyActiveOnePassTransitionIfAvailable(int uid, ArrayList<Synopsis> synopses,
@@ -1836,7 +1913,6 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		JsonNode values = node.getValues();
 
 		int uid = intField(values, "uid", -1);
-
 		String phase = textField(values, "phase", "");
 		String alias = textField(values, "alias", "");
 		String resultId = textField(values, "resultId", "");
@@ -1913,17 +1989,14 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		 */
 		onePassTupleBufferGate.sealAlias(uid, alias);
 
-		int actualParallelism = 1;
-		try {
-			actualParallelism = getRuntimeContext().getNumberOfParallelSubtasks();
-		} catch (Exception ignored) {
-			actualParallelism = 1;
-		}
-
+		int actualParallelism = getRuntimeContext().getNumberOfParallelSubtasks();
 		int expectedWorkers = requestedExpectedWorkers > 0 ? requestedExpectedWorkers : actualParallelism;
 
-		if (expectedWorkers <= 0) {
-			expectedWorkers = 1;
+		if (expectedWorkers > 1) {
+			handleShardedPhaseOneEndAlias(node, onePass, uid, alias, resultId, nextCommand, nextAlias,
+					expectedWorkers, collector);
+			processedOnePassEndAliasMarkers.add(markerKey);
+			return;
 		}
 
 		Estimation localPhaseOneResult = onePass.buildLocalPhaseOneResultEstimation(node.getKey(), uid, pId,
@@ -2052,7 +2125,287 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		//5. Remove END_ALIAS deduplication state.
         processedOnePassEndAliasMarkers.removeIf(key -> key.startsWith(pendingPrefix));
 
+		onePassPhaseOneTransferBuffer.clearUid(uid);
+		onePassPhaseOneCompletionTracker.clearUid(uid);
+		onePassExpectedWorkersByUid.remove(uid);
+		onePassBaseKeyByUid.remove(uid);
+		onePassPhaseOneEpochByUid.remove(uid);
+
 		System.out.println("[OnePass REMOVE] worker-local state cleared." + " uid=" + uid + ", workerId=" + pId +
 				", key=" + request.getKey());
+	}
+
+	private boolean isOnePassPhaseOneStateTransfer(Datapoint node) {
+		if (node == null || node.getValues() == null || node.getValues().isNull()) {
+			return false;
+		}
+
+		String type = textField(node.getValues(), "type", "");
+		String protocol = textField(node.getValues(), "protocol", "");
+
+		return OnePassPhaseOneTransferBuffer.PROTOCOL.equals(protocol)
+				&& (OnePassPhaseOneTransferBuffer.TYPE_SHARD_BATCH.equals(type)
+				|| OnePassPhaseOneTransferBuffer.TYPE_SOURCE_DONE.equals(type));
+	}
+
+	private void handleOnePassPhaseOneStateTransfer(Datapoint node, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+
+		JsonNode payload = node.getValues();
+
+		int uid = intField(payload, "uid", -1);
+		int epoch = intField(payload, "epoch", -1);
+		String alias = textField(payload, "alias", "");
+		int sourceWorker = intField(payload, "sourceWorker", -1);
+		int targetWorker = intField(payload, "targetWorker", -1);
+		int expectedWorkers = intField(payload, "expectedWorkers", 0);
+		String type = textField(payload, "type", "");
+
+		if (targetWorker != pId) {
+			throw new IllegalStateException("Phase-1 state message reached wrong worker. target=" +
+					targetWorker + ", actual=" + pId + ", payload=" + payload);
+		}
+
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
+		if (onePass == null) {
+			throw new IllegalStateException("Phase-1 state message reached worker before OnePass synopsis exists. uid=" +
+					uid + ", worker=" + pId);
+		}
+
+		if (OnePassPhaseOneTransferBuffer.TYPE_SHARD_BATCH.equals(type)) {
+			int sequence = intField(payload, "sequence", -1);
+
+			boolean firstDelivery = onePassPhaseOneCompletionTracker.acceptBatch(
+					uid, epoch, alias, expectedWorkers, sourceWorker, sequence
+			);
+
+			if (!firstDelivery) {
+				return;
+			}
+
+			String edgeId = textField(payload, "edgeId", "");
+			JsonNode entries = payload.get("entries");
+
+			if (entries == null || !entries.isArray()) {
+				throw new IllegalStateException("SHARD_BATCH has no entries array: " + payload);
+			}
+
+			for (JsonNode entry : entries) {
+				JsonNode partsNode = entry.get("joinKeyParts");
+				if (partsNode == null || !partsNode.isArray() || partsNode.size() == 0) {
+					throw new IllegalStateException("Invalid SHARD_BATCH joinKeyParts: " + entry);
+				}
+
+				List<String> parts = new ArrayList<String>();
+				for (JsonNode part : partsNode) {
+					parts.add(part.asText());
+				}
+
+				double delta = entry.get("delta").asDouble(0.0d);
+
+				onePass.applyPhaseOneContribution(
+						edgeId,
+						new JoinValue(parts),
+						delta
+				);
+			}
+		}
+
+		else if (OnePassPhaseOneTransferBuffer.TYPE_SOURCE_DONE.equals(type)) {
+			int lastSequence = intField(payload, "lastSequence", -1);
+
+			onePassPhaseOneCompletionTracker.acceptSourceDone(
+					uid, epoch, alias, expectedWorkers, sourceWorker, lastSequence
+			);
+		}
+
+		maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
+	}
+
+	private void handleShardedPhaseOneEndAlias(
+			Datapoint node,
+			OnePassSamplerSdeSynopsis onePass,
+			int uid,
+			String alias,
+			String resultId,
+			String nextCommand,
+			String nextAlias,
+			int expectedWorkers,
+			Collector<Estimation> collector) {
+
+		int epoch = intField(node.getValues(), "epoch", -1);
+		if (epoch <= 0) {
+			throw new IllegalStateException("Sharded END_ALIAS requires epoch > 0: " + node.getValues());
+		}
+
+		Integer expectedEpoch = onePassPhaseOneEpochByUid.get(uid);
+		if (expectedEpoch == null || expectedEpoch.intValue() != epoch) {
+			throw new IllegalStateException("END_ALIAS epoch mismatch. uid=" + uid + ", expected=" + expectedEpoch +
+					", received=" + epoch);
+		}
+
+		onePassTupleBufferGate.sealAlias(uid, alias);
+
+		// 1) Every remaining remote contribution must be emitted before SOURCE_DONE.
+		for (Estimation batch : onePassPhaseOneTransferBuffer.flushAlias(uid, epoch, alias)) {
+			collector.collect(batch);
+		}
+
+		// 2) Tiny per-destination completion markers.
+		for (Estimation done : onePassPhaseOneTransferBuffer.buildSourceDoneMessages(uid, onePassBaseKeyByUid.get(uid),
+				expectedWorkers, pId, epoch, alias)) {
+			collector.collect(done);
+		}
+
+		CompiledOnePassPlan.DirectedJoinEdge parentEdge =
+				onePass.getPlan().getParentEdge(alias);
+		String activeEdgeId = parentEdge == null ? "" : parentEdge.getEdgeId();
+
+		Map<String, Object> summary = onePass.getLocalPhaseOneEdgeSummary(activeEdgeId);
+		int localKeyCount = ((Number) summary.get("numberOfKeys")).intValue();
+		double localTotalWeight = ((Number) summary.get("totalWeight")).doubleValue();
+		long localSeenTuples = onePass.getLocalPhaseOneSeenTupleCount(alias);
+
+		// 3) Local source is done without Kafka.
+		onePassPhaseOneCompletionTracker.acceptLocalEndAlias(
+				uid,
+				epoch,
+				alias,
+				expectedWorkers,
+				pId,
+				resultId,
+				nextCommand,
+				nextAlias,
+				onePassBaseKeyByUid.get(uid),
+				activeEdgeId,
+				localKeyCount,
+				localTotalWeight,
+				localSeenTuples
+		);
+
+		maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
+	}
+
+	private void maybeEmitLocalPhaseOneShardReady(int uid, int epoch, String alias, OnePassSamplerSdeSynopsis onePass,
+												  Collector<Estimation> collector) {
+
+		OnePassPhaseOneCompletionTracker.ReadySnapshot ready =
+				onePassPhaseOneCompletionTracker.readySnapshotIfComplete(uid, epoch, alias);
+
+		if (ready == null) {
+			return;
+		}
+
+		Map<String, Object> payload = new LinkedHashMap<String, Object>();
+		payload.put("type", "LOCAL_PHASE1_SHARD_READY");
+		payload.put("protocol", "SHARDED_PHASE1_V1");
+		payload.put("phase", "PHASE1");
+		payload.put("uid", uid);
+		payload.put("workerId", pId);
+		payload.put("expectedWorkers", ready.expectedWorkers);
+		payload.put("epoch", ready.epoch);
+		payload.put("alias", ready.alias);
+		payload.put("resultId", ready.resultId);
+		payload.put("nextCommand", ready.nextCommand);
+		payload.put("nextAlias", ready.nextAlias);
+		payload.put("baseKey", ready.baseKey);
+		payload.put("activeEdgeId", ready.activeEdgeId);
+		payload.put("localKeyCount", ready.localKeyCount);
+		payload.put("localTotalWeight", ready.localTotalWeight);
+		payload.put("localSeenTuples", ready.localSeenTuples);
+
+		String json;
+		try {
+			json = MAPPER.writeValueAsString(payload);
+		} catch (Exception e) {
+			throw new IllegalStateException("Could not serialize LOCAL_PHASE1_SHARD_READY", e);
+		}
+
+		String reduceKey = uid + "_PHASE1_READY_" + ready.resultId;
+
+		collector.collect(new Estimation(uid, reduceKey, 76, 30, reduceKey, json,
+				new String[] {
+						"LOCAL_PHASE1_SHARD_READY",
+						ready.resultId,
+						ready.alias,
+						Integer.toString(ready.epoch),
+						Integer.toString(pId),
+						Integer.toString(ready.expectedWorkers)
+				},
+				ready.expectedWorkers
+		));
+	}
+
+	private boolean isOnePassShardedPhaseOneTransitionRequest(Request request) {
+		if (request == null
+				|| request.getSynopsisID() != ONEPASS_SYNOPSIS_ID
+				|| request.getRequestID() != 7) {
+			return false;
+		}
+
+		JsonNode payload = request.getParameters();
+		if (payload == null || payload.isNull()) {
+			return false;
+		}
+
+		if (!"SHARDED_PHASE1_V1".equals(textField(payload, "protocol", ""))) {
+			return false;
+		}
+
+		String type = textField(payload, "type", "");
+		return "START_NEXT_ALIAS".equals(type) || "START_PHASE_2".equals(type);
+	}
+
+	private void handleOnePassShardedPhaseOneTransitionRequest(
+			Request request,
+			ArrayList<Synopsis> synopses,
+			Collector<Estimation> collector) {
+
+		JsonNode payload = request.getParameters();
+		String command = textField(payload, "type", "");
+		int uid = request.getUID();
+		int nextEpoch = intField(payload, "epoch", -1);
+		String nextAlias = textField(payload, "nextAlias", "");
+
+		Integer currentEpoch = onePassPhaseOneEpochByUid.get(uid);
+		int completedEpoch = intField(payload, "completedEpoch", -1);
+
+		if (currentEpoch == null || currentEpoch.intValue() != completedEpoch) {
+			throw new IllegalStateException(
+					"Phase-1 transition epoch mismatch. uid=" + uid
+							+ ", current=" + currentEpoch
+							+ ", completed=" + completedEpoch);
+		}
+
+		if ("START_NEXT_ALIAS".equals(command)) {
+			onePassPhaseOneEpochByUid.put(uid, nextEpoch);
+
+			List<JsonNode> released = onePassTupleBufferGate.activateAliasAndDrain(uid, nextAlias);
+			OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
+
+			for (JsonNode buffered : released) {
+				processShardedPhaseOneTuple(onePass, buffered, collector);
+			}
+
+			processPendingOnePassEndAlias(uid, nextAlias, synopses, collector);
+			return;
+		}
+
+		if ("START_PHASE_2".equals(command)) {
+			/*
+			 * IMPORTANT: Phase 2 is intentionally not activated in this Phase-1
+			 * patch. The current Phase 2 assumes every worker holds a complete
+			 * replicated Phase-1 result, which is no longer true.
+			 *
+			 * Keep the previous alias sealed, record the epoch, and stop the
+			 * Phase-1 benchmark here. Phase 2 will get its own sharded read path.
+			 */
+			onePassPhaseOneEpochByUid.put(uid, nextEpoch);
+			System.out.println(
+					"[OnePass SHARDED PHASE1 COMPLETE] uid=" + uid
+							+ ", worker=" + pId
+							+ ", nextAlias=" + nextAlias
+							+ ". Phase 2 activation deferred until Phase-2 migration."
+			);
+		}
 	}
 }

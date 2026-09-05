@@ -25,9 +25,8 @@ import org.apache.flink.streaming.api.datastream.SplitStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Request;
-import infore.SDE.transformations.onepass.OnePassPhaseOneRequestSplitter;
-import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorFilter;
-
+import infore.SDE.transformations.onepass.OnePassStateTransferToJson;
+import infore.SDE.transformations.onepass.OnePassPhaseOneTransitionMapper;
 
 /**
  * <br>
@@ -53,7 +52,7 @@ public class Run {
 	private static String kafkaBrokersList;
 	private static int parallelism;
 	private static String kafkaOutputTopic;
-	private static String kafkaOnePassGlobalStateTopic;
+	private static String kafkaOnePassStateTopic;
 	private static OnePassDataRouterCoFlatMap.RoutingMode onePassRoutingMode =
 			OnePassDataRouterCoFlatMap.RoutingMode.ROUND_ROBIN;
 
@@ -76,12 +75,13 @@ public class Run {
 		initializeParameters(args);
 		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 		env.setParallelism(parallelism);
-		kafkaStringConsumer kc = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic);
+		//kafkaStringConsumer kc = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic);
+		kafkaStringConsumer kc = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic, true);
 		kafkaStringConsumer requests = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic);
 		kafkaProducerEstimation kp = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
-		kafkaStringProducer onePassGlobalStateKp = new kafkaStringProducer(kafkaBrokersList, kafkaOnePassGlobalStateTopic);
+		kafkaStringProducer onePassGlobalStateKp = new kafkaStringProducer(kafkaBrokersList, kafkaOnePassStateTopic);
 
-		kafkaStringConsumer globalStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassGlobalStateTopic);
+		kafkaStringConsumer globalStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic);
 		/*
 		 * Used only for coordinator feedback commands.
 		 * requestID == 7 will be serialized as a Request by kafkaProducerEstimation.
@@ -189,6 +189,30 @@ public class Run {
 				.connect(partitionedSynopsisRequests)
 				.flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
 
+		DataStream<Estimation> onePassStateTransferStream = estimationStream
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						if (value == null || value.getSynopsisID() != 30) {
+							return false;
+						}
+
+						String type = firstParam(value);
+						return value.getRequestID() == 78
+								&& ("SHARD_BATCH".equals(type)
+								|| "SOURCE_DONE".equals(type));
+					}
+				})
+				.name("ONEPASS_STATE_TRANSFER_BRANCH");
+
+		onePassStateTransferStream
+				.map(new OnePassStateTransferToJson())
+				.name("ONEPASS_STATE_TRANSFER_SERIALIZER")
+				.addSink(onePassGlobalStateKp.getProducer())
+				.name("ONEPASS_STATE_TOPIC_OUTPUT");
+
 		/*
 		 * Pre-reduce coordinator input.
 		 *
@@ -222,7 +246,9 @@ public class Run {
 
 					@Override
 					public boolean filter(Estimation value) {
-						return !isOnePassPreReduceCoordinatorMessage(value) && !isOnePassControlAck(value);
+						return !isOnePassPreReduceCoordinatorMessage(value)
+								&& !isOnePassControlAck(value)
+								&& !isOnePassStateTransferMessage(value);
 					}
 				}).name("NORMAL_ESTIMATION_STREAM");
 
@@ -250,6 +276,7 @@ public class Run {
 
 		DataStream<Estimation> finalStream = partialOutputStream.flatMap(new GReduceFlatMap()).setParallelism(1);
 
+		/*
 		DataStream<Estimation> onePassPhaseOneGlobalResults = finalStream.filter(new FilterFunction<Estimation>() {
 			private static final long serialVersionUID = 1L;
 			@Override
@@ -258,10 +285,6 @@ public class Run {
 			}
 		}).name("ONEPASS_PHASE1_GLOBAL_RESULTS");
 
-		/*
-		 * New OnePass-only Phase 1 feedback path.
-		 * Generic SDE estimations do not enter this branch.
-		 */
 		DataStream<Estimation> onePassPhaseOneStateMessages = onePassPhaseOneGlobalResults
 				.flatMap(new OnePassPhaseOneRequestSplitter())
 				.name("ONEPASS_PHASE1_REQUEST_SPLITTER")
@@ -271,6 +294,8 @@ public class Run {
 				.flatMap(new OnePassCoordinatorFilter())
 				.name("ONEPASS_PHASE1_FEEDBACK_COORDINATOR")
 				.setParallelism(1);
+
+		*/
 
 		SplitStream<Estimation> split_2 = finalStream.split(new OutputSelector<Estimation>() {
 			private static final long serialVersionUID = 1L;
@@ -287,6 +312,25 @@ public class Run {
 				return output;
 			}
 		});
+
+		DataStream<Estimation> onePassPhaseOneAliasReady = finalStream
+				.filter(new FilterFunction<Estimation>() {
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public boolean filter(Estimation value) {
+						return value != null
+								&& value.getSynopsisID() == 30
+								&& value.getRequestID() == 77
+								&& "GLOBAL_PHASE1_ALIAS_READY".equals(firstParam(value));
+					}
+				})
+				.name("ONEPASS_PHASE1_ALIAS_READY");
+
+		DataStream<Estimation> onePassPhaseOneTransitions = onePassPhaseOneAliasReady
+				.flatMap(new OnePassPhaseOneTransitionMapper())
+				.name("ONEPASS_PHASE1_TRANSITION_MAPPER")
+				.setParallelism(1);
 
 		DataStream<Estimation> UR = split_2.select("UR");
 		DataStream<Estimation> E = split_2.select("E");
@@ -385,10 +429,13 @@ public class Run {
 		 * Phase 1 uses the new BEGIN/CHUNK/COMMIT + transition path.
 		 * Phase 2/3 still use requests emitted by OnePassCoordinatorOperator.
 		 */
-		DataStream<Estimation> onePassRequestFeedback = onePassPhaseOneFeedback
+		DataStream<Estimation> onePassRequestFeedback = onePassPhaseOneTransitions
 				.union(onePassCoordinatorRequestOutput);
 
-		onePassRequestFeedback.addSink(pRequest.getProducer()).name("ONEPASS_REQUEST_TOPIC_FEEDBACK").setParallelism(1);
+		onePassRequestFeedback
+				.addSink(pRequest.getProducer())
+				.name("ONEPASS_REQUEST_TOPIC_FEEDBACK")
+				.setParallelism(1);
 
 		/*
 		 * Readiness/status events stay in estimationTopic.
@@ -551,6 +598,15 @@ public class Run {
 		return value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(firstParam(value));
 	}
 
+	private static boolean isOnePassStateTransferMessage(Estimation value) {
+		if (value == null || value.getSynopsisID() != 30 || value.getRequestID() != 78) {
+			return false;
+		}
+
+		String type = firstParam(value);
+		return "SHARD_BATCH".equals(type) || "SOURCE_DONE".equals(type);
+	}
+
 	private static void initializeParameters(String[] args) {
 
 		if (args.length > 4) {
@@ -564,9 +620,9 @@ public class Run {
 			//kafkaBrokersList = "localhost:9092";
 			parallelism = Integer.parseInt(args[4]);
 			if (args.length > 5) {
-				kafkaOnePassGlobalStateTopic = args[5];
+				kafkaOnePassStateTopic = args[5];
 			} else {
-				kafkaOnePassGlobalStateTopic = "globalStateTopic";
+				kafkaOnePassStateTopic = "onepassStateTopic";
 			}
 			if (args.length > 6) {
 				onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.fromString(args[6]
@@ -592,7 +648,7 @@ public class Run {
 			kafkaBrokersList = "localhost:9092";
 			//kafkaBrokersList = "159.69.32.166:9092";
 			kafkaOutputTopic = "estimationTopic";
-			kafkaOnePassGlobalStateTopic = "globalStateTopic";
+			kafkaOnePassStateTopic = "onepassStateTopic";
 			onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
 		}
 	}

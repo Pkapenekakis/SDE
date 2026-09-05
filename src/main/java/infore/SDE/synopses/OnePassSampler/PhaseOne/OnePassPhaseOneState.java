@@ -44,6 +44,19 @@ public class OnePassPhaseOneState implements Serializable {
     }
 
     public void addTuple(OnePassTuple tuple) {
+        OnePassPhaseOneContribution contribution = computeContribution(tuple);
+
+        if (contribution != null) {
+            applyContribution(contribution);
+        }
+    }
+
+    /**
+     * Calculates the Phase-1 contribution but does not decide where it is stored.
+     * Distributed SDE uses this method and then applies the contribution locally
+     * or transfers it to the owner through State Topic.
+     */
+    public OnePassPhaseOneContribution computeContribution(OnePassTuple tuple) {
         if (tuple == null) {
             throw new IllegalArgumentException("tuple must not be null");
         }
@@ -55,79 +68,90 @@ public class OnePassPhaseOneState implements Serializable {
                     "Tuple alias/table '" + alias + "' is not part of compiled plan");
         }
 
-        seenTuplesByAlias.put(alias, seenTuplesByAlias.get(alias) + 1L);
-
         if (plan.isRoot(alias)) {
-            return;
+            throw new IllegalArgumentException(
+                    "Root alias '" + alias + "' must not be processed during Phase 1");
         }
+
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
+
+        if (childEdges.size() > 1) {
+            throw new UnsupportedOperationException(
+                    "Sharded Phase 1 v1 supports at most one child edge per alias. "
+                            + "Alias '" + alias + "' has " + childEdges.size() + " child edges."
+            );
+        }
+
+        seenTuplesByAlias.put(alias, seenTuplesByAlias.get(alias) + 1L);
 
         final double ownWeight = weightEvaluator.evaluate(tuple);
         double continuationWeight = 1.0d;
 
-        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
         for (CompiledOnePassPlan.DirectedJoinEdge childEdge : childEdges) {
-            JoinValue currentTupleAsParentKey = JoinValue.fromTuple(tuple, childEdge.getParentFields()); //Build the lookup key e.g ["o_custkey"]
-            Phase1LinkWeightIndex childIndex = indexByEdgeId.get(childEdge.getEdgeId()); //Gets the child index e.g. B-C
+            JoinValue lookupKey = JoinValue.fromTuple(tuple, childEdge.getParentFields());
+            Phase1LinkWeightIndex childIndex = indexByEdgeId.get(childEdge.getEdgeId());
+
             if (childIndex == null) {
-                throw new IllegalStateException("Missing child index for edge " + childEdge.getEdgeId());
+                throw new IllegalStateException(
+                        "Missing local child index for edge " + childEdge.getEdgeId());
             }
-            continuationWeight *= childIndex.getOrZero(currentTupleAsParentKey);
+
+            continuationWeight *= childIndex.getOrZero(lookupKey);
         }
 
         final double subtreeWeight = ownWeight * continuationWeight;
-        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias); //Gets the parent edge of B e.g. A-B
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias);
         if (parentEdge == null) {
             throw new IllegalStateException(
                     "Non-root alias '" + alias + "' unexpectedly has no parent edge");
         }
 
-        //Build the key for pushing upward (to parent)
-        JoinValue childKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
-        Phase1LinkWeightIndex parentIndex = indexByEdgeId.get(parentEdge.getEdgeId());
-        if (parentIndex == null) {
-            throw new IllegalStateException("Missing parent index for edge " + parentEdge.getEdgeId());
-        }
-        parentIndex.add(childKey, subtreeWeight);
+        JoinValue parentKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
+
+        return new OnePassPhaseOneContribution(
+                parentEdge.getEdgeId(),
+                parentKey,
+                subtreeWeight
+        );
     }
 
-    public Phase1LinkWeightIndex getIndex(String edgeId) {
-        return indexByEdgeId.get(edgeId);
-    }
-
-    public OnePassPhaseOneResult exportResult() {
-        return new OnePassPhaseOneResult(plan, indexByEdgeId, seenTuplesByAlias);
-    }
-
-    public Map<String, Object> debugSnapshot() {
-        return exportResult().toDebugMap();
-    }
-
-    public void mergeFrom(OnePassPhaseOneState other) {
-        if (other == null) {
+    public void applyContribution(OnePassPhaseOneContribution contribution) {
+        if (contribution == null) {
             return;
         }
 
-        if (!this.plan.getRootAlias().equals(other.plan.getRootAlias())
-                || this.plan.getAliases().size() != other.plan.getAliases().size()) {
-            throw new IllegalArgumentException("Cannot merge incompatible Phase 1 states");
+        applyContribution(
+                contribution.getEdgeId(),
+                contribution.getJoinKey(),
+                contribution.getDelta()
+        );
+    }
+
+    public void applyContribution(String edgeId, JoinValue key, double delta) {
+        Phase1LinkWeightIndex index = indexByEdgeId.get(edgeId);
+
+        if (index == null) {
+            index = new Phase1LinkWeightIndex(edgeId);
+            indexByEdgeId.put(edgeId, index);
         }
 
-        for (Map.Entry<String, Phase1LinkWeightIndex> e : other.indexByEdgeId.entrySet()) {
-            Phase1LinkWeightIndex mine = this.indexByEdgeId.get(e.getKey());
-            if (mine == null) {
-                mine = new Phase1LinkWeightIndex(e.getKey());
-                this.indexByEdgeId.put(e.getKey(), mine);
-            }
-            mine.mergeFrom(e.getValue());
+        index.add(key, delta);
+    }
+
+    public Map<String, Object> localEdgeSummary(String edgeId) {
+        Phase1LinkWeightIndex index = indexByEdgeId.get(edgeId);
+
+        if (index == null) {
+            index = new Phase1LinkWeightIndex(edgeId);
         }
 
-        for (Map.Entry<String, Long> e : other.seenTuplesByAlias.entrySet()) {
-            Long cur = this.seenTuplesByAlias.get(e.getKey());
-            if (cur == null) {
-                cur = 0L;
-            }
-            this.seenTuplesByAlias.put(e.getKey(), cur + e.getValue());
-        }
+        return index.toSummaryMap(0);
+    }
+
+    public long getSeenTupleCount(String alias) {
+        Long count = seenTuplesByAlias.get(alias);
+        return count == null ? 0L : count.longValue();
     }
 
     public void replaceWith(OnePassPhaseOneResult result) {

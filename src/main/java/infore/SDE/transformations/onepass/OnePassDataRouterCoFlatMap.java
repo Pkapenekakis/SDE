@@ -116,10 +116,7 @@ public final class OnePassDataRouterCoFlatMap
 
     public OnePassDataRouterCoFlatMap(RoutingMode routingMode) {
 
-        this.routingMode =
-                routingMode == null
-                        ? RoutingMode.ROUND_ROBIN
-                        : routingMode;
+        this.routingMode = routingMode == null ? RoutingMode.ROUND_ROBIN : routingMode;
     }
 
     @Override
@@ -153,11 +150,9 @@ public final class OnePassDataRouterCoFlatMap
             return;
         }
 
-        if (routingMode == RoutingMode.JOIN_KEY_HASH
-                && phaseOneHashRoutingActive.contains(baseKey)) {
+        if (routingMode == RoutingMode.JOIN_KEY_HASH && phaseOneHashRoutingActive.contains(baseKey)) {
 
-            CompiledOnePassPlan plan =
-                    planByBaseKey.get(baseKey);
+            CompiledOnePassPlan plan = planByBaseKey.get(baseKey);
 
             if (plan == null) {
                 throw new IllegalStateException(
@@ -167,17 +162,12 @@ public final class OnePassDataRouterCoFlatMap
                 );
             }
 
-            OnePassTuple tuple =
-                    OnePassTupleExtractor.extract(
-                            value.getValues()
-                    );
+            OnePassTuple tuple = OnePassTupleExtractor.extract(value.getValues());
 
             String alias = tuple.getTable();
 
             if (!plan.containsAlias(alias)) {
-                throw new IllegalStateException(
-                        "Tuple alias '"
-                                + alias
+                throw new IllegalStateException("Tuple alias '" + alias
                                 + "' is not present in the compiled OnePass plan. "
                                 + "baseKey="
                                 + baseKey
@@ -337,45 +327,8 @@ public final class OnePassDataRouterCoFlatMap
         }
     }
 
-    private static int chooseJoinKeyWorker(
-            OnePassTuple tuple,
-            String alias,
-            CompiledOnePassPlan plan,
-            int parallelism) {
-
-        CompiledOnePassPlan.DirectedJoinEdge parentEdge =
-                plan.getParentEdge(alias);
-
-        if (parentEdge == null) {
-            throw new IllegalStateException(
-                    "Non-root alias '"
-                            + alias
-                            + "' has no parent edge."
-            );
-        }
-
-        List<String> joinFields =
-                parentEdge.getChildFields();
-
-        if (joinFields == null || joinFields.isEmpty()) {
-            throw new IllegalStateException(
-                    "Parent edge "
-                            + parentEdge.getEdgeId()
-                            + " has no child-side join fields for alias "
-                            + alias
-            );
-        }
-
-        String routingKey =
-                buildCanonicalJoinKey(
-                        tuple,
-                        joinFields
-                );
-
-        return stableWorkerHash(
-                routingKey,
-                parallelism
-        );
+    private static int chooseJoinKeyWorker(OnePassTuple tuple, String alias, CompiledOnePassPlan plan, int parallelism) {
+        return OnePassShardOwnership.ownerForPhaseOneInputTuple(tuple, plan, parallelism);
     }
 
     private static String buildCanonicalJoinKey(
