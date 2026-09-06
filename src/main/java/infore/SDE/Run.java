@@ -196,14 +196,14 @@ public class Run {
 
 					@Override
 					public boolean filter(Estimation value) {
-						if (value == null || value.getSynopsisID() != 30) {
+						if (value == null || value.getSynopsisID() != 30 || value.getRequestID() != 78) {
 							return false;
 						}
 
 						String type = firstParam(value);
-						return value.getRequestID() == 78 &&
-								("SHARD_BATCH".equals(type) ||
-								"SOURCE_DONE".equals(type)) ||
+						return "SHARD_BATCH".equals(type) ||
+								"SOURCE_DONE".equals(type) ||
+								OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type) ||
 								OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type);
 					}
 				})

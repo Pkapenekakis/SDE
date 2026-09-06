@@ -98,8 +98,12 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final long PHASE1_INDEX_EXPORT_TIMEOUT_MS =
             Long.parseLong(System.getProperty("onepass.phase1IndexExportTimeoutMs", "120000"));
 
-    //private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY (" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " + "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
-    private static final String TEST_ONEPASS_SQL =
+    //private static final String TEST_ONEPASS_SQL =
+    // "SELECT * FROM wq3_alias WEIGHTED BY
+    // (" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) "
+    // + "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+
+    private static final String TEST_ONEPASS_SQL1 =
             "SELECT * FROM w_branch_supplier WEIGHTED BY ("
                     + "l1.l_extendedprice * l2.l_extendedprice"
                     + ") "
@@ -107,9 +111,19 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     + "/* catalog='tpch-onepass-catalog.json', "
                     + "seed='branch-test-123', scalefactor=1 */";
 
+    private static final String TEST_ONEPASS_SQL =
+            "SELECT * FROM w_nested_branch_region WEIGHTED BY ("
+                    + "l1.l_extendedprice "
+                    + "* ord.o_totalprice "
+                    + "* l2.l_quantity"
+                    + ") "
+                    + "LIMIT 1000 "
+                    + "/* catalog='tpch-onepass-catalog.json', "
+                    + "seed='nested-branch-region-123', scalefactor=1 */";
+
     //Use -1 for the full TPC-H relation.
     private static final long TEST_ROW_LIMIT =
-            Long.parseLong(System.getProperty("onepass.testRowLimit", "1000000"));
+            Long.parseLong(System.getProperty("onepass.testRowLimit", "100000"));
 
     private static final int EXPECTED_WORKERS =
             Integer.parseInt(System.getProperty("onepass.workers", "4"));
@@ -2376,16 +2390,11 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 System.nanoTime()
                         - startNanos;
 
-        Long current =
-                benchmarkNanos.get(
-                        label
-                );
-
-        benchmarkNanos.put(
+        benchmarkNanos.compute(
                 label,
-                current == null
+                (k, current) -> current == null
                         ? elapsed
-                        : current.longValue()
+                        : current
                         + elapsed
         );
     }

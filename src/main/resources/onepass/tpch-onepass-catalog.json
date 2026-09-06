@@ -69,6 +69,15 @@
           "n_regionkey",
           "n_comment"
         ]
+      },
+      "region": {
+        "file": "region.tbl",
+        "separator": "|",
+        "columns": [
+          "r_regionkey",
+          "r_name",
+          "r_comment"
+        ]
       }
     }
   },
@@ -317,6 +326,174 @@
         "sup": "1",
         "l1": "l_extendedprice",
         "l2": "l_extendedprice"
+      }
+    },
+    "w_branch_supplier_four": {
+      "description": "Branching Phase-1 tree: nation root, supplier internal node with four lineitem children",
+      "defaultRoot": "nat",
+      "relations": [
+        {
+          "alias": "nat",
+          "table": "nation"
+        },
+        {
+          "alias": "sup",
+          "table": "supplier"
+        },
+        {
+          "alias": "l1",
+          "table": "lineitem"
+        },
+        {
+          "alias": "l2",
+          "table": "lineitem"
+        },
+        {
+          "alias": "l3",
+          "table": "lineitem"
+        },
+        {
+          "alias": "l4",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "nat",
+          "leftField": "n_nationkey",
+          "rightAlias": "sup",
+          "rightField": "s_nationkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l1",
+          "rightField": "l_suppkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l2",
+          "rightField": "l_suppkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l3",
+          "rightField": "l_suppkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l4",
+          "rightField": "l_suppkey"
+        }
+      ],
+      "projection": [
+        "nat.n_nationkey",
+        "sup.s_suppkey",
+        "l1.l_linenumber",
+        "l2.l_linenumber",
+        "l3.l_linenumber",
+        "l4.l_linenumber"
+      ],
+      "defaultWeightsByAlias": {
+        "nat": "1",
+        "sup": "1",
+        "l1": "l_extendedprice",
+        "l2": "l_quantity",
+        "l3": "1 - l_discount",
+        "l4": "l_extendedprice * (1 - l_discount)"
+      }
+    },
+    "w_nested_branch_region": {
+      "description": "Nested branching Phase-1 tree: region root, nation branches into supplier-lineitem and customer-orders-lineitem subtrees",
+      "defaultRoot": "reg",
+      "relations": [
+        {
+          "alias": "reg",
+          "table": "region"
+        },
+        {
+          "alias": "nat",
+          "table": "nation"
+        },
+        {
+          "alias": "sup",
+          "table": "supplier"
+        },
+        {
+          "alias": "l1",
+          "table": "lineitem"
+        },
+        {
+          "alias": "cus",
+          "table": "customer"
+        },
+        {
+          "alias": "ord",
+          "table": "orders"
+        },
+        {
+          "alias": "l2",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "reg",
+          "leftField": "r_regionkey",
+          "rightAlias": "nat",
+          "rightField": "n_regionkey"
+        },
+        {
+          "leftAlias": "nat",
+          "leftField": "n_nationkey",
+          "rightAlias": "sup",
+          "rightField": "s_nationkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l1",
+          "rightField": "l_suppkey"
+        },
+        {
+          "leftAlias": "nat",
+          "leftField": "n_nationkey",
+          "rightAlias": "cus",
+          "rightField": "c_nationkey"
+        },
+        {
+          "leftAlias": "cus",
+          "leftField": "c_custkey",
+          "rightAlias": "ord",
+          "rightField": "o_custkey"
+        },
+        {
+          "leftAlias": "ord",
+          "leftField": "o_orderkey",
+          "rightAlias": "l2",
+          "rightField": "l_orderkey"
+        }
+      ],
+      "projection": [
+        "reg.r_regionkey",
+        "nat.n_nationkey",
+        "sup.s_suppkey",
+        "l1.l_linenumber",
+        "cus.c_custkey",
+        "ord.o_orderkey",
+        "l2.l_linenumber"
+      ],
+      "defaultWeightsByAlias": {
+        "reg": "1",
+        "nat": "1",
+        "sup": "1",
+        "l1": "l_extendedprice",
+        "cus": "1",
+        "ord": "o_totalprice",
+        "l2": "l_quantity"
       }
     }
   }
