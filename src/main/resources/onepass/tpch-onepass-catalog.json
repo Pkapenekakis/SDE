@@ -264,6 +264,60 @@
         "ord": "o_totalprice",
         "lin": "l_extendedprice"
       }
+    },
+    "w_branch_supplier": {
+      "description": "Branching Phase-1 tree: nation root, supplier internal node with two lineitem children",
+      "defaultRoot": "nat",
+      "relations": [
+        {
+          "alias": "nat",
+          "table": "nation"
+        },
+        {
+          "alias": "sup",
+          "table": "supplier"
+        },
+        {
+          "alias": "l1",
+          "table": "lineitem"
+        },
+        {
+          "alias": "l2",
+          "table": "lineitem"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "nat",
+          "leftField": "n_nationkey",
+          "rightAlias": "sup",
+          "rightField": "s_nationkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l1",
+          "rightField": "l_suppkey"
+        },
+        {
+          "leftAlias": "sup",
+          "leftField": "s_suppkey",
+          "rightAlias": "l2",
+          "rightField": "l_suppkey"
+        }
+      ],
+      "projection": [
+        "nat.n_nationkey",
+        "sup.s_suppkey",
+        "l1.l_linenumber",
+        "l2.l_linenumber"
+      ],
+      "defaultWeightsByAlias": {
+        "nat": "1",
+        "sup": "1",
+        "l1": "l_extendedprice",
+        "l2": "l_extendedprice"
+      }
     }
   }
 }

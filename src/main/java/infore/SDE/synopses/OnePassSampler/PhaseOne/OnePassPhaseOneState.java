@@ -52,68 +52,25 @@ public class OnePassPhaseOneState implements Serializable {
     }
 
     /**
-     * Calculates the Phase-1 contribution but does not decide where it is stored.
-     * Distributed SDE uses this method and then applies the contribution locally
-     * or transfers it to the owner through State Topic.
+     * Single-worker/local compatibility path.
+     *
+     * In a single worker every child index is local, so this can walk every child
+     * directly. Distributed sharded execution uses the split methods below.
      */
     public OnePassPhaseOneContribution computeContribution(OnePassTuple tuple) {
-        if (tuple == null) {
-            throw new IllegalArgumentException("tuple must not be null");
-        }
 
-        final String alias = tuple.getTable();
+        double partialWeight = beginShardedContribution(tuple);
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(tuple.getTable());
 
-        if (!plan.containsAlias(alias)) {
-            throw new IllegalArgumentException(
-                    "Tuple alias/table '" + alias + "' is not part of compiled plan");
-        }
+        for (int childIndex = 0; childIndex < childEdges.size(); childIndex++) {
+            partialWeight *= lookupChildContinuationWeight(tuple, childIndex);
 
-        if (plan.isRoot(alias)) {
-            throw new IllegalArgumentException(
-                    "Root alias '" + alias + "' must not be processed during Phase 1");
-        }
-
-        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
-
-        if (childEdges.size() > 1) {
-            throw new UnsupportedOperationException(
-                    "Sharded Phase 1 v1 supports at most one child edge per alias. "
-                            + "Alias '" + alias + "' has " + childEdges.size() + " child edges."
-            );
-        }
-
-        seenTuplesByAlias.put(alias, seenTuplesByAlias.get(alias) + 1L);
-
-        final double ownWeight = weightEvaluator.evaluate(tuple);
-        double continuationWeight = 1.0d;
-
-        for (CompiledOnePassPlan.DirectedJoinEdge childEdge : childEdges) {
-            JoinValue lookupKey = JoinValue.fromTuple(tuple, childEdge.getParentFields());
-            Phase1LinkWeightIndex childIndex = indexByEdgeId.get(childEdge.getEdgeId());
-
-            if (childIndex == null) {
-                throw new IllegalStateException(
-                        "Missing local child index for edge " + childEdge.getEdgeId());
+            if (partialWeight == 0.0d) {
+                break;
             }
-
-            continuationWeight *= childIndex.getOrZero(lookupKey);
         }
 
-        final double subtreeWeight = ownWeight * continuationWeight;
-
-        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias);
-        if (parentEdge == null) {
-            throw new IllegalStateException(
-                    "Non-root alias '" + alias + "' unexpectedly has no parent edge");
-        }
-
-        JoinValue parentKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
-
-        return new OnePassPhaseOneContribution(
-                parentEdge.getEdgeId(),
-                parentKey,
-                subtreeWeight
-        );
+        return buildParentContribution(tuple, partialWeight);
     }
 
     public void applyContribution(OnePassPhaseOneContribution contribution) {
@@ -360,5 +317,94 @@ public class OnePassPhaseOneState implements Serializable {
         }
 
         return builder.toString();
+    }
+
+    /**
+     * Distributed Phase-1 tuple start.
+     *
+     * IMPORTANT:
+     * This is the ONLY distributed method that increments seenTuplesByAlias.
+     * Enrichment hops must never increment the original-tuple counter again.
+     */
+    public double beginShardedContribution(OnePassTuple tuple) {
+
+        validatePhaseOneTuple(tuple);
+        String alias = tuple.getTable();
+        seenTuplesByAlias.compute(alias, (k, current) -> current == null ? 1L : current + 1L);
+
+        return weightEvaluator.evaluate(tuple);
+    }
+
+
+    /**
+     * Reads exactly one child continuation entry.
+     *
+     * The distributed caller must route the work item to the deterministic owner
+     * of this child edge/key before calling this method.
+     */
+    public double lookupChildContinuationWeight(OnePassTuple tuple, int childIndex) {
+
+        validatePhaseOneTuple(tuple);
+        String alias = tuple.getTable();
+
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
+
+        if (childIndex < 0 || childIndex >= childEdges.size()) {
+            throw new IllegalArgumentException("Invalid childIndex=" + childIndex + " for alias=" + alias +
+                    ", childCount=" + childEdges.size());
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(childIndex);
+        JoinValue lookupKey = JoinValue.fromTuple(tuple, childEdge.getParentFields());
+
+        Phase1LinkWeightIndex childIndexState = indexByEdgeId.get(childEdge.getEdgeId());
+
+        if (childIndexState == null) {
+            throw new IllegalStateException("Missing local child index for edge " + childEdge.getEdgeId() +
+                    ", alias=" + alias + ", childIndex=" + childIndex);
+        }
+
+        return childIndexState.getOrZero(lookupKey);
+    }
+
+
+    /**
+     * Constructs the final contribution to this alias's parent edge.
+     *
+     * No index is mutated here. SDEcoFlatMap decides the deterministic owner of
+     * the resulting (edgeId, joinKey) and either applies it locally or transfers
+     * it through the State Topic.
+     */
+    public OnePassPhaseOneContribution buildParentContribution(OnePassTuple tuple, double subtreeWeight) {
+
+        validatePhaseOneTuple(tuple);
+        String alias = tuple.getTable();
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias);
+
+        if (parentEdge == null) {
+            throw new IllegalStateException("Non-root alias '" + alias + "' unexpectedly has no parent edge");
+        }
+
+        JoinValue parentKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
+
+        return new OnePassPhaseOneContribution(parentEdge.getEdgeId(), parentKey, subtreeWeight
+        );
+    }
+
+
+    private void validatePhaseOneTuple(OnePassTuple tuple) {
+
+        if (tuple == null) {throw new IllegalArgumentException("tuple must not be null");}
+
+        String alias = tuple.getTable();
+
+        if (!plan.containsAlias(alias)) {
+            throw new IllegalArgumentException("Tuple alias/table '" + alias + "' is not part of compiled plan");
+        }
+
+        if (plan.isRoot(alias)) {
+            throw new IllegalArgumentException("Root alias '" + alias + "' must not be processed during Phase 1"
+            );
+        }
     }
 }

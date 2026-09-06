@@ -1,102 +1,121 @@
 package infore.SDE.transformations.onepass.worker;
 
 import java.io.Serializable;
-import java.util.*;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 /**
- * Destination-local completeness tracker for one Phase-1 alias epoch.
+ * Destination-local completeness tracker for the FINAL Phase-1 parent-index
+ * contribution stream of one alias epoch.
  *
- * A shard is complete only when:
- *   - this worker has seen local END_ALIAS; and
+ * A final shard is complete only when:
+ *
+ *   - this worker has seen local END_ALIAS metadata; and
  *   - every source worker is DONE for this destination; and
  *   - every sequence 0..lastSequence announced by every remote source exists.
+ * END_ALIAS and local SOURCE_DONE are intentionally separate.
  */
 public final class OnePassPhaseOneCompletionTracker implements Serializable {
 
     private static final long serialVersionUID = 1L;
-
     private final Map<EpochKey, EpochState> states = new HashMap<EpochKey, EpochState>();
 
+
     /**
-     * Returns false for a duplicate batch. Caller must only apply the batch
-     * payload when this method returns true, otherwise duplicate Kafka delivery
-     * would double-add the index deltas.
+     * Returns false for a duplicate batch. Caller must apply SHARD_BATCH
+     * entries only when this returns true.
      */
     public boolean acceptBatch(int uid, int epoch, String alias, int expectedWorkers, int sourceWorker, int sequence) {
 
         EpochState state = state(uid, epoch, alias, expectedWorkers);
-        Set<Integer> sequences = state.receivedSequences.get(sourceWorker);
-
-        if (sequences == null) {
-            sequences = new HashSet<Integer>();
-            state.receivedSequences.put(sourceWorker, sequences);
-        }
+        Set<Integer> sequences = state.receivedSequences.computeIfAbsent(sourceWorker, k -> new HashSet<Integer>());
 
         return sequences.add(sequence);
     }
 
-    public void acceptSourceDone(int uid, int epoch, String alias, int expectedWorkers, int sourceWorker,
-                                 int lastSequence) {
+
+    public void acceptSourceDone(int uid, int epoch, String alias, int expectedWorkers, int sourceWorker, int lastSequence) {
 
         EpochState state = state(uid, epoch, alias, expectedWorkers);
+
         Integer previous = state.lastSequenceBySource.get(sourceWorker);
 
         if (previous != null && previous.intValue() != lastSequence) {
-            throw new IllegalStateException(
-                    "Conflicting SOURCE_DONE for uid=" + uid
-                            + ", epoch=" + epoch
-                            + ", alias=" + alias
-                            + ", source=" + sourceWorker
-                            + ": previous lastSequence=" + previous
-                            + ", new=" + lastSequence
-            );
+
+            throw new IllegalStateException("Conflicting SOURCE_DONE for uid=" + uid + ", epoch=" + epoch +
+                    ", alias=" + alias + ", source=" + sourceWorker + ": previous lastSequence=" + previous +
+                    ", new=" + lastSequence);
         }
 
         state.lastSequenceBySource.put(sourceWorker, lastSequence);
     }
-
-    public void acceptLocalEndAlias(int uid, int epoch, String alias, int expectedWorkers, int localWorker,
-                                    String resultId, String nextCommand, String nextAlias, String baseKey,
-                                    String activeEdgeId, int localKeyCount, double localTotalWeight,
-                                    long localSeenTuples) {
+    /**
+     * Records END_ALIAS metadata only.
+     * This deliberately does NOT mark the local source done.
+     */
+    public void acceptLocalEndAlias(int uid, int epoch, String alias, int expectedWorkers, String resultId,
+                                    String nextCommand, String nextAlias, String baseKey, String activeEdgeId) {
 
         EpochState state = state(uid, epoch, alias, expectedWorkers);
-
         state.localEndAliasSeen = true;
         state.resultId = resultId;
         state.nextCommand = nextCommand;
         state.nextAlias = nextAlias;
         state.baseKey = baseKey;
         state.activeEdgeId = activeEdgeId;
-        state.localKeyCount = localKeyCount;
-        state.localTotalWeight = localTotalWeight;
-        state.localSeenTuples = localSeenTuples;
+    }
 
-        // local contribution path never goes through Kafka
+
+    /**
+     * Local fast-path completion for the final contribution stream.
+     *
+     * Must be called only after this worker can no longer generate any final
+     * contribution for the alias.
+     */
+    public void acceptLocalSourceDone(int uid, int epoch, String alias, int expectedWorkers, int localWorker) {
+
+        EpochState state = state(uid, epoch, alias, expectedWorkers);
+
+        Integer previous = state.lastSequenceBySource.get(localWorker);
+
+        if (previous != null && previous.intValue() != -1) {
+
+            throw new IllegalStateException("Local final source already has non-local sequence metadata." +
+                    " uid=" + uid + ", epoch=" + epoch + ", alias=" + alias + ", worker=" + localWorker +
+                    ", previous=" + previous);
+        }
+
         state.lastSequenceBySource.put(localWorker, -1);
     }
+
 
     public ReadySnapshot readySnapshotIfComplete(int uid, int epoch, String alias) {
 
         EpochState state = states.get(new EpochKey(uid, epoch, alias));
+
         if (state == null || state.readyEmitted || !state.localEndAliasSeen) {
             return null;
         }
 
         for (int source = 0; source < state.expectedWorkers; source++) {
             Integer last = state.lastSequenceBySource.get(source);
+
             if (last == null) {
                 return null;
             }
 
-            if (last.intValue() >= 0) {
+            if (last >= 0) {
                 Set<Integer> received = state.receivedSequences.get(source);
+
                 if (received == null) {
                     return null;
                 }
 
-                for (int seq = 0; seq <= last.intValue(); seq++) {
-                    if (!received.contains(seq)) {
+                for (int sequence = 0; sequence <= last.intValue(); sequence++) {
+                    if (!received.contains(sequence)) {
                         return null;
                     }
                 }
@@ -104,15 +123,13 @@ public final class OnePassPhaseOneCompletionTracker implements Serializable {
         }
 
         state.readyEmitted = true;
-
         return new ReadySnapshot(uid, epoch, alias, state.expectedWorkers, state.resultId, state.nextCommand,
-                state.nextAlias, state.baseKey, state.activeEdgeId, state.localKeyCount,
-                state.localTotalWeight, state.localSeenTuples
-        );
+                state.nextAlias, state.baseKey, state.activeEdgeId);
     }
 
     public void clearUid(int uid) {
-        states.keySet().removeIf(k -> k.uid == uid);
+
+        states.keySet().removeIf(key -> key.uid == uid);
     }
 
     private EpochState state(int uid, int epoch, String alias, int expectedWorkers) {
@@ -123,16 +140,17 @@ public final class OnePassPhaseOneCompletionTracker implements Serializable {
             state = new EpochState(expectedWorkers);
             states.put(key, state);
         } else if (state.expectedWorkers != expectedWorkers) {
-            throw new IllegalStateException(
-                    "Conflicting expectedWorkers for " + key + ": " + state.expectedWorkers + " vs " + expectedWorkers);
-        }
 
+            throw new IllegalStateException("Conflicting expectedWorkers for " + key +
+                    ": " + state.expectedWorkers + " vs " + expectedWorkers);
+        }
         return state;
     }
 
-    public static final class ReadySnapshot implements Serializable {
-        private static final long serialVersionUID = 1L;
 
+    public static final class ReadySnapshot implements Serializable {
+
+        private static final long serialVersionUID = 1L;
         public final int uid;
         public final int epoch;
         public final String alias;
@@ -142,13 +160,10 @@ public final class OnePassPhaseOneCompletionTracker implements Serializable {
         public final String nextAlias;
         public final String baseKey;
         public final String activeEdgeId;
-        public final int localKeyCount;
-        public final double localTotalWeight;
-        public final long localSeenTuples;
 
         private ReadySnapshot(int uid, int epoch, String alias, int expectedWorkers, String resultId,
-                              String nextCommand, String nextAlias, String baseKey,
-                              String activeEdgeId, int localKeyCount, double localTotalWeight, long localSeenTuples) {
+                              String nextCommand, String nextAlias, String baseKey, String activeEdgeId) {
+
             this.uid = uid;
             this.epoch = epoch;
             this.alias = alias;
@@ -158,32 +173,23 @@ public final class OnePassPhaseOneCompletionTracker implements Serializable {
             this.nextAlias = nextAlias;
             this.baseKey = baseKey;
             this.activeEdgeId = activeEdgeId;
-            this.localKeyCount = localKeyCount;
-            this.localTotalWeight = localTotalWeight;
-            this.localSeenTuples = localSeenTuples;
         }
     }
 
+
     private static final class EpochState implements Serializable {
+
         private static final long serialVersionUID = 1L;
-
         private final int expectedWorkers;
-        private final Map<Integer, Set<Integer>> receivedSequences =
-                new HashMap<Integer, Set<Integer>>();
-        private final Map<Integer, Integer> lastSequenceBySource =
-                new HashMap<Integer, Integer>();
-
+        private final Map<Integer, Set<Integer>> receivedSequences = new HashMap<Integer, Set<Integer>>();
+        private final Map<Integer, Integer> lastSequenceBySource = new HashMap<Integer, Integer>();
         private boolean localEndAliasSeen = false;
         private boolean readyEmitted = false;
-
         private String resultId = "";
         private String nextCommand = "";
         private String nextAlias = "";
         private String baseKey = "";
         private String activeEdgeId = "";
-        private int localKeyCount = 0;
-        private double localTotalWeight = 0.0d;
-        private long localSeenTuples = 0L;
 
         private EpochState(int expectedWorkers) {
             this.expectedWorkers = expectedWorkers;
@@ -204,7 +210,11 @@ public final class OnePassPhaseOneCompletionTracker implements Serializable {
 
         @Override
         public boolean equals(Object other) {
-            if (!(other instanceof EpochKey)) return false;
+
+            if (!(other instanceof EpochKey)) {
+                return false;
+            }
+
             EpochKey o = (EpochKey) other;
             return uid == o.uid && epoch == o.epoch && Objects.equals(alias, o.alias);
         }

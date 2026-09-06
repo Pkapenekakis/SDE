@@ -224,6 +224,49 @@ public final class OnePassSamplerSynopsis implements Serializable {
         return this.phaseOneResult;
     }
 
+
+    //Distributed sharded Phase-1 start Increments the original tuple count exactly once and returns ownWeight.
+    public double beginShardedPhaseOneTuple(Object payload) {
+
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("beginShardedPhaseOneTuple() is only valid during PHASE_1. Current phase: " + phase);
+        }
+
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+        return phaseOneState.beginShardedContribution(tuple);
+    }
+
+
+    /**
+     * Reads one already-built child continuation entry.
+     * The SDE sharded worker must have routed this work item to the owner of (childEdge, joinKey) before calling this.
+     */
+    public double lookupShardedPhaseOneChildWeight(Object payload, int childIndex) {
+
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("lookupShardedPhaseOneChildWeight() is only valid during PHASE_1. Current phase: " + phase);
+        }
+
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+
+        return phaseOneState.lookupChildContinuationWeight(tuple, childIndex);
+    }
+
+
+    /**
+     * Constructs the final parent-edge contribution after all child continuation
+     * weights have been multiplied.
+     */
+    public OnePassPhaseOneContribution buildShardedPhaseOneParentContribution(Object payload, double subtreeWeight) {
+
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("buildShardedPhaseOneParentContribution() is only valid during PHASE_1. Current phase: " + phase);
+        }
+
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+        return phaseOneState.buildParentContribution(tuple, subtreeWeight);
+    }
+
     /**
      * Completes Phase 2.
      *

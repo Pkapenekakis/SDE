@@ -91,53 +91,23 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------
 
-    /*
-     * DEBUG / CORRECTNESS VALIDATION ONLY.
-     *
-     * Set this to true when you want the test to ask every OnePass worker to
-     * dump its final Phase-1 shard after the measured Phase-1 algorithm has
-     * completed. The test then unions the worker files into the exact
-     * {"edgeIndexes": ...} JSON format expected by
-     * validate_onepass_catalog_phase1.py.
-     *
-     * IMPORTANT: the dump/merge happens AFTER phase1_algorithm_total stops,
-     * so enabling this flag does not pollute the benchmark timing.
-     */
-    private static final boolean EXPORT_PHASE1_INDEXES = true;
-
     private static final String PHASE1_INDEX_EXPORT_DIR =
-            System.getProperty(
-                    "onepass.phase1IndexExportDir",
-                    "/tmp/onepass-phase1-validator"
-            );
-
+            System.getProperty("onepass.phase1IndexExportDir", "/tmp/onepass-phase1-validator");
     private static final String PHASE1_VALIDATOR_JSON_PATH =
-            System.getProperty(
-                    "onepass.phase1ValidatorJson",
-                    "/tmp/onepass_wq3_alias_phase1_full_indexes.json"
-            );
-
+            System.getProperty("onepass.phase1ValidatorJson", "/tmp/onepass_wq3_alias_phase1_full_indexes.json");
     private static final long PHASE1_INDEX_EXPORT_TIMEOUT_MS =
-            Long.parseLong(
-                    System.getProperty(
-                            "onepass.phase1IndexExportTimeoutMs",
-                            "120000"
-                    )
-            );
+            Long.parseLong(System.getProperty("onepass.phase1IndexExportTimeoutMs", "120000"));
 
+    //private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY (" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " + "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
     private static final String TEST_ONEPASS_SQL =
-            "SELECT * FROM wq3_alias WEIGHTED BY (" +
-                    "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
-                    "LIMIT 1000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+            "SELECT * FROM w_branch_supplier WEIGHTED BY ("
+                    + "l1.l_extendedprice * l2.l_extendedprice"
+                    + ") "
+                    + "LIMIT 1000 "
+                    + "/* catalog='tpch-onepass-catalog.json', "
+                    + "seed='branch-test-123', scalefactor=1 */";
 
-    /*
-     * Default kept at 1,000,000 to match the uploaded test.
-     *
-     * For a first smoke test without editing the file:
-     *   -Donepass.testRowLimit=10000
-     *
-     * Use -1 for the full TPC-H relation.
-     */
+    //Use -1 for the full TPC-H relation.
     private static final long TEST_ROW_LIMIT =
             Long.parseLong(System.getProperty("onepass.testRowLimit", "1000000"));
 
@@ -163,7 +133,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final int SYNOPSIS_ID = 30;
     private static final int REQUEST_ADD = 1;
     private static final int REQUEST_UPDATE = 7;
-
     // Debug-only request broadcast to every OnePass worker.
     private static final int REQUEST_DEBUG_EXPORT_PHASE1 = 79;
 
@@ -173,8 +142,21 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * phase1_algorithm_total.
      */
     private static final Map<String, Long> benchmarkNanos = new LinkedHashMap<String, Long>();
-
     private static final Map<String, Long> benchmarkCounts = new LinkedHashMap<String, Long>();
+
+    /*
+     * DEBUG / CORRECTNESS VALIDATION ONLY.
+     *
+     * Set this to true when you want the test to ask every OnePass worker to
+     * dump its final Phase-1 shard after the measured Phase-1 algorithm has
+     * completed. The test then unions the worker files into the exact
+     * {"edgeIndexes": ...} JSON format expected by
+     * validate_onepass_catalog_phase1.py.
+     *
+     * IMPORTANT: the dump/merge happens AFTER phase1_algorithm_total stops,
+     * so enabling this flag does not pollute the benchmark timing.
+     */
+    private static final boolean EXPORT_PHASE1_INDEXES = true;
 
     private OnePassSamplerSdeCoordinatorTest() {
     }
@@ -2369,17 +2351,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     plan.getChildEdges(
                             alias
                     ).size();
-
-            if (childEdgeCount > 1) {
-                throw new UnsupportedOperationException(
-                        "Sharded Phase 1 v1 supports at most one child edge "
-                                + "per Phase-1 alias. alias="
-                                + alias
-                                + ", childEdges="
-                                + childEdgeCount
-                );
-            }
-
             if (plan.getParentEdge(alias) == null) {
                 throw new IllegalStateException(
                         "Phase-1 alias has no parent edge: "

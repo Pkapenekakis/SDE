@@ -16,6 +16,7 @@ import infore.SDE.transformations.onepass.OnePassGlobalStateSplitter;
 import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
 import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorOperator;
 import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
+import infore.SDE.transformations.onepass.worker.OnePassPhaseOneEnrichmentBuffer;
 import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.java.functions.KeySelector;
@@ -200,9 +201,10 @@ public class Run {
 						}
 
 						String type = firstParam(value);
-						return value.getRequestID() == 78
-								&& ("SHARD_BATCH".equals(type)
-								|| "SOURCE_DONE".equals(type));
+						return value.getRequestID() == 78 &&
+								("SHARD_BATCH".equals(type) ||
+								"SOURCE_DONE".equals(type)) ||
+								OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type);
 					}
 				})
 				.name("ONEPASS_STATE_TRANSFER_BRANCH");
@@ -604,7 +606,10 @@ public class Run {
 		}
 
 		String type = firstParam(value);
-		return "SHARD_BATCH".equals(type) || "SOURCE_DONE".equals(type);
+		return "SHARD_BATCH".equals(type) ||
+				"SOURCE_DONE".equals(type) ||
+				OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type) ||
+				OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type);
 	}
 
 	private static void initializeParameters(String[] args) {

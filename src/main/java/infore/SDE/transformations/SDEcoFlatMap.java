@@ -35,6 +35,8 @@ import infore.SDE.messages.Request;
 import infore.SDE.messages.Datapoint;
 import infore.SDE.transformations.onepass.worker.OnePassPhaseOneTransferBuffer;
 import infore.SDE.transformations.onepass.worker.OnePassPhaseOneCompletionTracker;
+import infore.SDE.transformations.onepass.worker.OnePassPhaseOneEnrichmentBuffer;
+import infore.SDE.transformations.onepass.worker.OnePassPhaseOneEnrichmentCompletionTracker;
 
 public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Estimation> {
 
@@ -64,18 +66,15 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 	private final OnePassPhaseOneTransferBuffer onePassPhaseOneTransferBuffer =
 			new OnePassPhaseOneTransferBuffer();
-
 	private final OnePassPhaseOneCompletionTracker onePassPhaseOneCompletionTracker =
 			new OnePassPhaseOneCompletionTracker();
-
-	private final Map<Integer, Integer> onePassExpectedWorkersByUid =
-			new HashMap<Integer, Integer>();
-
-	private final Map<Integer, String> onePassBaseKeyByUid =
-			new HashMap<Integer, String>();
-
-	private final Map<Integer, Integer> onePassPhaseOneEpochByUid =
-			new HashMap<Integer, Integer>();
+	private final OnePassPhaseOneEnrichmentBuffer onePassPhaseOneEnrichmentBuffer =
+			new OnePassPhaseOneEnrichmentBuffer();
+	private final OnePassPhaseOneEnrichmentCompletionTracker onePassPhaseOneEnrichmentCompletionTracker =
+			new OnePassPhaseOneEnrichmentCompletionTracker();
+	private final Map<Integer, Integer> onePassExpectedWorkersByUid = new HashMap<Integer, Integer>();
+	private final Map<Integer, String> onePassBaseKeyByUid = new HashMap<Integer, String>();
+	private final Map<Integer, Integer> onePassPhaseOneEpochByUid = new HashMap<Integer, Integer>();
 
 	@Override
 	public void flatMap1(Datapoint node, Collector<Estimation> collector) throws JsonProcessingException {
@@ -1828,36 +1827,58 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		int uid = onePass.getSynopsisID();
 		int expectedWorkers = onePassExpectedWorkersByUid.get(uid);
 		int epoch = onePassPhaseOneEpochByUid.get(uid);
+
 		String baseKey = onePassBaseKeyByUid.get(uid);
-
-		OnePassPhaseOneContribution contribution = onePass.computePhaseOneContribution(payload);
-
-		if (contribution == null || contribution.getDelta() == 0.0d) {
-			return;
-		}
-
-		int targetWorker = OnePassShardOwnership.ownerForEdgeKey(
-				contribution.getEdgeId(),
-				contribution.getJoinKey(),
-				expectedWorkers
-		);
-
-		if (targetWorker == pId) {
-			// Local fast path: no Kafka round-trip.
-			onePass.applyPhaseOneContribution(
-					contribution.getEdgeId(),
-					contribution.getJoinKey(),
-					contribution.getDelta()
-			);
-			return;
-		}
-
 		OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+		String alias = tuple.getTable();
 
-		for (Estimation stateMessage : onePassPhaseOneTransferBuffer.addRemoteContribution(uid, baseKey,
-				expectedWorkers, pId, targetWorker, epoch, tuple.getTable(), contribution)) {
-			collector.collect(stateMessage);
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
+
+		/*
+		 * Original tuple accounting happens exactly once here.
+		 */
+		double partialWeight = onePass.beginShardedPhaseOneTuple(payload);
+
+		if (partialWeight == 0.0d) {
+			return;
 		}
+
+		/*
+		 * Leaf alias:
+		 * The data router already sent this tuple to the final parent-index owner.
+		 */
+		if (childEdges.isEmpty()) {
+
+			OnePassPhaseOneContribution contribution = onePass.buildShardedPhaseOneParentContribution(payload, partialWeight);
+
+			emitFinalPhaseOneContribution(onePass, contribution, uid, baseKey, expectedWorkers, epoch, alias, collector);
+
+			return;
+		}
+
+		/*
+		 * Internal alias:
+		 * The data router sent this original tuple to the owner of child index 0.
+		 */
+		partialWeight *= onePass.lookupShardedPhaseOneChildWeight(payload, 0);
+
+		if (partialWeight == 0.0d) {
+			return;
+		}
+
+		if (childEdges.size() == 1) {
+			OnePassPhaseOneContribution contribution = onePass.buildShardedPhaseOneParentContribution(payload, partialWeight);
+			emitFinalPhaseOneContribution(onePass, contribution, uid, baseKey, expectedWorkers, epoch, alias, collector);
+
+			return;
+		}
+
+		/*
+		 * Branching case:
+		 * child 0 was consumed locally. Move the partially enriched tuple to the owner of child 1.
+		 */
+		routePhaseOneEnrichmentWork(onePass, payload, partialWeight, 1, uid, baseKey, expectedWorkers, epoch,
+				alias, collector);
 	}
 
 	private void applyActiveOnePassTransitionIfAvailable(int uid, ArrayList<Synopsis> synopses,
@@ -2084,19 +2105,25 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				+ resultId + ", nextCommand=" + nextCommand + ", nextAlias=" + nextAlias + ", workerId=" + pId);
 	}
 
-	private void processPendingOnePassEndAlias(int uid, String alias, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+	private void processPendingOnePassEndAlias(int uid, String alias, ArrayList<Synopsis> synopses,
+											   Collector<Estimation> collector) {
 
 		if (alias == null || alias.trim().isEmpty()) {
 			return;
 		}
 
-		Datapoint pending = pendingOnePassEndAliasByUidAlias.get(onePassEndAliasPendingKey(uid, alias));
+		String pendingKey = onePassEndAliasPendingKey(uid, alias);
+		/*
+		 * Remove first. If the marker still cannot be processed,
+		 * handleOnePassEndAlias() will safely defer it again.
+		 */
+		Datapoint pending = pendingOnePassEndAliasByUidAlias.remove(pendingKey);
 
 		if (pending == null) {
 			return;
 		}
 
-		completeOnePassEndAlias(pending, synopses, collector);
+		handleOnePassEndAlias(pending, synopses, collector);
 	}
 
 	private void handleOnePassRemove(Request request, ArrayList<Synopsis> synopses) {
@@ -2132,6 +2159,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		onePassPhaseOneTransferBuffer.clearUid(uid);
 		onePassPhaseOneCompletionTracker.clearUid(uid);
+		onePassPhaseOneEnrichmentBuffer.clearUid(uid);
+		onePassPhaseOneEnrichmentCompletionTracker.clearUid(uid);
 		onePassExpectedWorkersByUid.remove(uid);
 		onePassBaseKeyByUid.remove(uid);
 		onePassPhaseOneEpochByUid.remove(uid);
@@ -2141,6 +2170,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	}
 
 	private boolean isOnePassPhaseOneStateTransfer(Datapoint node) {
+
 		if (node == null || node.getValues() == null || node.getValues().isNull()) {
 			return false;
 		}
@@ -2148,9 +2178,14 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		String type = textField(node.getValues(), "type", "");
 		String protocol = textField(node.getValues(), "protocol", "");
 
-		return OnePassPhaseOneTransferBuffer.PROTOCOL.equals(protocol)
-				&& (OnePassPhaseOneTransferBuffer.TYPE_SHARD_BATCH.equals(type)
-				|| OnePassPhaseOneTransferBuffer.TYPE_SOURCE_DONE.equals(type));
+		if (!OnePassPhaseOneTransferBuffer.PROTOCOL.equals(protocol)) {
+			return false;
+		}
+
+		return OnePassPhaseOneTransferBuffer.TYPE_SHARD_BATCH.equals(type)
+				|| OnePassPhaseOneTransferBuffer.TYPE_SOURCE_DONE.equals(type)
+				|| OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type)
+				|| OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type);
 	}
 
 	private void handleOnePassPhaseOneStateTransfer(Datapoint node, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
@@ -2176,12 +2211,15 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 					uid + ", worker=" + pId);
 		}
 
+		/*
+		 * -------------------------------------------------------------
+		 * FINAL PARENT-INDEX TRANSFER
+		 * -------------------------------------------------------------
+		 */
 		if (OnePassPhaseOneTransferBuffer.TYPE_SHARD_BATCH.equals(type)) {
-			int sequence = intField(payload, "sequence", -1);
 
-			boolean firstDelivery = onePassPhaseOneCompletionTracker.acceptBatch(
-					uid, epoch, alias, expectedWorkers, sourceWorker, sequence
-			);
+			int sequence = intField(payload, "sequence", -1);
+			boolean firstDelivery = onePassPhaseOneCompletionTracker.acceptBatch(uid, epoch, alias, expectedWorkers, sourceWorker, sequence);
 
 			if (!firstDelivery) {
 				return;
@@ -2196,6 +2234,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 			for (JsonNode entry : entries) {
 				JsonNode partsNode = entry.get("joinKeyParts");
+
 				if (partsNode == null || !partsNode.isArray() || partsNode.size() == 0) {
 					throw new IllegalStateException("Invalid SHARD_BATCH joinKeyParts: " + entry);
 				}
@@ -2206,88 +2245,132 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				}
 
 				double delta = entry.get("delta").asDouble(0.0d);
-
-				onePass.applyPhaseOneContribution(
-						edgeId,
-						new JoinValue(parts),
-						delta
-				);
+				onePass.applyPhaseOneContribution(edgeId, new JoinValue(parts), delta);
 			}
+
+			maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
+
+			return;
 		}
 
-		else if (OnePassPhaseOneTransferBuffer.TYPE_SOURCE_DONE.equals(type)) {
+		if (OnePassPhaseOneTransferBuffer.TYPE_SOURCE_DONE.equals(type)) {
+
+			int lastSequence = intField(payload, "lastSequence", -1);
+			onePassPhaseOneCompletionTracker.acceptSourceDone(uid, epoch, alias, expectedWorkers, sourceWorker, lastSequence);
+			maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
+			return;
+		}
+
+		/*
+		 * -------------------------------------------------------------
+		 * BRANCHING ENRICHMENT TRANSFER
+		 * -------------------------------------------------------------
+		 */
+		if (OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type)) {
+
+			int childIndex = intField(payload, "childIndex", -1);
+
+			int sequence = intField(payload, "sequence", -1);
+
+			boolean firstDelivery = onePassPhaseOneEnrichmentCompletionTracker.
+					acceptBatch(uid, epoch, alias, childIndex, expectedWorkers, sourceWorker, sequence);
+
+			if (!firstDelivery) {
+				return;
+			}
+
+			JsonNode items = payload.get("items");
+
+			if (items == null || !items.isArray()) {
+				throw new IllegalStateException("ENRICH_BATCH has no items array: " + payload);
+			}
+
+			String baseKey = onePassBaseKeyByUid.get(uid);
+
+			for (JsonNode item : items) {
+				JsonNode tuplePayload = item.get("tuple");
+				if (tuplePayload == null || tuplePayload.isNull()) {
+					throw new IllegalStateException("ENRICH_BATCH item has no tuple: " + item);
+				}
+
+				double partialWeight = doubleField(item, "partialWeight", 0.0d);
+
+				processShardedPhaseOneEnrichmentWork(onePass, tuplePayload, partialWeight, childIndex, uid,
+						baseKey, expectedWorkers, epoch, alias, collector);
+			}
+
+			maybeAdvanceOnePassPhaseOneEnrichmentStage(onePass, uid, epoch, alias, childIndex, expectedWorkers, collector);
+
+			return;
+		}
+
+		if (OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type)) {
+
+			int childIndex = intField(payload, "childIndex", -1);
 			int lastSequence = intField(payload, "lastSequence", -1);
 
-			onePassPhaseOneCompletionTracker.acceptSourceDone(
-					uid, epoch, alias, expectedWorkers, sourceWorker, lastSequence
-			);
+			onePassPhaseOneEnrichmentCompletionTracker.acceptSourceDone(uid, epoch, alias, childIndex,
+					expectedWorkers, sourceWorker, lastSequence);
+
+			maybeAdvanceOnePassPhaseOneEnrichmentStage(onePass, uid, epoch, alias, childIndex, expectedWorkers, collector);
+			return;
 		}
 
-		maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
+		throw new IllegalStateException("Unknown sharded Phase-1 state-transfer type: " + type + ", payload=" + payload);
 	}
 
-	private void handleShardedPhaseOneEndAlias(
-			Datapoint node,
-			OnePassSamplerSdeSynopsis onePass,
-			int uid,
-			String alias,
-			String resultId,
-			String nextCommand,
-			String nextAlias,
-			int expectedWorkers,
-			Collector<Estimation> collector) {
+	private void handleShardedPhaseOneEndAlias(Datapoint node, OnePassSamplerSdeSynopsis onePass, int uid, String alias,
+											   String resultId, String nextCommand, String nextAlias,
+											   int expectedWorkers, Collector<Estimation> collector) {
 
 		int epoch = intField(node.getValues(), "epoch", -1);
+
 		if (epoch <= 0) {
 			throw new IllegalStateException("Sharded END_ALIAS requires epoch > 0: " + node.getValues());
 		}
 
 		Integer expectedEpoch = onePassPhaseOneEpochByUid.get(uid);
-		if (expectedEpoch == null || expectedEpoch.intValue() != epoch) {
-			throw new IllegalStateException("END_ALIAS epoch mismatch. uid=" + uid + ", expected=" + expectedEpoch +
-					", received=" + epoch);
+
+		if (expectedEpoch == null || expectedEpoch != epoch) {
+
+			throw new IllegalStateException("END_ALIAS epoch mismatch." + " uid=" + uid +
+					", expected=" + expectedEpoch + ", received=" + epoch);
 		}
 
 		onePassTupleBufferGate.sealAlias(uid, alias);
-
-		// 1) Every remaining remote contribution must be emitted before SOURCE_DONE.
-		for (Estimation batch : onePassPhaseOneTransferBuffer.flushAlias(uid, epoch, alias)) {
-			collector.collect(batch);
-		}
-
-		// 2) Tiny per-destination completion markers.
-		for (Estimation done : onePassPhaseOneTransferBuffer.buildSourceDoneMessages(uid, onePassBaseKeyByUid.get(uid),
-				expectedWorkers, pId, epoch, alias)) {
-			collector.collect(done);
-		}
-
-		CompiledOnePassPlan.DirectedJoinEdge parentEdge =
-				onePass.getPlan().getParentEdge(alias);
+		CompiledOnePassPlan.DirectedJoinEdge parentEdge = onePass.getPlan().getParentEdge(alias);
 		String activeEdgeId = parentEdge == null ? "" : parentEdge.getEdgeId();
 
-		Map<String, Object> summary = onePass.getLocalPhaseOneEdgeSummary(activeEdgeId);
-		int localKeyCount = ((Number) summary.get("numberOfKeys")).intValue();
-		double localTotalWeight = ((Number) summary.get("totalWeight")).doubleValue();
-		long localSeenTuples = onePass.getLocalPhaseOneSeenTupleCount(alias);
+		//END_ALIAS metadata is recorded now, but local final SOURCE_DONE is NOT.
+		onePassPhaseOneCompletionTracker.acceptLocalEndAlias(uid, epoch, alias, expectedWorkers, resultId, nextCommand,
+				nextAlias, onePassBaseKeyByUid.get(uid), activeEdgeId);
 
-		// 3) Local source is done without Kafka.
-		onePassPhaseOneCompletionTracker.acceptLocalEndAlias(
-				uid,
-				epoch,
-				alias,
-				expectedWorkers,
-				pId,
-				resultId,
-				nextCommand,
-				nextAlias,
-				onePassBaseKeyByUid.get(uid),
-				activeEdgeId,
-				localKeyCount,
-				localTotalWeight,
-				localSeenTuples
-		);
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
 
-		maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
+		/*
+		 * Leaf or existing one-child chain:
+		 * Every original tuple has already produced its final parent contribution,
+		 * so final source generation can close immediately.
+		 */
+		if (childEdges.size() <= 1) {
+			finishFinalPhaseOneSourceGeneration(onePass, uid, epoch, alias, expectedWorkers, collector);
+
+			return;
+		}
+
+		/*
+		 * Branching alias:
+		 *
+		 * Original tuples consumed child 0. Their first remote enrichment target is
+		 * childIndex 1.
+		 */
+		int firstEnrichmentChildIndex = 1;
+
+		flushEnrichmentStageAndDeclareDone(uid, onePassBaseKeyByUid.get(uid), expectedWorkers, epoch, alias,
+				firstEnrichmentChildIndex, collector);
+
+		maybeAdvanceOnePassPhaseOneEnrichmentStage(onePass, uid, epoch, alias, firstEnrichmentChildIndex,
+				expectedWorkers, collector);
 	}
 
 	private void maybeEmitLocalPhaseOneShardReady(int uid, int epoch, String alias, OnePassSamplerSdeSynopsis onePass,
@@ -2301,26 +2384,18 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		/*
-		 * DEBUG ONLY.
-		 *
-		 * Dump only after the FINAL Phase-1 alias is complete.
-		 *
-		 * readySnapshotIfComplete() guarantees that this destination has received
-		 * every declared SHARD_BATCH from every source before we inspect the state.
-
-		if (OnePassPhaseOneValidatorExporter.isEnabled() && OnePassPhaseOneWorkerProtocol.COMMAND_START_PHASE_2
-				.equals(ready.nextCommand)) {
-			try {
-				OnePassPhaseOneValidatorExporter.exportWorkerShard(onePass, uid, pId, ready.expectedWorkers);
-			} catch (Exception exception) {
-				throw new IllegalStateException("Could not write Phase-1 validator shard." + " uid=" + uid +
-						", worker=" + pId, exception);
-			}
-		}
-		*
-		* */
+		 * IMPORTANT:
+		 * These statistics are intentionally read only after every final
+		 * SHARD_BATCH/SOURCE_DONE dependency is satisfied.
+		 * Reading them at END_ALIAS can be premature because remote final contributions may still be in flight.
+		 */
+		Map<String, Object> summary = onePass.getLocalPhaseOneEdgeSummary(ready.activeEdgeId);
+		int localKeyCount = ((Number) summary.get("numberOfKeys")).intValue();
+		double localTotalWeight = ((Number) summary.get("totalWeight")).doubleValue();
+		long localSeenTuples = onePass.getLocalPhaseOneSeenTupleCount(ready.alias);
 
 		Map<String, Object> payload = new LinkedHashMap<String, Object>();
+
 		payload.put("type", "LOCAL_PHASE1_SHARD_READY");
 		payload.put("protocol", "SHARDED_PHASE1_V1");
 		payload.put("phase", "PHASE1");
@@ -2334,9 +2409,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		payload.put("nextAlias", ready.nextAlias);
 		payload.put("baseKey", ready.baseKey);
 		payload.put("activeEdgeId", ready.activeEdgeId);
-		payload.put("localKeyCount", ready.localKeyCount);
-		payload.put("localTotalWeight", ready.localTotalWeight);
-		payload.put("localSeenTuples", ready.localSeenTuples);
+		payload.put("localKeyCount", localKeyCount);
+		payload.put("localTotalWeight", localTotalWeight);
+		payload.put("localSeenTuples", localSeenTuples);
 
 		String json;
 		try {
@@ -2347,17 +2422,14 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		String reduceKey = uid + "_PHASE1_READY_" + ready.resultId;
 
-		collector.collect(new Estimation(uid, reduceKey, 76, 30, reduceKey, json,
-				new String[] {
-						"LOCAL_PHASE1_SHARD_READY",
+		collector.collect(new Estimation(uid, reduceKey, 76, ONEPASS_SYNOPSIS_ID, reduceKey, json,
+				new String[] {"LOCAL_PHASE1_SHARD_READY",
 						ready.resultId,
 						ready.alias,
 						Integer.toString(ready.epoch),
 						Integer.toString(pId),
-						Integer.toString(ready.expectedWorkers)
-				},
-				ready.expectedWorkers
-		));
+						Integer.toString(ready.expectedWorkers)},
+						ready.expectedWorkers));
 	}
 
 	private boolean isOnePassShardedPhaseOneTransitionRequest(Request request) {
@@ -2407,8 +2479,14 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			List<JsonNode> released = onePassTupleBufferGate.activateAliasAndDrain(uid, nextAlias);
 			OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
 
+			System.out.println("[OnePass SHARDED TRANSITION]" + " uid=" + uid + ", workerId=" + pId +
+					", completedEpoch=" + completedEpoch + ", nextEpoch=" + nextEpoch +
+					", nextAlias=" + nextAlias + ", released=" + released.size());
+
 			for (JsonNode buffered : released) {
-				processShardedPhaseOneTuple(onePass, buffered, collector);
+				//Buffered distributed Phase-1 tuples must re-enter the sharded path.
+				processShardedPhaseOneTuple(onePass, buffered, collector
+				);
 			}
 
 			processPendingOnePassEndAlias(uid, nextAlias, synopses, collector);
@@ -2471,5 +2549,218 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		OnePassPhaseOneValidatorExporter.exportWorkerShard(onePass, request.getUID(), pId,
 				expectedWorkers, outputDirectory);
+	}
+
+	private void emitFinalPhaseOneContribution(OnePassSamplerSdeSynopsis onePass,
+											   OnePassPhaseOneContribution contribution, int uid, String baseKey,
+											   int expectedWorkers, int epoch, String alias, Collector<Estimation> collector) {
+
+		if (contribution == null || contribution.getDelta() == 0.0d) {
+			return;
+		}
+
+		int targetWorker = OnePassShardOwnership.ownerForEdgeKey(contribution.getEdgeId(), contribution.getJoinKey(), expectedWorkers);
+
+		if (targetWorker == pId) {
+			//Local final-index fast path.
+			onePass.applyPhaseOneContribution(contribution.getEdgeId(), contribution.getJoinKey(), contribution.getDelta());
+			return;
+		}
+
+		/*
+		 * Remote final-index path. Existing combine/batch logic remains unchanged.
+		 */
+		for (Estimation stateMessage : onePassPhaseOneTransferBuffer.addRemoteContribution(uid, baseKey,
+				expectedWorkers, pId, targetWorker, epoch, alias, contribution)) {
+			collector.collect(stateMessage);
+		}
+	}
+
+	private void routePhaseOneEnrichmentWork(OnePassSamplerSdeSynopsis onePass, JsonNode tuplePayload,
+											 double partialWeight, int childIndex, int uid,
+											 String baseKey, int expectedWorkers, int epoch, String alias,
+											 Collector<Estimation> collector) {
+
+		if (partialWeight == 0.0d) {
+			return;
+		}
+
+		OnePassTuple tuple = OnePassTupleExtractor.extract(tuplePayload);
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
+
+		if (childIndex <= 0 || childIndex >= childEdges.size()) {
+
+			throw new IllegalArgumentException("Invalid enrichment childIndex=" + childIndex + " for alias=" + alias +
+					", childCount=" + childEdges.size());
+		}
+
+		CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(childIndex);
+		JoinValue lookupKey = JoinValue.fromTuple(tuple, childEdge.getParentFields()
+				);
+		int targetWorker = OnePassShardOwnership.ownerForEdgeKey(childEdge.getEdgeId(), lookupKey, expectedWorkers);
+
+		if (targetWorker == pId) {
+
+			/*
+			 * Local child-index fast path.
+			 *
+			 * This may recursively consume multiple consecutive child indexes if
+			 * they all happen to be owned by the same worker.
+			 */
+			processShardedPhaseOneEnrichmentWork(onePass, tuplePayload, partialWeight, childIndex,
+					uid, baseKey, expectedWorkers, epoch, alias, collector);
+			return;
+		}
+
+		for (Estimation message : onePassPhaseOneEnrichmentBuffer.addRemoteWork(uid, baseKey, expectedWorkers, pId,
+				targetWorker, epoch, alias, childIndex, tuplePayload, partialWeight)) {
+			collector.collect(message);
+		}
+	}
+
+	private void processShardedPhaseOneEnrichmentWork(OnePassSamplerSdeSynopsis onePass, JsonNode tuplePayload,
+													  double partialWeight, int childIndex, int uid, String baseKey,
+													  int expectedWorkers, int epoch, String alias,
+													  Collector<Estimation> collector) {
+
+		if (partialWeight == 0.0d) {
+			return;
+		}
+
+		OnePassTuple tuple = OnePassTupleExtractor.extract(tuplePayload);
+
+		if (!alias.equals(tuple.getTable())) {
+
+			throw new IllegalStateException("Enrichment alias mismatch." + " messageAlias=" + alias + ", tupleAlias="
+					+ tuple.getTable());
+		}
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
+
+		if (childIndex <= 0 || childIndex >= childEdges.size()) {
+			throw new IllegalArgumentException("Invalid enrichment childIndex=" + childIndex + " for alias=" + alias +
+					", childCount=" + childEdges.size());
+		}
+
+		/*
+		 * This worker owns the required child edge/key by construction.
+		 */
+		double childWeight = onePass.lookupShardedPhaseOneChildWeight(tuplePayload, childIndex);
+
+		double enrichedWeight = partialWeight * childWeight;
+
+		if (enrichedWeight == 0.0d) {
+			return;
+		}
+
+		int nextChildIndex = childIndex + 1;
+
+		if (nextChildIndex < childEdges.size()) {
+			routePhaseOneEnrichmentWork(onePass, tuplePayload, enrichedWeight, nextChildIndex, uid, baseKey,
+					expectedWorkers, epoch, alias, collector);
+
+			return;
+		}
+
+		/*
+		 * Last child consumed: now create the normal final parent contribution.
+		 */
+		OnePassPhaseOneContribution contribution = onePass.buildShardedPhaseOneParentContribution(tuplePayload, enrichedWeight);
+		emitFinalPhaseOneContribution(onePass, contribution, uid, baseKey, expectedWorkers, epoch, alias, collector);
+	}
+
+	private void flushEnrichmentStageAndDeclareDone(int uid, String baseKey, int expectedWorkers, int epoch,
+													String alias, int childIndex, Collector<Estimation> collector) {
+		/*
+		 * Flush every remaining remote work item generated by this source for the
+		 * destination child hop.
+		 */
+		for (Estimation batch : onePassPhaseOneEnrichmentBuffer.flushStage(uid, epoch, alias, childIndex)) {
+			collector.collect(batch);
+		}
+
+		/*
+		 * Remote destinations receive explicit sequence-aware done markers.
+		 */
+		for (Estimation done : onePassPhaseOneEnrichmentBuffer.
+				buildStageDoneMessages(uid, baseKey, expectedWorkers, pId, epoch, alias, childIndex)) {
+			collector.collect(done);
+		}
+
+		/*
+		 * Local-target work used the direct fast path and is already processed.
+		 */
+		onePassPhaseOneEnrichmentCompletionTracker.acceptLocalSourceDone(uid, epoch, alias, childIndex, expectedWorkers, pId);
+	}
+
+	private void maybeAdvanceOnePassPhaseOneEnrichmentStage(OnePassSamplerSdeSynopsis onePass, int uid, int epoch,
+															String alias, int childIndex, int expectedWorkers,
+															Collector<Estimation> collector) {
+
+		boolean complete =
+				onePassPhaseOneEnrichmentCompletionTracker.markCompleteIfReady(uid, epoch, alias, childIndex);
+
+		if (!complete) {
+			return;
+		}
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
+
+		if (childIndex <= 0 || childIndex >= childEdges.size()) {
+			throw new IllegalStateException("Completed invalid enrichment childIndex=" + childIndex +
+					" for alias=" + alias + ", childCount=" + childEdges.size());
+		}
+
+		int nextChildIndex = childIndex + 1;
+		String baseKey = onePassBaseKeyByUid.get(uid);
+
+		if (nextChildIndex < childEdges.size()) {
+
+			/*
+			 * All childIndex input on this source worker is now known complete.
+			 * Therefore, this source has generated every output item that can targetnextChildIndex.
+			 */
+			flushEnrichmentStageAndDeclareDone(uid, baseKey, expectedWorkers, epoch, alias, nextChildIndex, collector);
+
+			//Remote DONE markers for nextChildIndex may already have arrived.Re-check immediately.
+
+			maybeAdvanceOnePassPhaseOneEnrichmentStage(onePass, uid, epoch, alias, nextChildIndex, expectedWorkers, collector);
+			return;
+		}
+
+		/*
+		 * Last child hop is complete on this worker.
+		 *
+		 * Every enrichment item that can produce a final parent contribution has
+		 * now been processed, so this source can finally close the existing final
+		 * SHARD_BATCH/SOURCE_DONE stream.
+		 */
+		finishFinalPhaseOneSourceGeneration(onePass, uid, epoch, alias, expectedWorkers, collector
+		);
+	}
+
+	private void finishFinalPhaseOneSourceGeneration(OnePassSamplerSdeSynopsis onePass, int uid, int epoch,
+													 String alias, int expectedWorkers,
+													 Collector<Estimation> collector) {
+
+		String baseKey = onePassBaseKeyByUid.get(uid);
+
+		/*
+		 * Every remaining remote final contribution must be emitted before
+		 * SOURCE_DONE.
+		 */
+		for (Estimation batch : onePassPhaseOneTransferBuffer.flushAlias(uid, epoch, alias)) {
+			collector.collect(batch);
+		}
+
+		for (Estimation done : onePassPhaseOneTransferBuffer.
+				buildSourceDoneMessages(uid, baseKey, expectedWorkers, pId, epoch, alias)) {
+			collector.collect(done);
+		}
+
+		//Final local-target contributions were already applied directly.
+		onePassPhaseOneCompletionTracker.acceptLocalSourceDone(uid, epoch, alias, expectedWorkers, pId);
+		maybeEmitLocalPhaseOneShardReady(uid, epoch, alias, onePass, collector);
 	}
 }

@@ -940,6 +940,23 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return summary;
     }
 
+    public double beginShardedPhaseOneTuple(Object payload) {
+
+        return lifecycle.beginShardedPhaseOneTuple(payload);
+    }
+
+
+    public double lookupShardedPhaseOneChildWeight(Object payload, int childIndex) {
+
+        return lifecycle.lookupShardedPhaseOneChildWeight(payload, childIndex);
+    }
+
+
+    public OnePassPhaseOneContribution buildShardedPhaseOneParentContribution(Object payload, double subtreeWeight) {
+
+        return lifecycle.buildShardedPhaseOneParentContribution(payload, subtreeWeight);
+    }
+
     private static JoinValue parseJoinValue(String joinKey) {
         if (joinKey == null) {
             throw new IllegalArgumentException("joinKey must not be null");
