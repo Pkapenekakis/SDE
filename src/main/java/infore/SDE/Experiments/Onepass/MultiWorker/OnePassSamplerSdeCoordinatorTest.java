@@ -23,6 +23,7 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -90,6 +91,40 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------
 
+    /*
+     * DEBUG / CORRECTNESS VALIDATION ONLY.
+     *
+     * Set this to true when you want the test to ask every OnePass worker to
+     * dump its final Phase-1 shard after the measured Phase-1 algorithm has
+     * completed. The test then unions the worker files into the exact
+     * {"edgeIndexes": ...} JSON format expected by
+     * validate_onepass_catalog_phase1.py.
+     *
+     * IMPORTANT: the dump/merge happens AFTER phase1_algorithm_total stops,
+     * so enabling this flag does not pollute the benchmark timing.
+     */
+    private static final boolean EXPORT_PHASE1_INDEXES = true;
+
+    private static final String PHASE1_INDEX_EXPORT_DIR =
+            System.getProperty(
+                    "onepass.phase1IndexExportDir",
+                    "/tmp/onepass-phase1-validator"
+            );
+
+    private static final String PHASE1_VALIDATOR_JSON_PATH =
+            System.getProperty(
+                    "onepass.phase1ValidatorJson",
+                    "/tmp/onepass_wq3_alias_phase1_full_indexes.json"
+            );
+
+    private static final long PHASE1_INDEX_EXPORT_TIMEOUT_MS =
+            Long.parseLong(
+                    System.getProperty(
+                            "onepass.phase1IndexExportTimeoutMs",
+                            "120000"
+                    )
+            );
+
     private static final String TEST_ONEPASS_SQL =
             "SELECT * FROM wq3_alias WEIGHTED BY (" +
                     "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
@@ -129,6 +164,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final int REQUEST_ADD = 1;
     private static final int REQUEST_UPDATE = 7;
 
+    // Debug-only request broadcast to every OnePass worker.
+    private static final int REQUEST_DEBUG_EXPORT_PHASE1 = 79;
+
     /*
      * Timing maps deliberately contain only algorithm timings.
      * Kafka/TPC-H preload is tracked separately and never added to
@@ -164,6 +202,11 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println("TPC-H dir        = " + TEST_TPCH_DIR);
         System.out.println("TEST_ROW_LIMIT   = " + TEST_ROW_LIMIT);
         System.out.println("transactionTimeoutMs = " + TRANSACTION_TIMEOUT_MS);
+        System.out.println("EXPORT_PHASE1_INDEXES = " + EXPORT_PHASE1_INDEXES);
+        if (EXPORT_PHASE1_INDEXES) {
+            System.out.println("phase1IndexExportDir = " + PHASE1_INDEX_EXPORT_DIR);
+            System.out.println("phase1ValidatorJson  = " + PHASE1_VALIDATOR_JSON_PATH);
+        }
         System.out.println("SQL:");
         System.out.println(TEST_ONEPASS_SQL);
         System.out.println();
@@ -455,7 +498,18 @@ public final class OnePassSamplerSdeCoordinatorTest {
              * -------------------------------------------------------------
              * PHASE-1 MEASUREMENT ENDS HERE
              * -------------------------------------------------------------
+             *
+             * Any debug index export below is intentionally outside the
+             * algorithm timer.
              */
+            if (EXPORT_PHASE1_INDEXES) {
+                exportPhaseOneIndexesForValidator(
+                        controlProducer,
+                        uid,
+                        baseKey,
+                        streamId
+                );
+            }
             System.out.println();
             System.out.println("=======================================================");
             System.out.println(" SHARDED PHASE 1 COMPLETE");
@@ -1008,6 +1062,433 @@ public final class OnePassSamplerSdeCoordinatorTest {
                         + ", recordsSeen="
                         + recordsSeen
         );
+    }
+
+    // =====================================================================
+    // DEBUG PHASE-1 INDEX EXPORT
+    // =====================================================================
+
+    /**
+     * DEBUG / VALIDATION ONLY.
+     *
+     * This runs strictly after phase1_algorithm_total has stopped. It asks
+     * every worker to snapshot its already-computed local Phase-1 index shard,
+     * waits for worker-N.json files, and performs a dumb set-union into the
+     * exact JSON format expected by validate_onepass_catalog_phase1.py.
+     *
+     * The merger intentionally does NOT know or use OnePass ownership, Kafka
+     * state transfer, weight computation, or reducer logic. A duplicate
+     * (edgeId, joinKey) across workers is treated as a validation failure.
+     */
+    private static void exportPhaseOneIndexesForValidator(
+            KafkaProducer<String, String> controlProducer,
+            int uid,
+            String baseKey,
+            String streamId) throws Exception {
+
+        System.out.println();
+        System.out.println("=======================================================");
+        System.out.println(" DEBUG: EXPORTING FINAL PHASE-1 INDEX SHARDS");
+        System.out.println("=======================================================");
+
+        File runDirectory =
+                new File(
+                        PHASE1_INDEX_EXPORT_DIR,
+                        "uid-" + uid
+                );
+
+        if (runDirectory.exists()) {
+            deleteRecursively(runDirectory);
+        }
+
+        if (!runDirectory.mkdirs() && !runDirectory.isDirectory()) {
+            throw new IllegalStateException(
+                    "Could not create debug shard directory: "
+                            + runDirectory.getAbsolutePath()
+            );
+        }
+
+        ObjectNode debugRequest =
+                buildPhaseOneDebugExportRequest(
+                        baseKey,
+                        streamId,
+                        uid,
+                        EXPECTED_WORKERS,
+                        PHASE1_INDEX_EXPORT_DIR
+                );
+
+        sendJson(
+                controlProducer,
+                REQUEST_TOPIC,
+                baseKey,
+                debugRequest
+        );
+
+        controlProducer.flush();
+
+        System.out.println(
+                "DEBUG_EXPORT_PHASE1_INDEXES request sent. Waiting for "
+                        + EXPECTED_WORKERS
+                        + " worker shard files in "
+                        + runDirectory.getAbsolutePath()
+        );
+
+        waitForPhaseOneWorkerShardFiles(
+                runDirectory,
+                EXPECTED_WORKERS,
+                PHASE1_INDEX_EXPORT_TIMEOUT_MS
+        );
+
+        File validatorOutput =
+                new File(PHASE1_VALIDATOR_JSON_PATH);
+
+        mergePhaseOneWorkerShardsForValidator(
+                runDirectory,
+                EXPECTED_WORKERS,
+                uid,
+                validatorOutput
+        );
+
+        System.out.println();
+        System.out.println(
+                "Phase-1 validator JSON written to: "
+                        + validatorOutput.getAbsolutePath()
+        );
+        System.out.println(
+                "Use this file as --sde-json with "
+                        + "validate_onepass_catalog_phase1.py"
+        );
+        System.out.println();
+    }
+
+    private static ObjectNode buildPhaseOneDebugExportRequest(
+            String datasetKey,
+            String streamId,
+            int uid,
+            int noOfP,
+            String outputDirectory) {
+
+        ObjectNode request =
+                MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+        request.put("key", datasetKey);
+        request.put("requestID", REQUEST_DEBUG_EXPORT_PHASE1);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+        request.put("noOfP", noOfP);
+
+        ArrayNode param =
+                MAPPER.createArrayNode();
+
+        param.add("DEBUG_EXPORT_PHASE1_INDEXES");
+        request.set("param", param);
+
+        ObjectNode parameters =
+                MAPPER.createObjectNode();
+
+        parameters.put(
+                "onePassCommand",
+                "DEBUG_EXPORT_PHASE1_INDEXES"
+        );
+
+        parameters.put(
+                "debugOutputDirectory",
+                outputDirectory
+        );
+
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+    private static void waitForPhaseOneWorkerShardFiles(
+            File runDirectory,
+            int expectedWorkers,
+            long timeoutMs) throws Exception {
+
+        long deadline =
+                System.currentTimeMillis() + timeoutMs;
+
+        while (System.currentTimeMillis() < deadline) {
+
+            boolean allPresent = true;
+
+            for (int workerId = 0;
+                 workerId < expectedWorkers;
+                 workerId++) {
+
+                File file =
+                        new File(
+                                runDirectory,
+                                "worker-" + workerId + ".json"
+                        );
+
+                if (!file.isFile() || file.length() <= 0L) {
+                    allPresent = false;
+                    break;
+                }
+            }
+
+            if (allPresent) {
+                /*
+                 * Give the final writer a brief moment to close/flush the
+                 * file before the independent merger opens it.
+                 */
+                Thread.sleep(250L);
+                return;
+            }
+
+            Thread.sleep(100L);
+        }
+
+        StringBuilder missing =
+                new StringBuilder();
+
+        for (int workerId = 0;
+             workerId < expectedWorkers;
+             workerId++) {
+
+            File file =
+                    new File(
+                            runDirectory,
+                            "worker-" + workerId + ".json"
+                    );
+
+            if (!file.isFile() || file.length() <= 0L) {
+                if (missing.length() > 0) {
+                    missing.append(", ");
+                }
+                missing.append(file.getName());
+            }
+        }
+
+        throw new IllegalStateException(
+                "Timed out waiting for Phase-1 debug worker shards. "
+                        + "directory=" + runDirectory.getAbsolutePath()
+                        + ", missing=[" + missing + "]"
+        );
+    }
+
+    /**
+     * Independent debug merger.
+     *
+     * Expected worker shard format:
+     *
+     * {
+     *   "uid": ...,
+     *   "workerId": ...,
+     *   "expectedWorkers": ...,
+     *   "edgeIndexes": {
+     *      "edgeId": { "joinKey": weight }
+     *   }
+     * }
+     *
+     * Final validator format:
+     *
+     * {
+     *   "edgeIndexes": { ... }
+     * }
+     */
+    private static void mergePhaseOneWorkerShardsForValidator(
+            File runDirectory,
+            int expectedWorkers,
+            int expectedUid,
+            File outputFile) throws Exception {
+
+        Map<String, Map<String, Double>> merged =
+                new LinkedHashMap<String, Map<String, Double>>();
+
+        for (int workerId = 0;
+             workerId < expectedWorkers;
+             workerId++) {
+
+            File shardFile =
+                    new File(
+                            runDirectory,
+                            "worker-" + workerId + ".json"
+                    );
+
+            JsonNode root =
+                    MAPPER.readTree(shardFile);
+
+            int fileUid =
+                    intField(root, "uid", -1);
+
+            if (fileUid != expectedUid) {
+                throw new IllegalStateException(
+                        "Debug shard UID mismatch in "
+                                + shardFile.getAbsolutePath()
+                                + ": expected=" + expectedUid
+                                + ", actual=" + fileUid
+                );
+            }
+
+            int fileWorkerId =
+                    intField(root, "workerId", -1);
+
+            if (fileWorkerId != workerId) {
+                throw new IllegalStateException(
+                        "Debug shard workerId mismatch in "
+                                + shardFile.getAbsolutePath()
+                                + ": expected=" + workerId
+                                + ", actual=" + fileWorkerId
+                );
+            }
+
+            int fileExpectedWorkers =
+                    intField(root, "expectedWorkers", -1);
+
+            if (fileExpectedWorkers != expectedWorkers) {
+                throw new IllegalStateException(
+                        "Debug shard expectedWorkers mismatch in "
+                                + shardFile.getAbsolutePath()
+                                + ": expected=" + expectedWorkers
+                                + ", actual=" + fileExpectedWorkers
+                );
+            }
+
+            JsonNode edgeIndexes =
+                    root.get("edgeIndexes");
+
+            if (edgeIndexes == null
+                    || !edgeIndexes.isObject()) {
+
+                throw new IllegalStateException(
+                        "Debug shard has no edgeIndexes object: "
+                                + shardFile.getAbsolutePath()
+                );
+            }
+
+            Iterator<Map.Entry<String, JsonNode>> edges =
+                    edgeIndexes.fields();
+
+            while (edges.hasNext()) {
+
+                Map.Entry<String, JsonNode> edgeEntry =
+                        edges.next();
+
+                String edgeId =
+                        edgeEntry.getKey();
+
+                JsonNode entriesNode =
+                        edgeEntry.getValue();
+
+                if (entriesNode == null
+                        || !entriesNode.isObject()) {
+
+                    throw new IllegalStateException(
+                            "Debug shard edgeIndexes['"
+                                    + edgeId
+                                    + "'] is not an object in "
+                                    + shardFile.getAbsolutePath()
+                    );
+                }
+
+                Map<String, Double> mergedEdge =
+                        merged.get(edgeId);
+
+                if (mergedEdge == null) {
+                    mergedEdge =
+                            new LinkedHashMap<String, Double>();
+
+                    merged.put(
+                            edgeId,
+                            mergedEdge
+                    );
+                }
+
+                Iterator<Map.Entry<String, JsonNode>> entries =
+                        entriesNode.fields();
+
+                while (entries.hasNext()) {
+
+                    Map.Entry<String, JsonNode> entry =
+                            entries.next();
+
+                    String joinKey =
+                            entry.getKey();
+
+                    double weight =
+                            entry.getValue().asDouble();
+
+                    /*
+                     * Strict sharding invariant:
+                     * one final (edgeId, joinKey) may exist on exactly one
+                     * worker. Do NOT sum duplicates here; duplicates mean the
+                     * sharding itself is wrong.
+                     */
+                    if (mergedEdge.containsKey(joinKey)) {
+                        throw new IllegalStateException(
+                                "Duplicate Phase-1 sharded key found across workers. "
+                                        + "edgeId=" + edgeId
+                                        + ", joinKey=" + joinKey
+                                        + ", secondWorker=" + workerId
+                                        + ", firstWeight=" + mergedEdge.get(joinKey)
+                                        + ", secondWeight=" + weight
+                        );
+                    }
+
+                    mergedEdge.put(
+                            joinKey,
+                            weight
+                    );
+                }
+            }
+        }
+
+        ObjectNode validatorJson =
+                MAPPER.createObjectNode();
+
+        validatorJson.set(
+                "edgeIndexes",
+                MAPPER.valueToTree(merged)
+        );
+
+        File parent =
+                outputFile.getParentFile();
+
+        if (parent != null
+                && !parent.exists()
+                && !parent.mkdirs()) {
+
+            throw new IllegalStateException(
+                    "Could not create validator output directory: "
+                            + parent.getAbsolutePath()
+            );
+        }
+
+        MAPPER.writerWithDefaultPrettyPrinter()
+                .writeValue(
+                        outputFile,
+                        validatorJson
+                );
+    }
+
+    private static void deleteRecursively(File file) {
+
+        if (file == null || !file.exists()) {
+            return;
+        }
+
+        if (file.isDirectory()) {
+            File[] children =
+                    file.listFiles();
+
+            if (children != null) {
+                for (File child : children) {
+                    deleteRecursively(child);
+                }
+            }
+        }
+
+        if (!file.delete()) {
+            throw new IllegalStateException(
+                    "Could not delete stale debug path: "
+                            + file.getAbsolutePath()
+            );
+        }
     }
 
     // =====================================================================

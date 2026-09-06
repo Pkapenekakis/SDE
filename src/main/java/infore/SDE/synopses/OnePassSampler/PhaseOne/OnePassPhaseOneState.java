@@ -271,4 +271,94 @@ public class OnePassPhaseOneState implements Serializable {
 
         return new OnePassPhaseOneResult(plan, selectedIndexes, selectedSeen);
     }
+
+    /**
+     * DEBUG / VALIDATION ONLY.
+     *
+     * Returns a detached copy of the exact Phase-1 indexes physically stored
+     * on this worker.
+     *
+     * IMPORTANT:
+     * This method does not rebuild or calculate anything.
+     * It directly reads Phase1LinkWeightIndex.getRawView().
+     *
+     * Output format:
+     *
+     *   edgeId -> joinKeyText -> weight
+     *
+     * which is exactly the structure expected under the validator's
+     * "edgeIndexes" field.
+     */
+    public Map<String, Map<String, Double>> debugCopyRawIndexesForValidator() {
+
+        Map<String, Map<String, Double>> result = new LinkedHashMap<String, Map<String, Double>>();
+
+        for (Map.Entry<String, Phase1LinkWeightIndex> edgeEntry : indexByEdgeId.entrySet()) {
+
+            String edgeId = edgeEntry.getKey();
+            Phase1LinkWeightIndex index = edgeEntry.getValue();
+
+            Map<String, Double> entries = new LinkedHashMap<String, Double>();
+
+            if (index != null) {
+
+                for (Map.Entry<JoinValue, Double> entry : index.getRawView().entrySet()) {
+
+                    JoinValue joinValue = entry.getKey();
+
+                    if (joinValue == null) {
+                        throw new IllegalStateException("DEBUG EXPORT found null JoinValue in edge " + edgeId);
+                    }
+
+                    Double weight = entry.getValue();
+
+                    String joinKeyText = debugJoinValueToValidatorText(joinValue);
+
+                    entries.put(joinKeyText, weight == null ? 0.0d : weight.doubleValue());
+                }
+            }
+
+            result.put(edgeId, entries);
+        }
+
+        return result;
+    }
+
+
+    /**
+     * Independent debug formatting of JoinValue.
+     *
+     * We deliberately do not call JoinValue.toString() here so the validation
+     * export does not depend on the production/debug string formatter.
+     *
+     * The Python validator uses:
+     *
+     *   single field: value
+     *   composite:    value1|value2|...
+     */
+    private static String debugJoinValueToValidatorText(JoinValue joinValue) {
+
+        List<String> parts = joinValue.getParts();
+
+        if (parts == null || parts.isEmpty()) {
+            throw new IllegalStateException("DEBUG EXPORT encountered empty JoinValue");
+        }
+
+        if (parts.size() == 1) {
+            return parts.get(0);
+        }
+
+        StringBuilder builder = new StringBuilder();
+
+        for (int i = 0; i < parts.size(); i++) {
+
+            if (i > 0) {
+                builder.append("|");
+            }
+
+            builder.append(parts.get(i));
+        }
+
+        return builder.toString();
+    }
 }

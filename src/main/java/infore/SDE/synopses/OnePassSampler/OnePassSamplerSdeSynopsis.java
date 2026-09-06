@@ -1293,4 +1293,11 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return field.asInt(defaultValue);
     }
 
+    /**
+     * DEBUG / VALIDATION ONLY.
+     */
+    public Map<String, Map<String, Double>> debugCopyPhaseOneRawIndexesForValidator() {
+        return lifecycle.debugCopyPhaseOneRawIndexesForValidator();
+    }
+
 }

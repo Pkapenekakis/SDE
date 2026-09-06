@@ -500,4 +500,11 @@ public final class OnePassSamplerSynopsis implements Serializable {
     public long getLocalPhaseOneSeenTupleCount(String alias) {
         return phaseOneState.getSeenTupleCount(alias);
     }
+
+    /**
+     * DEBUG / VALIDATION ONLY.
+     */
+    public Map<String, Map<String, Double>> debugCopyPhaseOneRawIndexesForValidator() {
+        return phaseOneState.debugCopyRawIndexesForValidator();
+    }
 }

@@ -20,6 +20,7 @@ import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneContribution;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassShardOwnership;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
+import infore.SDE.transformations.onepass.debug.OnePassPhaseOneValidatorExporter;
 import infore.SDE.transformations.onepass.worker.OnePassPhaseOneWorkerProtocol;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
 import infore.SDE.transformations.onepass.worker.OnePassTupleBufferGate;
@@ -159,14 +160,18 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(rq.getKey());
 		ArrayList<ContinuousSynopsis>  C_Synopses =  MC_Synopses.get(rq.getKey());
 
+		if (isOnePassPhaseOneDebugExportRequest(rq)) {
+			handleOnePassPhaseOneDebugExportRequest(rq, Synopses);
+			return;
+		}
+
 
 		/*
 		 * OnePass explicit cleanup.
 		 * Keep this isolated from generic synopsis removal because OnePass owns
 		 * additional worker-local protocol/gating state outside M_Synopses.
 		 */
-		if (rq.getSynopsisID() == ONEPASS_SYNOPSIS_ID
-				&& rq.getRequestID() % 10 == 2) {
+		if (rq.getSynopsisID() == ONEPASS_SYNOPSIS_ID && rq.getRequestID() % 10 == 2) {
 
 			handleOnePassRemove(rq, Synopses);
 
@@ -2295,6 +2300,26 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			return;
 		}
 
+		/*
+		 * DEBUG ONLY.
+		 *
+		 * Dump only after the FINAL Phase-1 alias is complete.
+		 *
+		 * readySnapshotIfComplete() guarantees that this destination has received
+		 * every declared SHARD_BATCH from every source before we inspect the state.
+
+		if (OnePassPhaseOneValidatorExporter.isEnabled() && OnePassPhaseOneWorkerProtocol.COMMAND_START_PHASE_2
+				.equals(ready.nextCommand)) {
+			try {
+				OnePassPhaseOneValidatorExporter.exportWorkerShard(onePass, uid, pId, ready.expectedWorkers);
+			} catch (Exception exception) {
+				throw new IllegalStateException("Could not write Phase-1 validator shard." + " uid=" + uid +
+						", worker=" + pId, exception);
+			}
+		}
+		*
+		* */
+
 		Map<String, Object> payload = new LinkedHashMap<String, Object>();
 		payload.put("type", "LOCAL_PHASE1_SHARD_READY");
 		payload.put("protocol", "SHARDED_PHASE1_V1");
@@ -2407,5 +2432,44 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 							+ ". Phase 2 activation deferred until Phase-2 migration."
 			);
 		}
+	}
+
+	private boolean isOnePassPhaseOneDebugExportRequest(Request request) {
+
+		if (request == null || request.getSynopsisID() != ONEPASS_SYNOPSIS_ID || request.getRequestID() != 79) {
+
+			return false;
+		}
+
+		JsonNode parameters = request.getParameters();
+
+		if (parameters == null || parameters.isNull()) {
+
+			return false;
+		}
+
+		return "DEBUG_EXPORT_PHASE1_INDEXES".equals(textField(parameters, "onePassCommand", "")
+		);
+	}
+
+	private void handleOnePassPhaseOneDebugExportRequest(Request request, ArrayList<Synopsis> synopses) throws Exception {
+
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsis(request, synopses);
+
+		if (onePass == null) {
+			throw new IllegalStateException("DEBUG_EXPORT_PHASE1_INDEXES could not find OnePass synopsis." + " uid=" +
+					request.getUID() + ", worker=" + pId + ", key=" + request.getKey());
+		}
+
+		JsonNode parameters = request.getParameters();
+
+		String outputDirectory = textField(parameters, "debugOutputDirectory",
+				"/tmp/onepass-phase1-validator");
+
+		int expectedWorkers = request.getNoOfP() > 0 ?
+				request.getNoOfP() : getRuntimeContext().getNumberOfParallelSubtasks();
+
+		OnePassPhaseOneValidatorExporter.exportWorkerShard(onePass, request.getUID(), pId,
+				expectedWorkers, outputDirectory);
 	}
 }
