@@ -120,16 +120,13 @@ public final class OnePassDataRouterCoFlatMap
     }
 
     @Override
-    public void flatMap1(
-            Datapoint value,
-            Collector<Datapoint> out) throws Exception {
+    public void flatMap1(Datapoint value, Collector<Datapoint> out) throws Exception {
 
         if (value == null) {
             return;
         }
 
         String baseKey = value.getDataSetkey();
-
         Integer p = parallelismByBaseKey.get(baseKey);
 
         if (p == null || p <= 1) {
@@ -137,29 +134,18 @@ public final class OnePassDataRouterCoFlatMap
             return;
         }
 
-        if (isOnePassDataBarrier(value)
-                || isOnePassEndAlias(value)) {
-
-            broadcastToWorkers(
-                    value,
-                    baseKey,
-                    p,
-                    out
-            );
+        if (isOnePassDataBarrier(value) || isOnePassEndAlias(value)) {
+            broadcastToWorkers(value, baseKey, p, out);
 
             return;
         }
 
-        if (routingMode == RoutingMode.JOIN_KEY_HASH && phaseOneHashRoutingActive.contains(baseKey)) {
+        if (routingMode == RoutingMode.JOIN_KEY_HASH) {
 
             CompiledOnePassPlan plan = planByBaseKey.get(baseKey);
 
             if (plan == null) {
-                throw new IllegalStateException(
-                        "JOIN_KEY_HASH routing is active without a compiled OnePass plan. "
-                                + "baseKey="
-                                + baseKey
-                );
+                throw new IllegalStateException("JOIN_KEY_HASH routing has no compiled OnePass plan." + " baseKey=" + baseKey);
             }
 
             OnePassTuple tuple = OnePassTupleExtractor.extract(value.getValues());
@@ -167,44 +153,35 @@ public final class OnePassDataRouterCoFlatMap
             String alias = tuple.getTable();
 
             if (!plan.containsAlias(alias)) {
-                throw new IllegalStateException("Tuple alias '" + alias
-                                + "' is not present in the compiled OnePass plan. "
-                                + "baseKey="
-                                + baseKey
-                );
+                throw new IllegalStateException("Tuple alias '" + alias + "' is not present in the OnePass plan." +
+                        " baseKey=" + baseKey);
             }
 
-            if (!plan.isRoot(alias)) {
+            /*
+             * ROOT tuples belong to sharded Phase 2.
+             *
+             * Route them by the first child continuation edge even if the START_PHASE_2
+             * control message and data stream race.
+             */
+            if (plan.isRoot(alias)) {
+                int worker = OnePassShardOwnership.ownerForPhaseTwoRootTuple(tuple, plan, p);
+                out.collect(copyWithKey(value, routedKey(baseKey, p, worker)));
+                return;
+            }
 
-                int worker =
-                        chooseJoinKeyWorker(
-                                tuple,
-                                alias,
-                                plan,
-                                p
-                        );
-
-                out.collect(
-                        copyWithKey(
-                                value,
-                                routedKey(
-                                        baseKey,
-                                        p,
-                                        worker
-                                )
-                        )
-                );
+            /*
+             * Non-root tuples use the existing sharded Phase-1 path only while Phase 1
+             * hash routing is active.
+             */
+            if (phaseOneHashRoutingActive.contains(baseKey)) {
+                int worker = OnePassShardOwnership.ownerForPhaseOneInputTuple(tuple, plan, p);
+                out.collect(copyWithKey(value, routedKey(baseKey, p, worker)));
 
                 return;
             }
         }
 
-        routeRoundRobin(
-                value,
-                baseKey,
-                p,
-                out
-        );
+        routeRoundRobin(value, baseKey, p, out);
     }
 
     @Override
@@ -298,13 +275,8 @@ public final class OnePassDataRouterCoFlatMap
 
                 phaseOneHashRoutingActive.remove(baseKey);
 
-                System.out.println(
-                        "[OnePassDataRouter] Phase 1 hash routing complete. "
-                                + "baseKey="
-                                + baseKey
-                                + ", fallback="
-                                + RoutingMode.ROUND_ROBIN
-                );
+                System.out.println("[OnePassDataRouter] Phase 1 hash routing complete." + " baseKey=" + baseKey +
+                        ". Root tuples will use SHARDED_PHASE2 first-child ownership.");
             }
 
             return;

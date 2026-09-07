@@ -1,4 +1,4 @@
-package infore.SDE.transformations.onepass.worker;
+package infore.SDE.transformations.onepass.worker.PhaseOne;
 
 import java.io.Serializable;
 import java.util.HashMap;

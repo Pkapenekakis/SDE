@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import infore.SDE.transformations.onepass.worker.OnePassPhaseOneWorkerProtocol;
+import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneWorkerProtocol;
 import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;

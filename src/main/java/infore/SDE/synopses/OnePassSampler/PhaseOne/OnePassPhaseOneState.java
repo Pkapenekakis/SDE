@@ -407,4 +407,42 @@ public class OnePassPhaseOneState implements Serializable {
             );
         }
     }
+
+    /**
+     * Phase-2 root lookup against the already-built local Phase-1 shard.
+     *
+     * The caller must route the root computation to the deterministic owner of
+     * this child edge/key before invoking this method.
+     */
+    public double lookupRootChildContinuationWeight(OnePassTuple rootTuple, int childIndex) {
+
+        if (rootTuple == null) {throw new IllegalArgumentException("rootTuple must not be null");}
+
+        String alias = rootTuple.getTable();
+
+        if (!plan.isRoot(alias)) {
+            throw new IllegalArgumentException("Expected Phase-2 root alias '" + plan.getRootAlias() +
+                    "' but received alias '" + alias + "'");
+        }
+
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
+
+        if (childIndex < 0 || childIndex >= childEdges.size()) {
+
+            throw new IllegalArgumentException("Invalid Phase-2 root childIndex=" + childIndex +
+                    " for root=" + alias + ", childCount=" + childEdges.size());
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(childIndex);
+
+        JoinValue lookupKey = JoinValue.fromTuple(rootTuple, childEdge.getParentFields());
+        Phase1LinkWeightIndex localIndex = indexByEdgeId.get(childEdge.getEdgeId());
+
+        if (localIndex == null) {
+            throw new IllegalStateException("Missing local Phase-1 child index for Phase-2 lookup." +
+                    " edgeId=" + childEdge.getEdgeId() + ", rootAlias=" + alias + ", childIndex=" + childIndex);
+        }
+
+        return localIndex.getOrZero(lookupKey);
+    }
 }

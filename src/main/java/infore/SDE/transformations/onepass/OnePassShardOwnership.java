@@ -103,6 +103,45 @@ public final class OnePassShardOwnership {
         return workerKey.endsWith(suffix) ? workerKey.substring(0, workerKey.length() - suffix.length()) : workerKey;
     }
 
+    /**
+     * Initial Phase-2 root owner.
+     * A root tuple must first read child edge 0, so route it directly to the owner
+     * of that child continuation entry.
+     */
+    public static int ownerForPhaseTwoRootTuple(OnePassTuple tuple, CompiledOnePassPlan plan, int parallelism) {
+
+        if (tuple == null) {
+            throw new IllegalArgumentException("tuple must not be null");
+        }
+
+        if (plan == null) {
+            throw new IllegalArgumentException("plan must not be null");
+        }
+
+        String alias = tuple.getTable();
+
+        if (!plan.isRoot(alias)) {
+            throw new IllegalArgumentException("Phase-2 input must be root alias '" +
+                    plan.getRootAlias() + "' but received '" + alias + "'");
+        }
+
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
+
+        /*
+         * A connected multi-relation query should always have at least one root
+         * child. Keep worker 0 as a safe fallback for a hypothetical single-relation
+         * query.
+         */
+        if (childEdges.isEmpty()) {
+            return 0;
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge firstChild = childEdges.get(0);
+        JoinValue lookupKey = JoinValue.fromTuple(tuple, firstChild.getParentFields());
+
+        return ownerForEdgeKey(firstChild.getEdgeId(), lookupKey, parallelism);
+    }
+
     /** deterministic FNV-1a 64-bit hash, folded to int */
     private static int stableWorkerHash(String routingKey, int parallelism) {
         byte[] bytes = routingKey.getBytes(StandardCharsets.UTF_8);

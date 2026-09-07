@@ -3,7 +3,7 @@ package Tests.PhaseOne;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import infore.SDE.transformations.onepass.worker.OnePassPhaseOneWorkerProtocol;
+import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneWorkerProtocol;
 import infore.SDE.transformations.onepass.worker.OnePassTupleBufferGate;
 import org.junit.Test;
 

@@ -8,7 +8,7 @@ import infore.SDE.messages.Request;
 import infore.SDE.transformations.onepass.OnePassFeedbackRequestFactory;
 import infore.SDE.transformations.onepass.OnePassPhaseOneRequestSplitter;
 import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorFilter;
-import infore.SDE.transformations.onepass.worker.OnePassPhaseOneWorkerProtocol;
+import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneWorkerProtocol;
 import org.apache.flink.util.Collector;
 import org.junit.Test;
 

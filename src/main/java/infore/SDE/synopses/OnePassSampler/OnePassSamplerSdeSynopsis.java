@@ -6,7 +6,7 @@ import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.messages.Request;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.*;
 import infore.SDE.synopses.Synopsis;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
@@ -14,10 +14,6 @@ import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassCompletedSample;
 import com.fasterxml.jackson.databind.JsonNode;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleCandidate;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.WeightedReservoirEntry;
-import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleInstance;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneContribution;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 
@@ -941,20 +937,118 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
     }
 
     public double beginShardedPhaseOneTuple(Object payload) {
-
         return lifecycle.beginShardedPhaseOneTuple(payload);
     }
 
 
     public double lookupShardedPhaseOneChildWeight(Object payload, int childIndex) {
-
         return lifecycle.lookupShardedPhaseOneChildWeight(payload, childIndex);
     }
 
 
     public OnePassPhaseOneContribution buildShardedPhaseOneParentContribution(Object payload, double subtreeWeight) {
-
         return lifecycle.buildShardedPhaseOneParentContribution(payload, subtreeWeight);
+    }
+
+    public Estimation buildLocalShardedPhaseTwoRootSummaryEstimation(String baseKey, int uid, int workerId,
+                                                                     int expectedWorkers, int actualParallelism,
+                                                                     String resultId) {
+
+        OnePassShardedPhaseTwoState state = lifecycle.getShardedPhaseTwoState();
+
+        if (state == null) {
+            throw new IllegalStateException("Cannot export LOCAL_PHASE2_ROOT_SUMMARY because " +
+                    "sharded Phase-2 state is null.");
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+
+        payload.put("type", "LOCAL_PHASE2_ROOT_SUMMARY");
+        payload.put("protocol", "SHARDED_PHASE2_V1");
+        payload.put("uid", uid);
+        payload.put("workerId", workerId);
+        payload.put("expectedWorkers", expectedWorkers);
+        payload.put("actualParallelism", actualParallelism);
+        payload.put("phase", "PHASE2");
+        payload.put("resultId", resultId);
+        payload.put("queryName", plan.getQueryName());
+        payload.put("rootAlias", plan.getRootAlias());
+        payload.put("baseKey", baseKey);
+        /*
+         * Keep the ORIGINAL query seed here.
+         *
+         * The reducer uses this seed for the final multinomial conversion.
+         * Worker-specific seeds are used only internally for local ES keys.
+         */
+        payload.put("datasetSeed", plan.getDatasetSeed());
+        payload.put("sampleSize", state.getSampleSize());
+        payload.put("rootTuplesSeen", state.getRootTuplesSeen());
+        payload.put("positiveRootCandidatesSeen", state.getPositiveRootCandidatesSeen());
+        payload.put("totalRootGroupWeight", state.getTotalRootGroupWeight());
+
+        List<Map<String, Object>> reservoir = new ArrayList<Map<String, Object>>();
+
+        for (WeightedReservoirEntry<OnePassRootSampleCandidate> entry : state.getOrderedReservoir()) {
+
+            OnePassRootSampleCandidate candidate = entry.getItem();
+            Map<String, Object> candidateJson = new LinkedHashMap<String, Object>();
+
+            candidateJson.put("candidateId", candidate.getCandidateId());
+            candidateJson.put("rootAlias", candidate.getRootAlias());
+            candidateJson.put("rootTuple", candidate.getRootTuple());
+            candidateJson.put("rootGroupWeight", candidate.getRootGroupWeight());
+            candidateJson.put("esKey", entry.getKey());
+
+            candidateJson.put("arrivalOrder", entry.getArrivalOrder());
+            reservoir.add(candidateJson);
+        }
+
+        payload.put("orderedReservoir", reservoir);
+
+        String json;
+        try {
+            json = MAPPER.writeValueAsString(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not serialize sharded LOCAL_PHASE2_ROOT_SUMMARY", e);
+        }
+
+        String[] param = new String[] {
+                        "LOCAL_PHASE2_ROOT_SUMMARY",
+                        resultId,
+                        "PHASE2",
+                        plan.getRootAlias(),
+                        Integer.toString(workerId),
+                        Integer.toString(expectedWorkers)};
+
+        String reduceKey = uid + "_PHASE2_" + resultId;
+
+        return new Estimation(uid, reduceKey, 82, 30, reduceKey, json, param, expectedWorkers
+        );
+    }
+
+
+    public void startShardedPhaseTwo(int workerId) {
+        lifecycle.startShardedPhaseTwo(workerId);
+    }
+
+    public double beginShardedPhaseTwoRootTuple(Object payload) {
+        return lifecycle.beginShardedPhaseTwoRootTuple(payload);
+    }
+
+    public double lookupShardedPhaseTwoRootChildWeight(Object payload, int childIndex) {
+        return lifecycle.lookupShardedPhaseTwoRootChildWeight(payload, childIndex);
+    }
+
+    public void acceptShardedPhaseTwoRootCandidate(Object payload, double rootGroupWeight) {
+        lifecycle.acceptShardedPhaseTwoRootCandidate(payload, rootGroupWeight);
+    }
+
+    public boolean isShardedPhaseTwoActive() {
+        return lifecycle.isShardedPhaseTwoActive();
+    }
+
+    public boolean isShardedPhaseTwoComplete() {
+        return lifecycle.isShardedPhaseTwoComplete();
     }
 
     private static JoinValue parseJoinValue(String joinKey) {
@@ -1159,16 +1253,15 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
             instances.add(new OnePassRootSampleInstance(sampleInstanceId, candidate));
         }
 
-        OnePassRootSampleResult globalResult = new OnePassRootSampleResult(
-                rootAlias,
-                sampleSize,
-                rootTuplesSeen,
-                positiveRootCandidatesSeen,
-                totalRootGroupWeight,
-                instances
-        );
+        OnePassRootSampleResult globalResult = new OnePassRootSampleResult(rootAlias, sampleSize, rootTuplesSeen,
+                positiveRootCandidatesSeen, totalRootGroupWeight, instances);
 
-        lifecycle.installGlobalPhaseTwoRootSampleResult(globalResult);
+        if (lifecycle.isShardedPhaseTwoActive()) {
+            lifecycle.installGlobalShardedPhaseTwoRootSampleResult(globalResult);
+        } else {
+            lifecycle.installGlobalPhaseTwoRootSampleResult(globalResult
+            );
+        }
 
         Map<String, Object> summary = new LinkedHashMap<String, Object>();
         summary.put("installed", true);

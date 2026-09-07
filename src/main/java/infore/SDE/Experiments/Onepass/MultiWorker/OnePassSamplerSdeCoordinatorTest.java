@@ -31,36 +31,33 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Phase-1-only local integration/benchmark test for the sharded OnePass* design.
+ * Local integration / benchmark test for the SHARDED OnePass* Phase 1 + Phase 2 design.
  *
- * Benchmark semantics:
+ * Timing semantics:
  *
- *   1) All Phase-1 TPC-H rows are parsed, serialized and written to Kafka
- *      BEFORE the OnePass* algorithm timer starts.
+ *   Phase 1:
+ *     - TPC-H parsing + Kafka producer.send() happen outside phase1_algorithm_total.
+ *     - Each non-root alias is prepared in an open Kafka transaction.
+ *     - commitTransaction() releases one alias at a time and IS inside the Phase-1 timer.
+ *     - the phase ends when START_PHASE_2 is observed on RequestTopic.
  *
- *   2) Each Phase-1 alias is written in its own open Kafka transaction.
- *      The SDE data consumer must use isolation.level=read_committed.
+ *   Phase 2:
+ *     - the root relation is parsed + written into an open Kafka transaction
+ *       AFTER Phase 1 completes and BEFORE phase2_algorithm_total starts.
+ *     - commitTransaction() is the Phase-2 release/start signal and IS inside
+ *       phase2_algorithm_total.
+ *     - the test waits for both:
  *
- *   3) The ADD request is sent after preload.
+ *           GLOBAL_PHASE2_ROOT_SAMPLE_READY
+ *           GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED
  *
- *   4) The measured Phase-1 run starts.
+ *       on the SDE output topic.
  *
- *   5) Alias transactions are committed one by one:
+ * This keeps expensive local file parsing / JSON creation / producer.send()
+ * outside both algorithm timers while preserving the actual Kafka visibility
+ * boundary (read_committed + transaction commit) inside each measured phase.
  *
- *          commit(alias E)
- *              -> rows + END_ALIAS(E) become visible
- *              -> workers compute / shard contributions
- *              -> SHARD_BATCH + SOURCE_DONE
- *              -> LOCAL_PHASE1_SHARD_READY x P
- *              -> GLOBAL_PHASE1_ALIAS_READY
- *              -> START_NEXT_ALIAS / START_PHASE_2 on RequestTopic
- *
- *   6) The primary metric is phase1_algorithm_total.
- *
- * IMPORTANT:
- *   This test intentionally stops after Phase 1. The sharded Phase-1 draft
- *   produces START_PHASE_2 but does not activate the old Phase-2 worker logic,
- *   because the old Phase 2 assumes a fully replicated Phase-1 index.
+ * Phase 3 is intentionally not started by this test.
  */
 public final class OnePassSamplerSdeCoordinatorTest {
 
@@ -73,6 +70,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String BOOTSTRAP_SERVERS = System.getProperty("onepass.kafka", "localhost:9092");
     private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic", "dataTopic");
     private static final String REQUEST_TOPIC = System.getProperty("onepass.requestTopic", "requestTopic");
+    private static final String OUTPUT_TOPIC = System.getProperty("onepass.outputTopic", "OUT");
 
     /*
      * The running SDE job still needs its State Topic configured, but this
@@ -86,6 +84,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String PHASE1_BENCHMARK_CSV_PATH =
             System.getProperty("onepass.phase1Csv",
                     "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_sharded_local.csv");
+
+    private static final String PHASE2_BENCHMARK_CSV_PATH =
+            System.getProperty("onepass.phase2Csv",
+                    "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase2_sharded_local.csv");
 
     // ---------------------------------------------------------------------
     // TEST CONFIGURATION
@@ -103,7 +105,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // (" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) "
     // + "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
-    private static final String TEST_ONEPASS_SQL1 =
+    private static final String TEST_ONEPASS_SQL =
             "SELECT * FROM w_branch_supplier WEIGHTED BY ("
                     + "l1.l_extendedprice * l2.l_extendedprice"
                     + ") "
@@ -111,7 +113,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     + "/* catalog='tpch-onepass-catalog.json', "
                     + "seed='branch-test-123', scalefactor=1 */";
 
-    private static final String TEST_ONEPASS_SQL =
+    private static final String TEST_ONEPASS_SQL1 =
             "SELECT * FROM w_nested_branch_region WEIGHTED BY ("
                     + "l1.l_extendedprice "
                     + "* ord.o_totalprice "
@@ -143,6 +145,15 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
     private static final boolean WRITE_PHASE1_BENCHMARK_CSV = true;
+    private static final boolean WRITE_PHASE2_BENCHMARK_CSV = true;
+
+    private static final boolean RUN_PHASE_2 =
+            Boolean.parseBoolean(
+                    System.getProperty(
+                            "onepass.runPhase2",
+                            "true"
+                    )
+            );
 
     private static final int SYNOPSIS_ID = 30;
     private static final int REQUEST_ADD = 1;
@@ -182,11 +193,14 @@ public final class OnePassSamplerSdeCoordinatorTest {
         benchmarkNanos.clear();
         benchmarkCounts.clear();
 
-        String streamId = "onepass-sharded-phase1-local-test";
-        String baseKey = "onepass-phase1-" + uid;
+        String streamId =
+                "onepass-sharded-phase12-local-test";
+
+        String baseKey =
+                "onepass-phase12-" + uid;
 
         System.out.println("=======================================================");
-        System.out.println(" OnePass* SHARDED PHASE 1 - LOCAL TEST");
+        System.out.println(" OnePass* SHARDED PHASE 1 + PHASE 2 - LOCAL TEST");
         System.out.println("=======================================================");
         System.out.println("uid              = " + uid);
         System.out.println("baseKey          = " + baseKey);
@@ -194,100 +208,144 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println("bootstrap        = " + BOOTSTRAP_SERVERS);
         System.out.println("dataTopic        = " + DATA_TOPIC);
         System.out.println("requestTopic     = " + REQUEST_TOPIC);
+        System.out.println("outputTopic      = " + OUTPUT_TOPIC);
         System.out.println("stateTopic(SDE)  = " + STATE_TOPIC);
         System.out.println("TPC-H dir        = " + TEST_TPCH_DIR);
         System.out.println("TEST_ROW_LIMIT   = " + TEST_ROW_LIMIT);
         System.out.println("transactionTimeoutMs = " + TRANSACTION_TIMEOUT_MS);
+        System.out.println("RUN_PHASE_2      = " + RUN_PHASE_2);
         System.out.println("EXPORT_PHASE1_INDEXES = " + EXPORT_PHASE1_INDEXES);
+
         if (EXPORT_PHASE1_INDEXES) {
             System.out.println("phase1IndexExportDir = " + PHASE1_INDEX_EXPORT_DIR);
             System.out.println("phase1ValidatorJson  = " + PHASE1_VALIDATOR_JSON_PATH);
         }
+
         System.out.println("SQL:");
         System.out.println(TEST_ONEPASS_SQL);
         System.out.println();
 
-        OnePassParams params = OnePassSqlCompiler.compile(TEST_ONEPASS_SQL);
-        CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
-        OnePassCatalog catalog =
-                OnePassQueryCatalogLoader.load(params.getDataset().getDbConfig());
+        OnePassParams params =
+                OnePassSqlCompiler.compile(
+                        TEST_ONEPASS_SQL
+                );
 
-        validatePlanForShardedPhaseOneV1(plan);
+        CompiledOnePassPlan plan =
+                CompiledOnePassPlan.from(
+                        params
+                );
+
+        OnePassCatalog catalog =
+                OnePassQueryCatalogLoader.load(
+                        params.getDataset()
+                                .getDbConfig()
+                );
+
+        validatePlanForShardedPhaseOneV1(
+                plan
+        );
 
         System.out.println("Compiled plan:");
         System.out.println(plan);
         System.out.println("Root alias: " + plan.getRootAlias());
+        System.out.println("Root child edges: " + plan.getChildEdges(plan.getRootAlias()));
         System.out.println("Leaf-to-root order: " + plan.getLeafToRootOrder());
-        System.out.println("Required fields by alias: "
-                + plan.getRequiredFieldsByAlias());
+        System.out.println(
+                "Required fields by alias: "
+                        + plan.getRequiredFieldsByAlias()
+        );
         System.out.println();
 
-        KafkaProducer<String, String> controlProducer = createProducer();
+        KafkaProducer<String, String> controlProducer =
+                createProducer();
 
-        KafkaConsumer<String, String> feedbackConsumer =
+        KafkaConsumer<String, String> phaseOneFeedbackConsumer =
                 createObserverConsumer();
+
+        KafkaConsumer<String, String> phaseTwoOutputConsumer =
+                null;
 
         List<PreparedAliasTransaction> preparedPhaseOne =
                 new ArrayList<PreparedAliasTransaction>();
 
+        PreparedAliasTransaction preparedPhaseTwoRoot =
+                null;
+
         try {
-            /*
-             * Position the observer BEFORE ADD so no transition generated by
-             * this UID can be missed.
-             */
-            initializeObserver(feedbackConsumer, REQUEST_TOPIC);
 
             /*
-             * -------------------------------------------------------------
-             * PRELOAD - OUTSIDE THE ONEPASS* ALGORITHM TIMER
-             * -------------------------------------------------------------
-             *
-             * Rows + END_ALIAS are written into Kafka now, but remain invisible
-             * to the read_committed Flink data source until commitTransaction().
+             * Position the Phase-1 RequestTopic observer BEFORE ADD so no
+             * transition produced for this UID can be missed.
              */
-            System.out.println();
-            System.out.println("Preloading all Phase-1 aliases into Kafka " + "transactions BEFORE starting OnePass*...");
-            System.out.println();
-
-            long preloadStartNanos = tic();
-
-            preparedPhaseOne = preparePhaseOneTransactions(
-                    uid,
-                    baseKey,
-                    streamId,
-                    catalog,
-                    plan
+            initializeObserver(
+                    phaseOneFeedbackConsumer,
+                    REQUEST_TOPIC
             );
 
-            long preloadNanos = System.nanoTime() - preloadStartNanos;
+            // =============================================================
+            // PHASE 1 PRELOAD
+            // =============================================================
+
+            System.out.println();
+            System.out.println(
+                    "Preloading all Phase-1 aliases into Kafka transactions "
+                            + "BEFORE starting the measured Phase-1 algorithm..."
+            );
+            System.out.println();
+
+            long phaseOnePreloadStartNanos =
+                    tic();
+
+            preparedPhaseOne =
+                    preparePhaseOneTransactions(
+                            uid,
+                            baseKey,
+                            streamId,
+                            catalog,
+                            plan
+                    );
+
+            long phaseOnePreloadNanos =
+                    System.nanoTime()
+                            - phaseOnePreloadStartNanos;
 
             System.out.printf(
                     "Phase-1 Kafka preload completed OUTSIDE algorithm timer: %.3f s%n",
-                    preloadNanos / 1_000_000_000.0d
+                    phaseOnePreloadNanos
+                            / 1_000_000_000.0d
             );
 
-            long totalPreparedRows = 0L;
+            long totalPreparedPhaseOneRows =
+                    0L;
 
             for (PreparedAliasTransaction prepared : preparedPhaseOne) {
-                totalPreparedRows += prepared.rows;
+
+                totalPreparedPhaseOneRows +=
+                        prepared.rows;
 
                 System.out.println(
-                        "  PREPARED alias=" + prepared.alias
-                                + ", epoch=" + prepared.epoch
-                                + ", rows=" + prepared.rows
-                                + ", committed=" + prepared.committed
+                        "  PREPARED PHASE1 alias="
+                                + prepared.alias
+                                + ", epoch="
+                                + prepared.epoch
+                                + ", rows="
+                                + prepared.rows
+                                + ", committed="
+                                + prepared.committed
                 );
             }
 
-            if (totalPreparedRows <= 0L) {
+            if (totalPreparedPhaseOneRows <= 0L) {
+
                 throw new IllegalStateException(
                         "No Phase-1 rows were preloaded."
                 );
             }
 
-            /*
-             * ADD is setup, not algorithm runtime.
-             */
+            // =============================================================
+            // ADD
+            // =============================================================
+
             System.out.println();
             System.out.println(
                     "Sending ADD OnePass request with noOfP="
@@ -295,12 +353,13 @@ public final class OnePassSamplerSdeCoordinatorTest {
                             + "..."
             );
 
-            ObjectNode addRequest = buildOnePassAddRequest(
-                    baseKey,
-                    streamId,
-                    uid,
-                    EXPECTED_WORKERS
-            );
+            ObjectNode addRequest =
+                    buildOnePassAddRequest(
+                            baseKey,
+                            streamId,
+                            uid,
+                            EXPECTED_WORKERS
+                    );
 
             sendJson(
                     controlProducer,
@@ -312,36 +371,48 @@ public final class OnePassSamplerSdeCoordinatorTest {
             controlProducer.flush();
 
             /*
-             * Temporary existing ADD synchronization.
-             * Keep outside the measured Phase-1 runtime.
+             * Existing temporary ADD synchronization.
+             * Setup time; deliberately outside both algorithm timers.
              */
-            Thread.sleep(3000L);
+            Thread.sleep(
+                    3000L
+            );
 
-            /*
-             * -------------------------------------------------------------
-             * ONEPASS* PHASE-1 ALGORITHM TIMER STARTS HERE
-             * -------------------------------------------------------------
-             */
+            // =============================================================
+            // MEASURED PHASE 1
+            // =============================================================
+
             System.out.println();
             System.out.println("=======================================================");
-            System.out.println(" STARTING MEASURED ONEPASS* PHASE 1");
+            System.out.println(" STARTING MEASURED ONEPASS* SHARDED PHASE 1");
             System.out.println(" TPC-H parsing + Kafka sends are already complete.");
             System.out.println("=======================================================");
             System.out.println();
 
-            long phaseOneTotalStartNanos = tic();
+            long phaseOneTotalStartNanos =
+                    tic();
 
             for (PreparedAliasTransaction prepared : preparedPhaseOne) {
 
-                String alias = prepared.alias;
-                int epoch = prepared.epoch;
-                long aliasStartNanos = tic();
+                String alias =
+                        prepared.alias;
+
+                int epoch =
+                        prepared.epoch;
+
+                long aliasStartNanos =
+                        tic();
 
                 String resultId =
-                        "PHASE1_" + alias + "_" + uid;
+                        "PHASE1_"
+                                + alias
+                                + "_"
+                                + uid;
 
                 boolean last =
-                        epoch == plan.getLeafToRootOrder().size();
+                        epoch
+                                == plan.getLeafToRootOrder()
+                                .size();
 
                 String expectedNextCommand =
                         last
@@ -351,15 +422,20 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 String expectedNextAlias =
                         last
                                 ? plan.getRootAlias()
-                                : plan.getLeafToRootOrder().get(epoch);
+                                : plan.getLeafToRootOrder()
+                                .get(epoch);
 
                 System.out.println();
                 System.out.println("-------------------------------------------------------");
                 System.out.println(
-                        "Releasing alias=" + alias
-                                + ", epoch=" + epoch
-                                + ", rows=" + prepared.rows
+                        "Releasing Phase-1 alias="
+                                + alias
+                                + ", epoch="
+                                + epoch
+                                + ", rows="
+                                + prepared.rows
                 );
+
                 System.out.println(
                         "Expected transition: "
                                 + expectedNextCommand
@@ -369,14 +445,12 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 System.out.println("-------------------------------------------------------");
 
                 /*
-                 * commitTransaction() is intentionally inside the measured
-                 * interval. It is the release/start signal.
-                 *
-                 * All expensive file reading / JSON creation / producer.send()
-                 * calls already happened during preload.
+                 * The commit is the algorithm release signal and is therefore
+                 * intentionally inside the measured interval.
                  */
                 prepared.producer.commitTransaction();
-                prepared.committed = true;
+                prepared.committed =
+                        true;
 
                 System.out.println(
                         "Kafka transaction committed. "
@@ -386,7 +460,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
                 JsonNode transition =
                         waitForShardedPhaseOneTransition(
-                                feedbackConsumer,
+                                phaseOneFeedbackConsumer,
                                 uid,
                                 epoch,
                                 alias,
@@ -417,7 +491,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
                                 0.0d
                         );
 
-                if (globalSeen != prepared.rows) {
+                if (globalSeen
+                        != prepared.rows) {
+
                     throw new IllegalStateException(
                             "Phase-1 seen-tuple mismatch for alias="
                                     + alias
@@ -430,11 +506,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     );
                 }
 
-                /*
-                 * For normal positive-weight WQ3 data, the active shard must
-                 * contain at least one key and positive total weight.
-                 */
                 if (globalKeyCount <= 0L) {
+
                     throw new IllegalStateException(
                             "Invalid global shard key count after alias="
                                     + alias
@@ -446,6 +519,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 }
 
                 if (globalTotalWeight <= 0.0d) {
+
                     throw new IllegalStateException(
                             "Invalid global shard total weight after alias="
                                     + alias
@@ -462,12 +536,16 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 );
 
                 recordCount(
-                        "phase1_alias_" + alias + "_rows_processed",
+                        "phase1_alias_"
+                                + alias
+                                + "_rows_processed",
                         prepared.rows
                 );
 
                 recordDuration(
-                        "phase1_alias_" + alias + "_algorithm",
+                        "phase1_alias_"
+                                + alias
+                                + "_algorithm",
                         aliasStartNanos
                 );
 
@@ -490,15 +568,21 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     phaseOneTotalStartNanos
             );
 
+            System.out.println();
+            System.out.println("=======================================================");
+            System.out.println(" SHARDED PHASE 1 COMPLETE");
+            System.out.println(" START_PHASE_2 has been observed.");
+            System.out.println("=======================================================");
+
             /*
-             * -------------------------------------------------------------
-             * PHASE-1 MEASUREMENT ENDS HERE
-             * -------------------------------------------------------------
+             * Debug export is deliberately outside phase1_algorithm_total.
              *
-             * Any debug index export below is intentionally outside the
-             * algorithm timer.
+             * START_PHASE_2 may already have activated the Phase-2 lifecycle,
+             * but Phase-1 shard state still exists and the debug exporter reads
+             * that physical state directly.
              */
             if (EXPORT_PHASE1_INDEXES) {
+
                 exportPhaseOneIndexesForValidator(
                         controlProducer,
                         uid,
@@ -506,32 +590,322 @@ public final class OnePassSamplerSdeCoordinatorTest {
                         streamId
                 );
             }
-            System.out.println();
-            System.out.println("=======================================================");
-            System.out.println(" SHARDED PHASE 1 COMPLETE");
-            System.out.println("=======================================================");
 
             printPhaseOneBenchmarkSummary(
                     plan,
-                    preloadNanos
+                    phaseOnePreloadNanos
             );
 
             writePhaseOneBenchmarkCsv(
                     plan,
-                    preloadNanos,
+                    phaseOnePreloadNanos,
                     "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE1_LOCAL"
             );
 
-            System.out.println();
-            System.out.println(
-                    "SUCCESS: sharded Phase 1 completed locally. "
-                            + "START_PHASE_2 was observed, but this test stops here "
-                            + "because Phase 2 has not been migrated to sharded Phase-1 state yet."
-            );
+            // =============================================================
+            // PHASE 2
+            // =============================================================
+
+            if (RUN_PHASE_2) {
+
+                /*
+                 * Prepare the ROOT transaction now.
+                 *
+                 * This is AFTER Phase 1 and BEFORE the Phase-2 timer. It avoids
+                 * keeping another Kafka transaction open throughout the entire
+                 * Phase-1 run, while still excluding TPC-H parsing / JSON
+                 * building / producer.send() from phase2_algorithm_total.
+                 */
+                System.out.println();
+                System.out.println("=======================================================");
+                System.out.println(" PREPARING PHASE-2 ROOT TRANSACTION OUTSIDE TIMER");
+                System.out.println(" rootAlias=" + plan.getRootAlias());
+                System.out.println("=======================================================");
+
+                long phaseTwoPreloadStartNanos =
+                        tic();
+
+                preparedPhaseTwoRoot =
+                        preparePhaseTwoRootTransaction(
+                                uid,
+                                baseKey,
+                                streamId,
+                                catalog,
+                                plan
+                        );
+
+                long phaseTwoPreloadNanos =
+                        System.nanoTime()
+                                - phaseTwoPreloadStartNanos;
+
+                System.out.printf(
+                        "Phase-2 root Kafka preload completed OUTSIDE algorithm timer: %.3f s%n",
+                        phaseTwoPreloadNanos
+                                / 1_000_000_000.0d
+                );
+
+                System.out.println(
+                        "  PREPARED PHASE2 rootAlias="
+                                + preparedPhaseTwoRoot.alias
+                                + ", epoch="
+                                + preparedPhaseTwoRoot.epoch
+                                + ", rows="
+                                + preparedPhaseTwoRoot.rows
+                                + ", committed="
+                                + preparedPhaseTwoRoot.committed
+                );
+
+                /*
+                 * OUT observer is initialized immediately before Phase 2.
+                 * Seeking to end here discards unrelated/old Phase-1 output but
+                 * cannot miss Phase-2 completion because root data is still
+                 * hidden inside the uncommitted transaction.
+                 */
+                phaseTwoOutputConsumer =
+                        createObserverConsumer();
+
+                initializeObserver(
+                        phaseTwoOutputConsumer,
+                        OUTPUT_TOPIC
+                );
+
+                String phaseTwoResultId =
+                        phaseTwoResultId(
+                                uid
+                        );
+
+                System.out.println();
+                System.out.println("=======================================================");
+                System.out.println(" STARTING MEASURED ONEPASS* SHARDED PHASE 2");
+                System.out.println(" rootAlias=" + plan.getRootAlias());
+                System.out.println(" rootRows=" + preparedPhaseTwoRoot.rows);
+                System.out.println(" resultId=" + phaseTwoResultId);
+                System.out.println("=======================================================");
+
+                long phaseTwoStartNanos =
+                        tic();
+
+                preparedPhaseTwoRoot.producer.commitTransaction();
+                preparedPhaseTwoRoot.committed =
+                        true;
+
+                System.out.println(
+                        "Kafka transaction committed. Phase-2 root "
+                                + preparedPhaseTwoRoot.alias
+                                + " is now visible to the read_committed SDE source."
+                );
+
+                PhaseTwoCompletion phaseTwoCompletion =
+                        waitForShardedPhaseTwoCompletion(
+                                phaseTwoOutputConsumer,
+                                uid,
+                                phaseTwoResultId,
+                                TIMEOUT_MS
+                        );
+
+                recordDuration(
+                        "phase2_algorithm_total",
+                        phaseTwoStartNanos
+                );
+
+                recordCount(
+                        "phase2_root_rows_processed",
+                        preparedPhaseTwoRoot.rows
+                );
+
+                JsonNode ready =
+                        phaseTwoCompletion.readyPayload;
+
+                JsonNode installed =
+                        phaseTwoCompletion.installedPayload;
+
+                long rootTuplesSeen =
+                        longField(
+                                ready,
+                                "rootTuplesSeen",
+                                -1L
+                        );
+
+                long positiveRootCandidatesSeen =
+                        longField(
+                                ready,
+                                "positiveRootCandidatesSeen",
+                                -1L
+                        );
+
+                double totalRootGroupWeight =
+                        doubleField(
+                                ready,
+                                "totalRootGroupWeight",
+                                0.0d
+                        );
+
+                int sampleSize =
+                        intField(
+                                ready,
+                                "sampleSize",
+                                -1
+                        );
+
+                int sampleInstanceCount =
+                        intField(
+                                ready,
+                                "sampleInstanceCount",
+                                -1
+                        );
+
+                int installedWorkerCount =
+                        intField(
+                                installed,
+                                "installedWorkerCount",
+                                -1
+                        );
+
+                JsonNode failedWorkers =
+                        installed.get(
+                                "failedWorkers"
+                        );
+
+                if (rootTuplesSeen
+                        != preparedPhaseTwoRoot.rows) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 root tuple count mismatch."
+                                    + " expected="
+                                    + preparedPhaseTwoRoot.rows
+                                    + ", actual="
+                                    + rootTuplesSeen
+                                    + ", ready="
+                                    + ready
+                    );
+                }
+
+                if (positiveRootCandidatesSeen <= 0L
+                        || positiveRootCandidatesSeen > rootTuplesSeen) {
+
+                    throw new IllegalStateException(
+                            "Invalid Phase-2 positiveRootCandidatesSeen="
+                                    + positiveRootCandidatesSeen
+                                    + ", rootTuplesSeen="
+                                    + rootTuplesSeen
+                                    + ", ready="
+                                    + ready
+                    );
+                }
+
+                if (totalRootGroupWeight <= 0.0d
+                        || Double.isNaN(totalRootGroupWeight)
+                        || Double.isInfinite(totalRootGroupWeight)) {
+
+                    throw new IllegalStateException(
+                            "Invalid Phase-2 totalRootGroupWeight="
+                                    + totalRootGroupWeight
+                                    + ". Ready="
+                                    + ready
+                    );
+                }
+
+                if (sampleSize
+                        != plan.getSampleSize()) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 sampleSize mismatch."
+                                    + " plan="
+                                    + plan.getSampleSize()
+                                    + ", global="
+                                    + sampleSize
+                                    + ", ready="
+                                    + ready
+                    );
+                }
+
+                if (sampleInstanceCount
+                        != plan.getSampleSize()) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 sampleInstanceCount mismatch."
+                                    + " expected="
+                                    + plan.getSampleSize()
+                                    + ", actual="
+                                    + sampleInstanceCount
+                                    + ", ready="
+                                    + ready
+                    );
+                }
+
+                if (installedWorkerCount
+                        != EXPECTED_WORKERS) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 installed worker count mismatch."
+                                    + " expected="
+                                    + EXPECTED_WORKERS
+                                    + ", actual="
+                                    + installedWorkerCount
+                                    + ", installed="
+                                    + installed
+                    );
+                }
+
+                if (failedWorkers != null
+                        && failedWorkers.isArray()
+                        && failedWorkers.size() > 0) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 root sample install failed on workers: "
+                                    + failedWorkers
+                                    + ". Installed="
+                                    + installed
+                    );
+                }
+
+                printPhaseTwoBenchmarkSummary(
+                        plan,
+                        preparedPhaseTwoRoot.rows,
+                        phaseTwoPreloadNanos,
+                        ready,
+                        installed
+                );
+
+                writePhaseTwoBenchmarkCsv(
+                        plan,
+                        preparedPhaseTwoRoot.rows,
+                        phaseTwoPreloadNanos,
+                        ready,
+                        installed,
+                        "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE2_LOCAL"
+                );
+
+                System.out.println();
+                System.out.println("=======================================================");
+                System.out.println(" SHARDED PHASE 2 COMPLETE");
+                System.out.println("=======================================================");
+                System.out.println(
+                        "SUCCESS: Phase 1 + sharded Phase 2 completed locally."
+                );
+                System.out.println(
+                        "Global root sample is installed on all "
+                                + EXPECTED_WORKERS
+                                + " workers. Phase 3 is intentionally not started."
+                );
+
+            } else {
+
+                System.out.println();
+                System.out.println(
+                        "SUCCESS: sharded Phase 1 completed locally. "
+                                + "RUN_PHASE_2=false, so the test stops at START_PHASE_2."
+                );
+            }
 
         } finally {
 
+            // =============================================================
+            // ONEPASS CLEANUP
+            // =============================================================
+
             try {
+
                 System.out.println();
                 System.out.println(
                         "Removing OnePass synopsis uid="
@@ -556,62 +930,115 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 controlProducer.flush();
 
             } catch (Exception cleanupError) {
+
                 System.err.println(
                         "WARNING: OnePass cleanup request failed for uid="
                                 + uid
                 );
+
                 cleanupError.printStackTrace();
             }
 
             /*
-             * Any transaction that did not reach commitTransaction() must be
-             * explicitly aborted before closing.
+             * Abort any Phase-1 transaction that did not reach its release
+             * point, then close every transactional producer.
              */
             for (PreparedAliasTransaction prepared : preparedPhaseOne) {
 
-                if (prepared == null || prepared.producer == null) {
-                    continue;
-                }
-
-                try {
-                    if (!prepared.committed) {
-                        System.err.println(
-                                "Aborting uncommitted Phase-1 transaction: alias="
-                                        + prepared.alias
-                                        + ", epoch="
-                                        + prepared.epoch
-                        );
-
-                        prepared.producer.abortTransaction();
-                    }
-                } catch (Exception abortError) {
-                    System.err.println(
-                            "WARNING: could not abort transaction for alias="
-                                    + prepared.alias
-                    );
-                    abortError.printStackTrace();
-                }
-
-                try {
-                    prepared.producer.close();
-                } catch (Exception closeError) {
-                    System.err.println(
-                            "WARNING: could not close transactional producer for alias="
-                                    + prepared.alias
-                    );
-                    closeError.printStackTrace();
-                }
+                closePreparedTransaction(
+                        prepared,
+                        "Phase-1"
+                );
             }
 
+            /*
+             * Same cleanup for the root transaction if Phase 2 preparation
+             * succeeded but its release/completion failed.
+             */
+            closePreparedTransaction(
+                    preparedPhaseTwoRoot,
+                    "Phase-2 root"
+            );
+
             try {
-                feedbackConsumer.close();
+
+                phaseOneFeedbackConsumer.close();
+
             } catch (Exception ignored) {
             }
 
+            if (phaseTwoOutputConsumer != null) {
+
+                try {
+
+                    phaseTwoOutputConsumer.close();
+
+                } catch (Exception ignored) {
+                }
+            }
+
             try {
+
                 controlProducer.close();
+
             } catch (Exception ignored) {
             }
+        }
+    }
+
+
+    private static void closePreparedTransaction(
+            PreparedAliasTransaction prepared,
+            String label) {
+
+        if (prepared == null
+                || prepared.producer == null) {
+
+            return;
+        }
+
+        try {
+
+            if (!prepared.committed) {
+
+                System.err.println(
+                        "Aborting uncommitted "
+                                + label
+                                + " transaction: alias="
+                                + prepared.alias
+                                + ", epoch="
+                                + prepared.epoch
+                );
+
+                prepared.producer.abortTransaction();
+            }
+
+        } catch (Exception abortError) {
+
+            System.err.println(
+                    "WARNING: could not abort "
+                            + label
+                            + " transaction for alias="
+                            + prepared.alias
+            );
+
+            abortError.printStackTrace();
+        }
+
+        try {
+
+            prepared.producer.close();
+
+        } catch (Exception closeError) {
+
+            System.err.println(
+                    "WARNING: could not close "
+                            + label
+                            + " transactional producer for alias="
+                            + prepared.alias
+            );
+
+            closeError.printStackTrace();
         }
     }
 
@@ -774,6 +1201,162 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         return prepared;
     }
+
+
+    // =====================================================================
+    // PHASE-2 ROOT PRELOAD
+    // =====================================================================
+
+    private static PreparedAliasTransaction preparePhaseTwoRootTransaction(
+            int uid,
+            String baseKey,
+            String streamId,
+            OnePassCatalog catalog,
+            CompiledOnePassPlan plan) throws Exception {
+
+        String rootAlias =
+                plan.getRootAlias();
+
+        int epoch =
+                plan.getLeafToRootOrder()
+                        .size()
+                        + 1;
+
+        String resultId =
+                phaseTwoResultId(
+                        uid
+                );
+
+        String transactionalId =
+                "onepass-p2-"
+                        + uid
+                        + "-"
+                        + epoch
+                        + "-"
+                        + rootAlias
+                        + "-"
+                        + Long.toHexString(
+                        System.nanoTime()
+                );
+
+        KafkaProducer<String, String> rootProducer =
+                createTransactionalProducer(
+                        transactionalId
+                );
+
+        boolean success =
+                false;
+
+        try {
+
+            System.out.println(
+                    "Preparing Kafka transaction for Phase-2 root alias="
+                            + rootAlias
+                            + ", epoch="
+                            + epoch
+                            + "..."
+            );
+
+            long rows =
+                    streamAlias(
+                            rootProducer,
+                            DATA_TOPIC,
+                            baseKey,
+                            streamId,
+                            catalog,
+                            plan,
+                            rootAlias,
+                            TEST_ROW_LIMIT,
+                            plan.getRequiredFieldsByAlias()
+                    );
+
+            if (rows <= 0L) {
+
+                throw new IllegalStateException(
+                        "No rows were read for Phase-2 root alias "
+                                + rootAlias
+                );
+            }
+
+            ObjectNode endRoot =
+                    buildPhaseTwoEndAliasDatapoint(
+                            baseKey,
+                            streamId,
+                            uid,
+                            rootAlias,
+                            epoch,
+                            resultId,
+                            EXPECTED_WORKERS
+                    );
+
+            /*
+             * Same transaction + same Kafka key as the root tuples.
+             * With read_committed, END_ALIAS(root) cannot be observed before
+             * all earlier root rows in this transaction become visible.
+             */
+            sendJsonAsync(
+                    rootProducer,
+                    DATA_TOPIC,
+                    baseKey,
+                    endRoot
+            );
+
+            rootProducer.flush();
+
+            PreparedAliasTransaction prepared =
+                    new PreparedAliasTransaction(
+                            rootAlias,
+                            epoch,
+                            rows,
+                            rootProducer
+                    );
+
+            success =
+                    true;
+
+            System.out.println(
+                    "Prepared UNCOMMITTED Phase-2 root transaction:"
+                            + " alias="
+                            + rootAlias
+                            + ", epoch="
+                            + epoch
+                            + ", rows="
+                            + rows
+                            + ", resultId="
+                            + resultId
+            );
+
+            return prepared;
+
+        } finally {
+
+            if (!success) {
+
+                try {
+
+                    rootProducer.abortTransaction();
+
+                } catch (Exception ignored) {
+                }
+
+                try {
+
+                    rootProducer.close();
+
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+
+    private static String phaseTwoResultId(
+            int uid) {
+
+        return "PHASE2_RESULT_"
+                + uid;
+    }
+
 
     private static KafkaProducer<String, String> createTransactionalProducer(
             String transactionalId) {
@@ -1059,6 +1642,378 @@ public final class OnePassSamplerSdeCoordinatorTest {
                         + recordsSeen
         );
     }
+
+
+    // =====================================================================
+    // SHARDED PHASE-2 OUTPUT-TOPIC OBSERVER
+    // =====================================================================
+
+    /**
+     * Waits for both Phase-2 milestones:
+     *
+     *   1) GLOBAL_PHASE2_ROOT_SAMPLE_READY
+     *      - contains deterministic global metrics:
+     *          rootTuplesSeen
+     *          positiveRootCandidatesSeen
+     *          totalRootGroupWeight
+     *          sampleInstanceCount
+     *
+     *   2) GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED
+     *      - confirms the globally reduced sample has been installed on all
+     *        workers.
+     *
+     * One loop is used deliberately. Kafka poll() advances the consumer
+     * position for the whole returned batch, so returning immediately on READY
+     * could otherwise discard an INSTALLED event that was in the same poll.
+     */
+    private static PhaseTwoCompletion waitForShardedPhaseTwoCompletion(
+            KafkaConsumer<String, String> consumer,
+            int uid,
+            String expectedResultId,
+            long timeoutMs) throws Exception {
+
+        long deadline =
+                System.currentTimeMillis()
+                        + timeoutMs;
+
+        JsonNode readyPayload =
+                null;
+
+        JsonNode installedPayload =
+                null;
+
+        String expectedStateRef =
+                "";
+
+        int recordsSeen =
+                0;
+
+        while (System.currentTimeMillis()
+                < deadline) {
+
+            ConsumerRecords<String, String> records =
+                    consumer.poll(
+                            1000L
+                    );
+
+            for (ConsumerRecord<String, String> record : records) {
+
+                recordsSeen++;
+
+                JsonNode envelope;
+
+                try {
+
+                    envelope =
+                            MAPPER.readTree(
+                                    record.value()
+                            );
+
+                } catch (Exception ignored) {
+
+                    continue;
+                }
+
+                JsonNode payload =
+                        unwrapEstimationPayload(
+                                envelope
+                        );
+
+                if (payload == null
+                        || payload.isNull()
+                        || !payload.isObject()) {
+
+                    continue;
+                }
+
+                if (intField(
+                        payload,
+                        "uid",
+                        -1
+                ) != uid) {
+
+                    continue;
+                }
+
+                String type =
+                        textField(
+                                payload,
+                                "type",
+                                ""
+                        );
+
+                if ("GLOBAL_PHASE2_ROOT_SAMPLE_READY".equals(
+                        type
+                )) {
+
+                    String resultId =
+                            textField(
+                                    payload,
+                                    "resultId",
+                                    ""
+                            );
+
+                    if (!expectedResultId.equals(
+                            resultId
+                    )) {
+
+                        continue;
+                    }
+
+                    readyPayload =
+                            payload.deepCopy();
+
+                    expectedStateRef =
+                            textField(
+                                    payload,
+                                    "stateRef",
+                                    ""
+                            );
+
+                    System.out.println(
+                            "Observed GLOBAL_PHASE2_ROOT_SAMPLE_READY:"
+                                    + " resultId="
+                                    + resultId
+                                    + ", stateRef="
+                                    + expectedStateRef
+                                    + ", rootTuplesSeen="
+                                    + longField(
+                                    payload,
+                                    "rootTuplesSeen",
+                                    -1L
+                            )
+                                    + ", positiveRootCandidatesSeen="
+                                    + longField(
+                                    payload,
+                                    "positiveRootCandidatesSeen",
+                                    -1L
+                            )
+                                    + ", totalRootGroupWeight="
+                                    + doubleField(
+                                    payload,
+                                    "totalRootGroupWeight",
+                                    0.0d
+                            )
+                                    + ", sampleInstanceCount="
+                                    + intField(
+                                    payload,
+                                    "sampleInstanceCount",
+                                    -1
+                            )
+                    );
+
+                    /*
+                     * If INSTALLED was seen first for some unexpected reason,
+                     * verify its stateRef now.
+                     */
+                    if (installedPayload != null) {
+
+                        String installedStateRef =
+                                textField(
+                                        installedPayload,
+                                        "stateRef",
+                                        ""
+                                );
+
+                        if (!expectedStateRef.equals(
+                                installedStateRef
+                        )) {
+
+                            installedPayload =
+                                    null;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if ("GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(
+                        type
+                )) {
+
+                    String stateRef =
+                            textField(
+                                    payload,
+                                    "stateRef",
+                                    ""
+                            );
+
+                    if (readyPayload != null
+                            && !expectedStateRef.equals(
+                            stateRef
+                    )) {
+
+                        continue;
+                    }
+
+                    installedPayload =
+                            payload.deepCopy();
+
+                    System.out.println(
+                            "Observed GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED:"
+                                    + " stateRef="
+                                    + stateRef
+                                    + ", installedWorkerCount="
+                                    + intField(
+                                    payload,
+                                    "installedWorkerCount",
+                                    -1
+                            )
+                                    + ", expectedWorkers="
+                                    + intField(
+                                    payload,
+                                    "expectedWorkers",
+                                    -1
+                            )
+                                    + ", failedWorkers="
+                                    + payload.get(
+                                    "failedWorkers"
+                            )
+                    );
+                }
+            }
+
+            if (readyPayload != null
+                    && installedPayload != null) {
+
+                String readyStateRef =
+                        textField(
+                                readyPayload,
+                                "stateRef",
+                                ""
+                        );
+
+                String installedStateRef =
+                        textField(
+                                installedPayload,
+                                "stateRef",
+                                ""
+                        );
+
+                if (!readyStateRef.equals(
+                        installedStateRef
+                )) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 READY/INSTALLED stateRef mismatch."
+                                    + " ready="
+                                    + readyStateRef
+                                    + ", installed="
+                                    + installedStateRef
+                    );
+                }
+
+                return new PhaseTwoCompletion(
+                        readyPayload,
+                        installedPayload
+                );
+            }
+        }
+
+        throw new IllegalStateException(
+                "Timed out waiting for sharded Phase-2 completion."
+                        + " uid="
+                        + uid
+                        + ", resultId="
+                        + expectedResultId
+                        + ", sawReady="
+                        + (readyPayload != null)
+                        + ", sawInstalled="
+                        + (installedPayload != null)
+                        + ", recordsSeen="
+                        + recordsSeen
+        );
+    }
+
+
+    /**
+     * Estimation.toKafkaJson() wraps the actual OnePass payload in the
+     * Estimation.estimation field. That field is normally a JSON string.
+     *
+     * This helper also accepts a raw payload object so the observer remains
+     * tolerant if the output serializer changes representation later.
+     */
+    private static JsonNode unwrapEstimationPayload(
+            JsonNode envelope) {
+
+        if (envelope == null
+                || envelope.isNull()) {
+
+            return null;
+        }
+
+        JsonNode estimation =
+                envelope.get(
+                        "estimation"
+                );
+
+        if (estimation == null
+                || estimation.isNull()) {
+
+            /*
+             * Raw-payload fallback.
+             */
+            if (envelope.has(
+                    "type"
+            )) {
+
+                return envelope;
+            }
+
+            return null;
+        }
+
+        if (estimation.isObject()
+                || estimation.isArray()) {
+
+            return estimation;
+        }
+
+        if (estimation.isTextual()) {
+
+            String value =
+                    estimation.asText();
+
+            if (value == null
+                    || value.trim().isEmpty()) {
+
+                return null;
+            }
+
+            try {
+
+                return MAPPER.readTree(
+                        value
+                );
+
+            } catch (Exception ignored) {
+
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+
+    private static final class PhaseTwoCompletion {
+
+        private final JsonNode readyPayload;
+        private final JsonNode installedPayload;
+
+
+        private PhaseTwoCompletion(
+                JsonNode readyPayload,
+                JsonNode installedPayload) {
+
+            this.readyPayload =
+                    readyPayload;
+
+            this.installedPayload =
+                    installedPayload;
+        }
+    }
+
 
     // =====================================================================
     // DEBUG PHASE-1 INDEX EXPORT
@@ -1706,6 +2661,81 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         return datapoint;
     }
+
+
+    private static ObjectNode buildPhaseTwoEndAliasDatapoint(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String rootAlias,
+            int epoch,
+            String resultId,
+            int expectedWorkers) {
+
+        ObjectNode marker =
+                MAPPER.createObjectNode();
+
+        marker.put(
+                "type",
+                "END_ALIAS"
+        );
+
+        marker.put(
+                "synopsisID",
+                SYNOPSIS_ID
+        );
+
+        marker.put(
+                "uid",
+                uid
+        );
+
+        marker.put(
+                "phase",
+                "PHASE2"
+        );
+
+        marker.put(
+                "alias",
+                rootAlias
+        );
+
+        marker.put(
+                "epoch",
+                epoch
+        );
+
+        marker.put(
+                "resultId",
+                resultId
+        );
+
+        marker.put(
+                "expectedWorkers",
+                expectedWorkers
+        );
+
+        ObjectNode datapoint =
+                MAPPER.createObjectNode();
+
+        datapoint.put(
+                "dataSetkey",
+                datasetKey
+        );
+
+        datapoint.put(
+                "streamID",
+                streamId
+        );
+
+        datapoint.set(
+                "values",
+                marker
+        );
+
+        return datapoint;
+    }
+
 
     // =====================================================================
     // TPC-H -> DATAPOINT PRELOAD
@@ -2355,17 +3385,15 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         /*
-         * Phase-1 v1 currently supports chains / aliases with at most one
-         * child continuation lookup. Fail before Kafka preload if the query
-         * requires the branching-tree extension.
+         * Every alias processed during Phase 1 is non-root and must therefore
+         * have exactly one parent edge in the rooted join tree.
+         *
+         * Multiple CHILD edges are supported by the sharded enrichment path.
          */
         for (String alias : plan.getLeafToRootOrder()) {
 
-            int childEdgeCount =
-                    plan.getChildEdges(
-                            alias
-                    ).size();
             if (plan.getParentEdge(alias) == null) {
+
                 throw new IllegalStateException(
                         "Phase-1 alias has no parent edge: "
                                 + alias
@@ -2745,6 +3773,332 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         return out;
     }
+
+
+    private static void printPhaseTwoBenchmarkSummary(
+            CompiledOnePassPlan plan,
+            long rootRows,
+            long preloadNanos,
+            JsonNode ready,
+            JsonNode installed) {
+
+        double preloadSeconds =
+                preloadNanos
+                        / 1_000_000_000.0d;
+
+        double algorithmSeconds =
+                secondsFor(
+                        "phase2_algorithm_total"
+                );
+
+        long rootTuplesSeen =
+                longField(
+                        ready,
+                        "rootTuplesSeen",
+                        -1L
+                );
+
+        long positiveRootCandidatesSeen =
+                longField(
+                        ready,
+                        "positiveRootCandidatesSeen",
+                        -1L
+                );
+
+        double totalRootGroupWeight =
+                doubleField(
+                        ready,
+                        "totalRootGroupWeight",
+                        0.0d
+                );
+
+        int sampleInstanceCount =
+                intField(
+                        ready,
+                        "sampleInstanceCount",
+                        -1
+                );
+
+        int installedWorkerCount =
+                intField(
+                        installed,
+                        "installedWorkerCount",
+                        -1
+                );
+
+        System.out.println();
+        System.out.println(
+                "=== Sharded OnePass* Phase 2 benchmark ==="
+        );
+
+        System.out.printf(
+                "%-42s %12.3f s  [OUTSIDE TIMER]%n",
+                "phase2_root_kafka_preload",
+                preloadSeconds
+        );
+
+        System.out.printf(
+                "%-42s %12.3f s%n",
+                "phase2_algorithm_total",
+                algorithmSeconds
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase2_root_rows_processed",
+                rootRows
+        );
+
+        System.out.printf(
+                "%-42s %12.3f rows/s%n",
+                "phase2_algorithm_rows_per_sec",
+                rowsPerSecond(
+                        rootRows,
+                        algorithmSeconds
+                )
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase2_root_tuples_seen",
+                rootTuplesSeen
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase2_positive_root_candidates",
+                positiveRootCandidatesSeen
+        );
+
+        System.out.printf(
+                "%-42s %12.6e%n",
+                "phase2_total_root_group_weight",
+                totalRootGroupWeight
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase2_sample_instance_count",
+                sampleInstanceCount
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase2_installed_worker_count",
+                installedWorkerCount
+        );
+
+        System.out.println(
+                "rootAlias="
+                        + plan.getRootAlias()
+                        + ", rootChildEdges="
+                        + plan.getChildEdges(
+                        plan.getRootAlias()
+                ).size()
+                        + ", stateRef="
+                        + textField(
+                        ready,
+                        "stateRef",
+                        ""
+                )
+        );
+
+        System.out.println(
+                "==========================================="
+        );
+        System.out.println();
+    }
+
+
+    private static void writePhaseTwoBenchmarkCsv(
+            CompiledOnePassPlan plan,
+            long rootRows,
+            long preloadNanos,
+            JsonNode ready,
+            JsonNode installed,
+            String implementation) throws Exception {
+
+        if (!WRITE_PHASE2_BENCHMARK_CSV) {
+
+            return;
+        }
+
+        File csvFile =
+                new File(
+                        PHASE2_BENCHMARK_CSV_PATH
+                );
+
+        File parent =
+                csvFile.getParentFile();
+
+        if (parent != null
+                && !parent.exists()) {
+
+            parent.mkdirs();
+        }
+
+        boolean writeHeader =
+                !csvFile.exists()
+                        || csvFile.length() == 0L;
+
+        double preloadSeconds =
+                preloadNanos
+                        / 1_000_000_000.0d;
+
+        double algorithmSeconds =
+                secondsFor(
+                        "phase2_algorithm_total"
+                );
+
+        long rootTuplesSeen =
+                longField(
+                        ready,
+                        "rootTuplesSeen",
+                        -1L
+                );
+
+        long positiveRootCandidatesSeen =
+                longField(
+                        ready,
+                        "positiveRootCandidatesSeen",
+                        -1L
+                );
+
+        double totalRootGroupWeight =
+                doubleField(
+                        ready,
+                        "totalRootGroupWeight",
+                        0.0d
+                );
+
+        int sampleInstanceCount =
+                intField(
+                        ready,
+                        "sampleInstanceCount",
+                        -1
+                );
+
+        int installedWorkerCount =
+                intField(
+                        installed,
+                        "installedWorkerCount",
+                        -1
+                );
+
+        String stateRef =
+                textField(
+                        ready,
+                        "stateRef",
+                        ""
+                );
+
+        FileWriter writer =
+                new FileWriter(
+                        csvFile,
+                        true
+                );
+
+        try {
+
+            if (writeHeader) {
+
+                writer.write(
+                        "timestamp_ms,"
+                                + "implementation,"
+                                + "workers,"
+                                + "query_name,"
+                                + "seed,"
+                                + "test_row_limit,"
+                                + "sample_size_limit,"
+                                + "root_alias,"
+                                + "root_child_edge_count,"
+                                + "phase2_root_rows_processed,"
+                                + "phase2_root_tuples_seen,"
+                                + "phase2_positive_root_candidates_seen,"
+                                + "phase2_total_root_group_weight,"
+                                + "phase2_sample_instance_count,"
+                                + "phase2_installed_worker_count,"
+                                + "phase2_root_kafka_preload_s,"
+                                + "phase2_algorithm_total_s,"
+                                + "phase2_algorithm_rows_per_sec,"
+                                + "state_ref"
+                                + System.lineSeparator()
+                );
+            }
+
+            writer.write(
+                    Long.toString(
+                            System.currentTimeMillis()
+                    )
+                            + ","
+                            + csv(
+                            implementation
+                    )
+                            + ","
+                            + EXPECTED_WORKERS
+                            + ","
+                            + csv(
+                            plan.getQueryName()
+                    )
+                            + ","
+                            + csv(
+                            plan.getDatasetSeed()
+                    )
+                            + ","
+                            + csv(
+                            formatRowLimit(
+                                    TEST_ROW_LIMIT
+                            )
+                    )
+                            + ","
+                            + plan.getSampleSize()
+                            + ","
+                            + csv(
+                            plan.getRootAlias()
+                    )
+                            + ","
+                            + plan.getChildEdges(
+                            plan.getRootAlias()
+                    ).size()
+                            + ","
+                            + rootRows
+                            + ","
+                            + rootTuplesSeen
+                            + ","
+                            + positiveRootCandidatesSeen
+                            + ","
+                            + totalRootGroupWeight
+                            + ","
+                            + sampleInstanceCount
+                            + ","
+                            + installedWorkerCount
+                            + ","
+                            + preloadSeconds
+                            + ","
+                            + algorithmSeconds
+                            + ","
+                            + rowsPerSecond(
+                            rootRows,
+                            algorithmSeconds
+                    )
+                            + ","
+                            + csv(
+                            stateRef
+                    )
+                            + System.lineSeparator()
+            );
+
+        } finally {
+
+            writer.close();
+        }
+
+        System.out.println(
+                "Phase-2 benchmark CSV appended to: "
+                        + csvFile.getAbsolutePath()
+        );
+    }
+
 
     private static String csv(
             String value) {

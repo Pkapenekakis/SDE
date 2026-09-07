@@ -6,6 +6,7 @@ import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
+import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassShardedPhaseTwoState;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 
@@ -55,6 +56,8 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
     private OnePassPhaseTwoState phaseTwoState;
     private OnePassRootSampleResult phaseTwoResult;
+    private OnePassShardedPhaseTwoState shardedPhaseTwoState;
+    private boolean shardedPhaseTwoComplete;
 
     private OnePassPhaseThreeState phaseThreeState;
     private OnePassPhaseThreeResult phaseThreeResult;
@@ -82,6 +85,8 @@ public final class OnePassSamplerSynopsis implements Serializable {
         this.phaseOneResult = null;
         this.phaseTwoState = null;
         this.phaseTwoResult = null;
+        this.shardedPhaseTwoState = null;
+        this.shardedPhaseTwoComplete = false;
         this.phaseThreeState = null;
         this.phaseThreeResult = null;
     }
@@ -137,12 +142,26 @@ public final class OnePassSamplerSynopsis implements Serializable {
     }
 
     private void addPhaseTwoTuple(OnePassTuple tuple) {
+
         String alias = tuple.getTable();
 
         if (!rootAlias.equals(alias)) {
-            throw new IllegalArgumentException(
-                    "Received non-root alias '" + alias + "' during PHASE_2. " +
-                            "Expected root alias '" + rootAlias + "'.");
+
+            throw new IllegalArgumentException("Received non-root alias '" + alias +
+                    "' during PHASE_2. " + "Expected root alias '" + rootAlias + "'.");
+        }
+
+        if (shardedPhaseTwoState != null) {
+            throw new IllegalStateException(
+                    "Generic lifecycle.add() must not be used for sharded Phase 2."
+                            + " Use beginShardedPhaseTwoRootTuple(), "
+                            + "lookupShardedPhaseTwoRootChildWeight(), and "
+                            + "acceptShardedPhaseTwoRootCandidate()."
+            );
+        }
+
+        if (phaseTwoState == null) {
+            throw new IllegalStateException("Replicated Phase-2 state is null");
         }
 
         phaseTwoState.addTuple(tuple);
@@ -266,6 +285,82 @@ public final class OnePassSamplerSynopsis implements Serializable {
         OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
         return phaseOneState.buildParentContribution(tuple, subtreeWeight);
     }
+
+    /**
+     * Activates Phase 2 without constructing a replicated OnePassPhaseOneResult.
+     * The local Phase-1 indexes remain inside phaseOneState.
+     */
+    public void startShardedPhaseTwo(int workerId) {
+
+        if (phase == Phase.PHASE_2 && shardedPhaseTwoState != null) {
+            return;
+        }
+
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("startShardedPhaseTwo() is only valid while leaving PHASE_1." +
+                    " Current phase=" + phase);
+        }
+
+        this.phaseTwoState = null;
+        this.phaseTwoResult = null;
+        this.shardedPhaseTwoState = new OnePassShardedPhaseTwoState(plan, workerId);
+        this.shardedPhaseTwoComplete = false;
+        this.phase = Phase.PHASE_2;
+    }
+
+    public double beginShardedPhaseTwoRootTuple(Object payload) {
+
+        requireShardedPhaseTwoActive();
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+
+        return shardedPhaseTwoState.beginRootTuple(tuple);
+    }
+
+    public double lookupShardedPhaseTwoRootChildWeight(Object payload, int childIndex) {
+
+        requireShardedPhaseTwoActive();
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+
+        return phaseOneState.lookupRootChildContinuationWeight(tuple, childIndex);
+    }
+
+    public void acceptShardedPhaseTwoRootCandidate(Object payload, double rootGroupWeight) {
+
+        requireShardedPhaseTwoActive();
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+        shardedPhaseTwoState.acceptCompletedRootTuple(tuple, rootGroupWeight);
+    }
+
+    private void requireShardedPhaseTwoActive() {
+        if (phase != Phase.PHASE_2 || shardedPhaseTwoState == null) {
+            throw new IllegalStateException("Sharded Phase 2 is not active." + " phase=" + phase +
+                    ", state=" + shardedPhaseTwoState
+            );
+        }
+    }
+
+    /**
+     * Installs the globally merged Phase-2 root sample in sharded mode.
+     *
+     * Phase 3 is deliberately NOT activated here because the current Phase 3
+     * implementation still assumes the old replicated Phase-1 result.
+     */
+    public OnePassRootSampleResult installGlobalShardedPhaseTwoRootSampleResult(OnePassRootSampleResult globalPhaseTwoResult) {
+
+        if (globalPhaseTwoResult == null) {
+            throw new IllegalArgumentException("globalPhaseTwoResult must not be null");
+        }
+
+        requireShardedPhaseTwoActive();
+
+        this.phaseTwoResult = globalPhaseTwoResult;
+        this.shardedPhaseTwoComplete = true;
+
+        //Keep phase == PHASE_2 until sharded Phase 3 is explicitly implemented.
+        return phaseTwoResult;
+    }
+
+
 
     /**
      * Completes Phase 2.
@@ -428,6 +523,19 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
     public String getPhaseThreeActiveAlias() {
         return phaseThreeState == null ? null : phaseThreeState.getActiveAlias();
+    }
+
+    public OnePassShardedPhaseTwoState getShardedPhaseTwoState() {
+        return shardedPhaseTwoState;
+    }
+
+    public boolean isShardedPhaseTwoActive() {
+        return phase == Phase.PHASE_2
+                && shardedPhaseTwoState != null;
+    }
+
+    public boolean isShardedPhaseTwoComplete() {
+        return shardedPhaseTwoComplete;
     }
 
     public OnePassPhaseTwoState getPhaseTwoState() {
