@@ -22,6 +22,7 @@ import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassShardOwnership;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 import infore.SDE.transformations.onepass.debug.OnePassPhaseOneValidatorExporter;
+import infore.SDE.transformations.onepass.debug.OnePassPhaseTwoValidatorExporter;
 import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneWorkerProtocol;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
 import infore.SDE.transformations.onepass.worker.OnePassTupleBufferGate;
@@ -182,6 +183,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			return;
 		}
 
+		if (isOnePassPhaseTwoDebugValidationRequest(rq)) {
+			handleOnePassPhaseTwoDebugValidationRequest(rq, Synopses);
+			return;
+		}
 
 		/*
 		 * OnePass explicit cleanup.
@@ -3304,5 +3309,41 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 	private static String shardedPhaseTwoResultId(int uid) {
 		return "PHASE2_RESULT_" + uid;
+	}
+
+	private boolean isOnePassPhaseTwoDebugValidationRequest(Request request) {
+		if (request == null || request.getSynopsisID() != ONEPASS_SYNOPSIS_ID || request.getRequestID() != 89) {
+			return false;
+		}
+
+		JsonNode parameters = request.getParameters();
+		if (parameters == null || parameters.isNull()) {
+			return false;
+		}
+
+		return "DEBUG_VALIDATE_PHASE2_ROOT_SAMPLE".equals(textField(parameters, "onePassCommand", ""));
+	}
+
+	private void handleOnePassPhaseTwoDebugValidationRequest(Request request, ArrayList<Synopsis> synopses) throws Exception {
+
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsis(request, synopses);
+		if (onePass == null) {
+			throw new IllegalStateException("DEBUG_VALIDATE_PHASE2_ROOT_SAMPLE could not find OnePass synopsis." +
+					" uid=" + request.getUID() + ", key=" + request.getKey() + ", workerId=" + pId);
+		}
+
+		int expectedWorkers = request.getNoOfP() > 0 ?
+				request.getNoOfP() : getRuntimeContext().getNumberOfParallelSubtasks();
+
+		String outputDirectory =  "/tmp/onepass-phase2-validator"; //OnePassPhaseTwoValidatorExporter.getOutputDirectory();
+		JsonNode parameters = request.getParameters();
+
+		if (parameters != null && !parameters.isNull()) {
+			String requestedDirectory = textField(parameters, "outputDirectory", "");
+			if (requestedDirectory != null && !requestedDirectory.trim().isEmpty()) {
+				outputDirectory = requestedDirectory.trim();
+			}
+		}
+		OnePassPhaseTwoValidatorExporter.exportInstalledRootSample(onePass, request.getUID(), pId, expectedWorkers, outputDirectory);
 	}
 }

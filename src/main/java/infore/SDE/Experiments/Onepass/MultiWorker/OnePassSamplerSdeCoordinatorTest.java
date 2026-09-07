@@ -104,7 +104,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
             parseLong(System.getProperty("onepass.phase1IndexExportTimeoutMs", "120000"));
 
     private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY " +
-            "(" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
+            "(" + "o.o_totalprice * (l.l_extendedprice * (2 - l.l_discount))) " +
             "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
 //    private static final String TEST_ONEPASS_SQL = "SELECT * FROM w_branch_supplier WEIGHTED BY " +
@@ -162,9 +162,42 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * IMPORTANT: the dump/merge happens AFTER phase1_algorithm_total stops,
      * so enabling this flag does not pollute the benchmark timing.
      */
-    // Debug-only request broadcast to every OnePass worker.
     private static final int REQUEST_DEBUG_EXPORT_PHASE1 = 79;
     private static final boolean EXPORT_PHASE1_INDEXES = true;
+
+    /*
+     * DEBUG / CORRECTNESS VALIDATION ONLY.
+     *
+     * This is the ONLY switch needed for local Phase-2 validation.
+     *
+     * true:
+     *   - after phase2_algorithm_total has stopped, the test sends
+     *     DEBUG_VALIDATE_PHASE2_ROOT_SAMPLE (request 89);
+     *   - each worker exports a checksum of its already-installed root sample;
+     *   - the test compares the worker artifacts and writes the consolidated
+     *     validation JSON for the independent Python validator.
+     *
+     * false:
+     *   - request 89 is never sent;
+     *   - no Phase-2 checksum/export work is performed;
+     *   - normal/benchmark execution is unaffected.
+     *
+     * No Run.java flag or JVM -D property is required.
+     */
+    private static final int REQUEST_DEBUG_VALIDATE_PHASE2 = 89;
+    private static final boolean VALIDATE_PHASE2 = true;
+
+    private static final String PHASE2_VALIDATION_DIR =
+            System.getProperty("onepass.phase2ValidationDir", "/tmp/onepass-phase2-validator");
+
+    private static final String PHASE2_VALIDATION_JSON_PATH =
+            System.getProperty("onepass.phase2ValidatorJson", "/tmp/onepass_phase2_validation.json");
+
+    private static final long PHASE2_VALIDATION_TIMEOUT_MS =
+            Long.parseLong(System.getProperty("onepass.phase2ValidationTimeoutMs", "120000"));
+
+    private static final String PHASE2_CHECKSUM_VERSION =
+            "ONEPASS_PHASE2_ROOT_SAMPLE_SHA256_V1";
 
     private OnePassSamplerSdeCoordinatorTest() {}
 
@@ -195,10 +228,17 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println("transactionTimeoutMs = " + TRANSACTION_TIMEOUT_MS);
         System.out.println("RUN_PHASE_2      = " + RUN_PHASE_2);
         System.out.println("EXPORT_PHASE1_INDEXES = " + EXPORT_PHASE1_INDEXES);
+        System.out.println("VALIDATE_PHASE2  = " + VALIDATE_PHASE2);
 
         if (EXPORT_PHASE1_INDEXES) {
             System.out.println("phase1IndexExportDir = " + PHASE1_INDEX_EXPORT_DIR);
             System.out.println("phase1ValidatorJson  = " + PHASE1_VALIDATOR_JSON_PATH);
+        }
+
+        if (VALIDATE_PHASE2) {
+            System.out.println("phase2ValidationDir  = " + PHASE2_VALIDATION_DIR);
+            System.out.println("phase2ValidatorJson  = " + PHASE2_VALIDATION_JSON_PATH);
+            System.out.println("phase2ChecksumVersion= " + PHASE2_CHECKSUM_VERSION);
         }
 
         System.out.println("SQL:");
@@ -508,6 +548,27 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 printPhaseTwoBenchmarkSummary(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed);
 
                 writePhaseTwoBenchmarkCsv(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed, "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE2_LOCAL");
+
+                /*
+                 * TEST-ONLY correctness validation.
+                 *
+                 * IMPORTANT:
+                 * phase2_algorithm_total has already stopped above. Therefore
+                 * checksum construction, worker JSON exports, file polling, and
+                 * independent-validator artifact generation are excluded from
+                 * the measured Phase-2 runtime.
+                 */
+                if (VALIDATE_PHASE2) {
+
+                    PhaseTwoValidationResult validation = validateInstalledPhaseTwoRootSamples(controlProducer, uid, baseKey, streamId, plan, ready, installed);
+
+                    System.out.println();
+                    System.out.println("Phase-2 installed-root validation PASSED.");
+                    System.out.println("  checksumVersion = " + validation.checksumVersion);
+                    System.out.println("  checksum        = " + validation.checksum);
+                    System.out.println("  workerChecksums = " + validation.workerChecksums);
+                    System.out.println("  validatorJson   = " + PHASE2_VALIDATION_JSON_PATH);
+                }
 
                 System.out.println();
                 System.out.println("=======================================================");
@@ -1396,6 +1457,370 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
     }
 
+
+    // =====================================================================
+    // DEBUG PHASE-2 INSTALLED-ROOT VALIDATION
+    // =====================================================================
+
+    /**
+     * DEBUG / VALIDATION ONLY.
+     * <p>
+     * This method is called only when VALIDATE_PHASE2=true and only
+     * after GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED has been observed and
+     * phase2_algorithm_total has stopped.
+     * <p>
+     * The normal OnePass Phase-2 path is therefore not modified or slowed by
+     * this validation.
+     */
+    private static PhaseTwoValidationResult validateInstalledPhaseTwoRootSamples(KafkaProducer<String, String> controlProducer, int uid, String baseKey, String streamId, CompiledOnePassPlan plan, JsonNode ready, JsonNode installed) throws Exception {
+
+        System.out.println();
+        System.out.println("=======================================================");
+        System.out.println(" DEBUG: VALIDATING INSTALLED PHASE-2 ROOT SAMPLE");
+        System.out.println(" This work is OUTSIDE phase2_algorithm_total.");
+        System.out.println("=======================================================");
+
+        File runDirectory = new File(PHASE2_VALIDATION_DIR, "uid-" + uid);
+
+        /*
+         * The UID is random per run, so collisions are unlikely, but deleting
+         * any stale directory makes the validation deterministic and prevents
+         * accidentally accepting files from a previous failed run.
+         */
+        if (runDirectory.exists()) {
+            deleteRecursively(runDirectory);
+        }
+
+        ObjectNode request = buildPhaseTwoDebugValidationRequest(baseKey, streamId, uid, EXPECTED_WORKERS, PHASE2_VALIDATION_DIR);
+
+        sendJson(controlProducer, REQUEST_TOPIC, baseKey, request);
+
+        controlProducer.flush();
+
+        System.out.println("DEBUG_VALIDATE_PHASE2_ROOT_SAMPLE request sent. Waiting for " + EXPECTED_WORKERS + " worker validation files in " + runDirectory.getAbsolutePath());
+
+        Map<Integer, JsonNode> workerArtifacts = waitForPhaseTwoValidationFiles(runDirectory, uid, EXPECTED_WORKERS, PHASE2_VALIDATION_TIMEOUT_MS);
+
+        String referenceChecksum = null;
+
+        String referenceChecksumVersion = null;
+
+        Map<Integer, String> workerChecksums = new LinkedHashMap<Integer, String>();
+
+        long globalRootTuplesSeen = longField(ready, "rootTuplesSeen", -1L);
+
+        long globalPositiveRootCandidatesSeen = longField(ready, "positiveRootCandidatesSeen", -1L);
+
+        double globalTotalRootGroupWeight = doubleField(ready, "totalRootGroupWeight", Double.NaN);
+
+        int globalSampleInstanceCount = intField(ready, "sampleInstanceCount", -1);
+
+        int globalSampleSize = intField(ready, "sampleSize", -1);
+
+        for (int workerId = 0; workerId < EXPECTED_WORKERS; workerId++) {
+
+            JsonNode worker = workerArtifacts.get(workerId);
+
+            if (worker == null) {
+
+                throw new IllegalStateException("Missing Phase-2 validation artifact for worker=" + workerId);
+            }
+
+            int artifactUid = intField(worker, "uid", -1);
+
+            if (artifactUid != uid) {
+
+                throw new IllegalStateException("Phase-2 validation UID mismatch." + " worker=" + workerId + ", expected=" + uid + ", actual=" + artifactUid + ", artifact=" + worker);
+            }
+
+            int artifactWorkerId = intField(worker, "workerId", -1);
+
+            if (artifactWorkerId != workerId) {
+
+                throw new IllegalStateException("Phase-2 validation workerId mismatch." + " expected=" + workerId + ", actual=" + artifactWorkerId + ", artifact=" + worker);
+            }
+
+            int artifactExpectedWorkers = intField(worker, "expectedWorkers", -1);
+
+            if (artifactExpectedWorkers != EXPECTED_WORKERS) {
+
+                throw new IllegalStateException("Phase-2 validation expectedWorkers mismatch." + " worker=" + workerId + ", expected=" + EXPECTED_WORKERS + ", actual=" + artifactExpectedWorkers);
+            }
+
+            String rootAlias = textField(worker, "rootAlias", "");
+
+            if (!plan.getRootAlias().equals(rootAlias)) {
+
+                throw new IllegalStateException("Phase-2 validation rootAlias mismatch." + " worker=" + workerId + ", expected=" + plan.getRootAlias() + ", actual=" + rootAlias);
+            }
+
+            int requestedSampleSize = intField(worker, "requestedSampleSize", -1);
+
+            if (requestedSampleSize != globalSampleSize || requestedSampleSize != plan.getSampleSize()) {
+
+                throw new IllegalStateException("Phase-2 validation requestedSampleSize mismatch." + " worker=" + workerId + ", plan=" + plan.getSampleSize() + ", global=" + globalSampleSize + ", workerValue=" + requestedSampleSize);
+            }
+
+            int sampleInstanceCount = intField(worker, "sampleInstanceCount", -1);
+
+            if (sampleInstanceCount != globalSampleInstanceCount) {
+
+                throw new IllegalStateException("Phase-2 validation sampleInstanceCount mismatch." + " worker=" + workerId + ", expected=" + globalSampleInstanceCount + ", actual=" + sampleInstanceCount);
+            }
+
+            long rootTuplesSeen = longField(worker, "rootTuplesSeen", -1L);
+
+            if (rootTuplesSeen != globalRootTuplesSeen) {
+
+                throw new IllegalStateException("Phase-2 validation rootTuplesSeen mismatch." + " worker=" + workerId + ", expected=" + globalRootTuplesSeen + ", actual=" + rootTuplesSeen);
+            }
+
+            long positiveRootCandidatesSeen = longField(worker, "positiveRootCandidatesSeen", -1L);
+
+            if (positiveRootCandidatesSeen != globalPositiveRootCandidatesSeen) {
+
+                throw new IllegalStateException("Phase-2 validation positiveRootCandidatesSeen mismatch." + " worker=" + workerId + ", expected=" + globalPositiveRootCandidatesSeen + ", actual=" + positiveRootCandidatesSeen);
+            }
+
+            double totalRootGroupWeight = doubleField(worker, "totalRootGroupWeight", Double.NaN);
+
+            /*
+             * Worker validation files are written from the installed
+             * OnePassRootSampleResult, which was reconstructed from the same
+             * global state. Exact IEEE-754 equality is therefore expected here.
+             */
+            if (Double.doubleToLongBits(totalRootGroupWeight) != Double.doubleToLongBits(globalTotalRootGroupWeight)) {
+
+                throw new IllegalStateException("Phase-2 validation totalRootGroupWeight mismatch." + " worker=" + workerId + ", expected=" + globalTotalRootGroupWeight + ", actual=" + totalRootGroupWeight);
+            }
+
+            String checksumVersion = textField(worker, "checksumVersion", "");
+
+            String checksum = textField(worker, "checksum", "");
+
+            if (!PHASE2_CHECKSUM_VERSION.equals(checksumVersion)) {
+
+                throw new IllegalStateException("Unexpected Phase-2 checksum version." + " worker=" + workerId + ", expected=" + PHASE2_CHECKSUM_VERSION + ", actual=" + checksumVersion);
+            }
+
+            if (checksum == null || checksum.trim().isEmpty()) {
+
+                throw new IllegalStateException("Worker " + workerId + " exported an empty Phase-2 checksum.");
+            }
+
+            if (referenceChecksum == null) {
+
+                referenceChecksum = checksum;
+
+                referenceChecksumVersion = checksumVersion;
+
+            } else {
+
+                if (!referenceChecksum.equals(checksum)) {
+
+                    throw new IllegalStateException("Installed Phase-2 root sample differs across workers." + " referenceChecksum=" + referenceChecksum + ", worker=" + workerId + ", workerChecksum=" + checksum);
+                }
+
+                if (!referenceChecksumVersion.equals(checksumVersion)) {
+
+                    throw new IllegalStateException("Phase-2 checksum version differs across workers." + " reference=" + referenceChecksumVersion + ", worker=" + workerId + ", workerVersion=" + checksumVersion);
+                }
+            }
+
+            workerChecksums.put(workerId, checksum);
+        }
+
+        if (referenceChecksum == null || referenceChecksum.trim().isEmpty()) {
+
+            throw new IllegalStateException("Phase-2 validation completed without a reference checksum.");
+        }
+
+        writePhaseTwoValidationJson(plan, ready, installed, referenceChecksumVersion, referenceChecksum, workerArtifacts);
+
+        return new PhaseTwoValidationResult(referenceChecksumVersion, referenceChecksum, workerChecksums);
+    }
+
+
+    private static ObjectNode buildPhaseTwoDebugValidationRequest(String datasetKey, String streamId, int uid, int noOfP, String outputDirectory) {
+
+        /*
+         * Keep the same request JSON shape used by the existing Phase-1 debug
+         * request so it follows the normal SDE request-routing conventions.
+         */
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", datasetKey);
+
+        request.put("key", datasetKey);
+
+        request.put("requestID", REQUEST_DEBUG_VALIDATE_PHASE2);
+
+        request.put("synopsisID", SYNOPSIS_ID);
+
+        request.put("uid", uid);
+
+        request.put("streamID", streamId);
+
+        request.put("noOfP", noOfP);
+
+        ArrayNode param = MAPPER.createArrayNode();
+
+        param.add("DEBUG_VALIDATE_PHASE2_ROOT_SAMPLE");
+
+        request.set("param", param);
+
+        ObjectNode parameters = MAPPER.createObjectNode();
+
+        parameters.put("onePassCommand", "DEBUG_VALIDATE_PHASE2_ROOT_SAMPLE");
+
+        parameters.put("outputDirectory", outputDirectory);
+
+        request.set("parameters", parameters);
+
+        return request;
+    }
+
+
+    private static Map<Integer, JsonNode> waitForPhaseTwoValidationFiles(File runDirectory, int expectedUid, int expectedWorkers, long timeoutMs) throws Exception {
+
+        long deadline = System.currentTimeMillis() + timeoutMs;
+
+        while (System.currentTimeMillis() < deadline) {
+
+            Map<Integer, JsonNode> artifacts = new LinkedHashMap<Integer, JsonNode>();
+
+            for (int workerId = 0; workerId < expectedWorkers; workerId++) {
+
+                File file = new File(runDirectory, "worker-" + workerId + ".json");
+
+                if (!file.isFile() || file.length() <= 0L) {
+
+                    continue;
+                }
+
+                try {
+
+                    JsonNode node = MAPPER.readTree(file);
+
+                    int artifactUid = intField(node, "uid", -1);
+
+                    if (artifactUid != expectedUid) {
+
+                        continue;
+                    }
+
+                    artifacts.put(workerId, node);
+
+                } catch (Exception ignored) {
+
+                    /*
+                     * The worker may still be completing the file write.
+                     * Retry on the next polling iteration.
+                     */
+                }
+            }
+
+            if (artifacts.size() == expectedWorkers) {
+
+                /*
+                 * Give the last writer a tiny amount of time to close the
+                 * underlying file before the caller performs all assertions.
+                 */
+                Thread.sleep(100L);
+
+                return artifacts;
+            }
+
+            Thread.sleep(100L);
+        }
+
+        StringBuilder missing = new StringBuilder();
+
+        for (int workerId = 0; workerId < expectedWorkers; workerId++) {
+
+            File file = new File(runDirectory, "worker-" + workerId + ".json");
+
+            if (!file.isFile() || file.length() <= 0L) {
+
+                if (missing.length() > 0) {
+
+                    missing.append(", ");
+                }
+
+                missing.append(file.getName());
+            }
+        }
+
+        throw new IllegalStateException("Timed out waiting for Phase-2 validation worker files." + " directory=" + runDirectory.getAbsolutePath() + ", missing=[" + missing + "]");
+    }
+
+
+    private static void writePhaseTwoValidationJson(CompiledOnePassPlan plan, JsonNode ready, JsonNode installed, String checksumVersion, String checksum, Map<Integer, JsonNode> workerArtifacts) throws Exception {
+
+        ObjectNode output = MAPPER.createObjectNode();
+
+        output.put("type", "ONEPASS_PHASE2_VALIDATION");
+
+        output.put("queryName", plan.getQueryName());
+
+        output.put("rootAlias", plan.getRootAlias());
+
+        output.put("testRowLimit", TEST_ROW_LIMIT);
+
+        output.put("workerCount", EXPECTED_WORKERS);
+
+        output.put("installedRootSamplesIdentical", true);
+
+        output.put("checksumVersion", checksumVersion);
+
+        output.put("checksum", checksum);
+
+        ObjectNode workers = output.putObject("workers");
+
+        for (Map.Entry<Integer, JsonNode> entry : workerArtifacts.entrySet()) {
+
+            workers.set(Integer.toString(entry.getKey()), entry.getValue().deepCopy());
+        }
+
+        output.set("ready", ready == null ? MAPPER.getNodeFactory().nullNode() : ready.deepCopy());
+
+        output.set("installed", installed == null ? MAPPER.getNodeFactory().nullNode() : installed.deepCopy());
+
+        File outputFile = new File(PHASE2_VALIDATION_JSON_PATH);
+
+        File parent = outputFile.getParentFile();
+
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+
+            throw new IllegalStateException("Could not create Phase-2 validator output directory: " + parent.getAbsolutePath());
+        }
+
+        MAPPER.writerWithDefaultPrettyPrinter().writeValue(outputFile, output);
+
+        System.out.println("Consolidated Phase-2 validation JSON written to: " + outputFile.getAbsolutePath());
+    }
+
+
+    private static final class PhaseTwoValidationResult {
+
+        private final String checksumVersion;
+
+        private final String checksum;
+
+        private final Map<Integer, String> workerChecksums;
+
+
+        private PhaseTwoValidationResult(String checksumVersion, String checksum, Map<Integer, String> workerChecksums) {
+
+            this.checksumVersion = checksumVersion;
+
+            this.checksum = checksum;
+
+            this.workerChecksums = new LinkedHashMap<Integer, String>(workerChecksums);
+        }
+    }
+
+
     // =====================================================================
     // REQUEST BUILDERS
     // =====================================================================
@@ -1836,12 +2261,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
          */
         for (TopicPartition partition : partitions) {
             long position = consumer.position(partition);
-            System.out.println("Kafka observer start position:" + " topic=" + topic + ", partition=" +
-                    partition.partition() + ", offset=" + position);
+            System.out.println("Kafka observer start position:" + " topic=" + topic + ", partition=" + partition.partition() + ", offset=" + position);
         }
 
-        System.out.println("Kafka observer READY on " + topic + ", partitions=" + partitions +
-                ", startingOffsets=" + startingOffsets);
+        System.out.println("Kafka observer READY on " + topic + ", partitions=" + partitions + ", startingOffsets=" + startingOffsets);
     }
 
     private static void sendJsonAsync(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) {
