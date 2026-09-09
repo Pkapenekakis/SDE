@@ -65,13 +65,16 @@ import java.util.UUID;
 public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String LOCAL_BOOTSTRAP_SERVERS = "localhost:9092";
+    private static final String SOFTNET_BOOTSTRAP_SERVERS = "clu02.softnet.tuc.gr:6667," + "clu03.softnet.tuc.gr:6667,"
+            + "clu04.softnet.tuc.gr:6667," + "clu06.softnet.tuc.gr:6667";
 
     // ---------------------------------------------------------------------
     // LOCAL TEST SETTINGS
     // ---------------------------------------------------------------------
 
-    private static final String BOOTSTRAP_SERVERS = System.getProperty("onepass.kafka",
-            "localhost:9092");
+    /*
+    private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
             "dataTopic");
     private static final String REQUEST_TOPIC = System.getProperty("onepass.requestTopic",
@@ -79,32 +82,48 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String OUTPUT_TOPIC = System.getProperty("onepass.outputTopic",
             "estimationTopic");
 
-    /*
-     * The running SDE job still needs its State Topic configured, but this
-     * driver does not consume it directly.
-     */
     private static final String STATE_TOPIC = System.getProperty("onepass.stateTopic",
             "onepassStateTopic");
 
     private static final String TEST_TPCH_DIR = System.getProperty("onepass.tpchDir",
             "/home/vboxuser/Desktop/Thesis/tpch-data/sf1");
 
-    private static final String PHASE1_BENCHMARK_CSV_PATH = System.getProperty("onepass.phase1Csv",
-            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_sharded_local.csv");
+    private static final String DEFAULT_PHASE1_BENCHMARK_CSV_PATH =
+            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_sharded_local.csv";
 
-    private static final String PHASE2_BENCHMARK_CSV_PATH = System.getProperty("onepass.phase2Csv",
-            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase2_sharded_local.csv");
+    private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
+            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase2_sharded_local.csv";
+*/
+    // =========================
+    // SOFTNET
+    // Uncomment these and comment the LOCAL definitions above.
+    // =========================
+
+     private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
+     private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
+     private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
+     private static final String OUTPUT_TOPIC = "pkapenekakis-estimationTopic";
+     private static final String STATE_TOPIC = "pkapenekakis-onepassStateTopic";
+
+    private static final String TEST_TPCH_DIR = System.getProperty("onepass.tpchDir",
+            "/home/pkapenekakis/onepass/tpch-data/sf1");
+
+     private static final String DEFAULT_PHASE1_BENCHMARK_CSV_PATH =
+     "/home/pkapenekakis/onepass/results/onepass_phase1_softnet.csv";
+
+     private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
+             "/home/pkapenekakis/onepass/results/onepass_phase2_softnet.csv";
 
     // ---------------------------------------------------------------------
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------
 
-    private static final String PHASE1_INDEX_EXPORT_DIR = System.getProperty("onepass.phase1IndexExportDir",
-            "/tmp/onepass-phase1-validator");
-    private static final String PHASE1_VALIDATOR_JSON_PATH = System.getProperty("onepass.phase1ValidatorJson",
-            "/tmp/onepass_wq3_alias_phase1_full_indexes.json");
-    private static final long PHASE1_INDEX_EXPORT_TIMEOUT_MS = Long.
-            parseLong(System.getProperty("onepass.phase1IndexExportTimeoutMs", "120000"));
+    private static final String PHASE1_BENCHMARK_CSV_PATH =
+            System.getProperty("onepass.phase1Csv", DEFAULT_PHASE1_BENCHMARK_CSV_PATH);
+
+    private static final String PHASE2_BENCHMARK_CSV_PATH =
+            System.getProperty("onepass.phase2Csv", DEFAULT_PHASE2_BENCHMARK_CSV_PATH);
+
 
     private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY " +
             "(" + "o.o_totalprice * (l.l_extendedprice * (2 - l.l_discount))) " +
@@ -116,7 +135,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     //Use -1 for the full TPC-H relation.
     private static final long TEST_ROW_LIMIT = Long.parseLong(System.getProperty("onepass.testRowLimit",
-            "100000"));
+            "1000000"));
 
     private static final int EXPECTED_WORKERS = Integer.parseInt(System.getProperty("onepass.workers",
             "4"));
@@ -154,7 +173,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final Map<String, Long> benchmarkCounts = new LinkedHashMap<String, Long>();
 
     /*
-     * DEBUG / CORRECTNESS VALIDATION ONLY.
+     * DEBUG / CORRECTNESS VALIDATION ONLY. !!!!!!DO NOT RUN AS TRUE ON THE SOFTNET CLUSTER!!!!!!!
      *
      * Set this to true when you want the test to ask every OnePass worker to
      * dump its final Phase-1 shard after the measured Phase-1 algorithm has
@@ -166,7 +185,14 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * so enabling this flag does not pollute the benchmark timing.
      */
     private static final int REQUEST_DEBUG_EXPORT_PHASE1 = 79;
-    private static final boolean EXPORT_PHASE1_INDEXES = true;
+    private static final boolean EXPORT_PHASE1_INDEXES = false;
+
+    private static final String PHASE1_INDEX_EXPORT_DIR = System.getProperty("onepass.phase1IndexExportDir",
+            "/tmp/onepass-phase1-validator");
+    private static final String PHASE1_VALIDATOR_JSON_PATH = System.getProperty("onepass.phase1ValidatorJson",
+            "/tmp/onepass_wq3_alias_phase1_full_indexes.json");
+    private static final long PHASE1_INDEX_EXPORT_TIMEOUT_MS = Long.
+            parseLong(System.getProperty("onepass.phase1IndexExportTimeoutMs", "120000"));
 
     /*
      * DEBUG / CORRECTNESS VALIDATION ONLY.
@@ -184,11 +210,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
      *   - request 89 is never sent;
      *   - no Phase-2 checksum/export work is performed;
      *   - normal/benchmark execution is unaffected.
-     *
-     * No Run.java flag or JVM -D property is required.
      */
     private static final int REQUEST_DEBUG_VALIDATE_PHASE2 = 89;
-    private static final boolean VALIDATE_PHASE2 = true;
+    private static final boolean VALIDATE_PHASE2 = false;
 
     private static final String PHASE2_VALIDATION_DIR =
             System.getProperty("onepass.phase2ValidationDir", "/tmp/onepass-phase2-validator");
@@ -205,6 +229,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private OnePassSamplerSdeCoordinatorTest() {}
 
     public static void main(String[] args) throws Exception {
+
+        configureRuntimeArguments(args);
 
         int uid = UUID.randomUUID().toString().hashCode() & 0x7fffffff;
 
@@ -2751,5 +2777,27 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         return field.asDouble(defaultValue);
+    }
+
+    private static void configureRuntimeArguments(String[] args) {
+
+        /*
+         * Priority:
+         * 1. Command-line broker list
+         * 2. -Donepass.kafka JVM property
+         * 3. The LOCAL / SOFTNET default selected above
+         */
+
+        if (args != null && args.length > 0 && args[0] != null && !args[0].trim().isEmpty()) {
+            BOOTSTRAP_SERVERS = args[0].trim();
+
+        } else {
+            String propertyValue = System.getProperty("onepass.kafka", "");
+            if (propertyValue != null && !propertyValue.trim().isEmpty()) {
+                BOOTSTRAP_SERVERS = propertyValue.trim();
+            }
+        }
+
+        System.out.println("[OnePass TEST CONFIG]" + " kafka=" + BOOTSTRAP_SERVERS);
     }
 }

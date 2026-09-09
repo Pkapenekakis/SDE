@@ -10,21 +10,6 @@
     <pluginManagement>
       <plugins>
         <plugin>
-          <artifactId>maven-compiler-plugin</artifactId>
-          <dependencies>
-            <dependency>
-              <groupId>org.eclipse.tycho</groupId>
-              <artifactId>tycho-compiler-jdt</artifactId>
-              <version>0.21.0</version>
-            </dependency>
-          </dependencies>
-          <configuration>
-            <source>${java.version}</source>
-            <target>${java.version}</target>
-            <compilerId>jdt</compilerId>
-          </configuration>
-        </plugin>
-        <plugin>
           <groupId>org.eclipse.m2e</groupId>
           <artifactId>lifecycle-mapping</artifactId>
           <version>1.0.0</version>
