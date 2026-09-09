@@ -1139,11 +1139,12 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
                     + state);
         }
 
-        List<OnePassRootSampleInstance> instances = new ArrayList<OnePassRootSampleInstance>();
+        List<OnePassRootSampleInstance> instances = new ArrayList<OnePassRootSampleInstance>(samples.size());
+        Map<String, OnePassRootSampleCandidate> candidatesByGlobalId = new LinkedHashMap<String, OnePassRootSampleCandidate>();
 
         for (int i = 0; i < samples.size(); i++) {
-            JsonNode sample = samples.get(i);
 
+            JsonNode sample = samples.get(i);
             long sampleInstanceId = longField(sample, "sampleInstanceId", i);
             long candidateId = longField(sample, "candidateId", sampleInstanceId);
             JsonNode rootTuple = sample.get("rootTuple");
@@ -1153,12 +1154,54 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
                 throw new IllegalArgumentException("Sample is missing rootTuple: " + sample);
             }
 
-            OnePassRootSampleCandidate candidate = new OnePassRootSampleCandidate(
-                    candidateId,
-                    rootAlias,
-                    rootTuple,
-                    rootGroupWeight
-            );
+            /*
+             * Reducer currently emits:
+             *     globalCandidateId = workerId:candidateId
+             * and also:
+             *     sourceCandidateId = workerId:candidateId
+             * Prefer globalCandidateId.
+             */
+            String globalCandidateId = textField(sample, "globalCandidateId",
+                    textField(sample, "sourceCandidateId", ""));
+
+
+            if (globalCandidateId.isEmpty()) {
+                //Backward compatibility only.
+                int sourceWorker = intField(sample, "workerId", -1);
+                globalCandidateId = sourceWorker + ":" + candidateId;
+            }
+
+            OnePassRootSampleCandidate candidate = candidatesByGlobalId.get(globalCandidateId);
+            if (candidate == null) {
+                candidate = new OnePassRootSampleCandidate(candidateId, rootAlias, rootTuple, rootGroupWeight);
+                candidatesByGlobalId.put(globalCandidateId, candidate);
+
+            } else {
+                /*
+                 * Duplicate multinomial instances of one source candidate must be
+                 * byte-for-byte/logically identical in their candidate metadata.
+                 */
+                if (candidate.getCandidateId() != candidateId) {
+                    throw new IllegalStateException("Repeated Phase-2 candidate changed candidateId." +
+                            " globalCandidateId=" + globalCandidateId);
+                }
+
+                if (!candidate.getRootAlias().equals(rootAlias)) {
+                    throw new IllegalStateException("Repeated Phase-2 candidate changed rootAlias." +
+                            " globalCandidateId=" + globalCandidateId);
+                }
+
+                if (Double.doubleToLongBits(candidate.getRootGroupWeight()) != Double.doubleToLongBits(rootGroupWeight)) {
+                    throw new IllegalStateException("Repeated Phase-2 candidate changed weight." +
+                            " globalCandidateId=" + globalCandidateId);
+                }
+
+                if (!candidate.getRootTuple().equals(rootTuple)) {
+                    throw new IllegalStateException("Repeated Phase-2 candidate changed root tuple." +
+                            " globalCandidateId=" + globalCandidateId);
+                }
+            }
+
 
             instances.add(new OnePassRootSampleInstance(sampleInstanceId, candidate));
         }

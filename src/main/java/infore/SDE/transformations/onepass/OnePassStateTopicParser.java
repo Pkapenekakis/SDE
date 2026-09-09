@@ -7,6 +7,9 @@ import infore.SDE.messages.Datapoint;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.util.Collector;
 
+import java.util.Iterator;
+import java.util.Map;
+
 /**
  * OnePass State Topic ingress parser/router.
  *
@@ -64,7 +67,7 @@ public final class OnePassStateTopicParser extends RichFlatMapFunction<String, D
 
         for (int workerId = 0; workerId < expectedWorkers; workerId++) {
             String workerKey = OnePassShardOwnership.workerKey(baseKey, expectedWorkers, workerId);
-            ObjectNode workerPayload = payload.deepCopy();
+            ObjectNode workerPayload = shallowObjectCopy(payload);
 
             //Add worker-local routing metadata only after Kafka.
             workerPayload.put("workerId", workerId);
@@ -72,6 +75,21 @@ public final class OnePassStateTopicParser extends RichFlatMapFunction<String, D
 
             out.collect(new Datapoint(workerKey, "onepass-state-topic", workerPayload));
         }
+    }
+
+    private static ObjectNode shallowObjectCopy(ObjectNode source) {
+        ObjectNode copy = MAPPER.createObjectNode();
+        Iterator<Map.Entry<String, JsonNode>> fields = source.fields();
+
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            /*
+             * JsonNode values are not mutated by the StateTopic parser.
+             * Reuse child nodes, especially the potentially large entries array.
+             */
+            copy.set(field.getKey(), field.getValue());
+        }
+        return copy;
     }
 
 

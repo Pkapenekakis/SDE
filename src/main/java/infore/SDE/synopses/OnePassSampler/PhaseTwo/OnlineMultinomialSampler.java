@@ -117,14 +117,13 @@ public final class OnlineMultinomialSampler<T> implements Serializable {
      * every time, so calling finish() twice returns the same output.
      */
     public OnlineMultinomialSample<T> finish() {
+
         List<WeightedReservoirEntry<T>> orderedReservoir = getOrderedReservoir();
-
         List<T> output = new ArrayList<T>(sampleSize);
-        List<WeightedReservoirEntry<T>> selectedDistinctEntries =
-                new ArrayList<WeightedReservoirEntry<T>>();
+        List<WeightedReservoirEntry<T>> selectedDistinctEntries = new ArrayList<WeightedReservoirEntry<T>>(orderedReservoir.size());
 
+        double[] cumulativeWeights = new double[orderedReservoir.size()];
         Random outputRandom = new Random(baseSeed + 31L);
-
         double selectedDistinctWeight = 0.0d;
         int nextOrderedReservoirIndex = 0;
 
@@ -133,59 +132,24 @@ public final class OnlineMultinomialSampler<T> implements Serializable {
                 break;
             }
 
-            /*
-             * The ordered reservoir gives us candidate new items in weighted
-             * without-replacement order.
-             *
-             * At each output position:
-             *
-             * - With probability introducedWeight / totalWeight,
-             *   repeat one of the already introduced entries, proportional
-             *   to its weight.
-             *
-             * - Otherwise, introduce the next entry from the ordered reservoir.
-             *
-             * This produces with-replacement/multinomial output.
-             */
             double u = nextPositiveDouble(outputRandom) * totalWeight;
-
-            boolean repeatPrevious =
-                    selectedDistinctWeight > 0.0d && u < selectedDistinctWeight;
-
-            boolean noMoreReservoirEntries =
-                    nextOrderedReservoirIndex >= orderedReservoir.size();
-
+            boolean repeatPrevious = selectedDistinctWeight > 0.0d && u < selectedDistinctWeight;
+            boolean noMoreReservoirEntries = nextOrderedReservoirIndex >= orderedReservoir.size();
             WeightedReservoirEntry<T> selected;
-            if (repeatPrevious || noMoreReservoirEntries) {
-                selected = drawFromIntroduced(
-                        selectedDistinctEntries,
-                        selectedDistinctWeight,
-                        outputRandom
-                );
 
+            if (repeatPrevious || noMoreReservoirEntries) {
+                selected = drawFromIntroducedBinary(selectedDistinctEntries, cumulativeWeights, selectedDistinctWeight, outputRandom);
             } else {
                 selected = orderedReservoir.get(nextOrderedReservoirIndex);
-
                 nextOrderedReservoirIndex++;
-
                 selectedDistinctEntries.add(selected);
-                selectedDistinctWeight = checkedAdd(
-                        selectedDistinctWeight,
-                        selected.getWeight()
-                );
-
+                selectedDistinctWeight = checkedAdd(selectedDistinctWeight, selected.getWeight());
+                cumulativeWeights[selectedDistinctEntries.size() - 1] = selectedDistinctWeight;
             }
             output.add(selected.getItem());
         }
 
-        return new OnlineMultinomialSample<T>(
-                sampleSize,
-                itemsSeen,
-                positiveItemsSeen,
-                totalWeight,
-                output,
-                orderedReservoir
-        );
+        return new OnlineMultinomialSample<T>(sampleSize, itemsSeen, positiveItemsSeen, totalWeight, output, orderedReservoir);
     }
 
     /**
@@ -221,32 +185,27 @@ public final class OnlineMultinomialSampler<T> implements Serializable {
         return -Math.log(u) / weight;
     }
 
-    private WeightedReservoirEntry<T> drawFromIntroduced(
-            List<WeightedReservoirEntry<T>> introducedEntries,
-            double introducedWeight,
-            Random outputRandom) {
+    private WeightedReservoirEntry<T> drawFromIntroducedBinary(List<WeightedReservoirEntry<T>> introducedEntries,
+                                                               double[] cumulativeWeights, double introducedWeight,
+                                                               Random outputRandom) {
 
-        if (introducedEntries.isEmpty()) {
-            throw new IllegalStateException(
-                    "Cannot draw from an empty introduced set"
-            );
+        if (introducedEntries == null || introducedEntries.isEmpty()) {
+            throw new IllegalStateException("Cannot draw from an empty introduced set");
         }
 
         double u = nextPositiveDouble(outputRandom) * introducedWeight;
-        double cumulative = 0.0d;
+        int low = 0;
+        int high = introducedEntries.size() - 1;
 
-        for (WeightedReservoirEntry<T> entry : introducedEntries) {
-            cumulative += entry.getWeight();
-
-            if (u < cumulative) {
-                return entry;
+        while (low < high) {
+            int mid = (low + high) >>> 1;
+            if (u < cumulativeWeights[mid]) {
+                high = mid;
+            } else {
+                low = mid + 1;
             }
         }
-
-        /*
-         * Numerical fallback for rare floating-point boundary cases.
-         */
-        return introducedEntries.get(introducedEntries.size() - 1);
+        return introducedEntries.get(low);
     }
 
     private static void validateWeight(double weight) {

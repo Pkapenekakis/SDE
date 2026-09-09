@@ -60,6 +60,8 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
     private long positiveRootCandidatesSeen = 0L;
     private double totalRootGroupWeight = 0.0d;
 
+    private boolean metadataInitialized = false;
+
     public OnePassSampleReduceFunction(int nOfP, int count, String[] parameters, int synID, int rqid) {
         super(nOfP, count, parameters, synID, rqid);
         this.expectedWorkers = nOfP <= 0 ? 1 : nOfP;

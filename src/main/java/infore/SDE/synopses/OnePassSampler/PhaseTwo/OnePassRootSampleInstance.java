@@ -7,36 +7,30 @@ import java.io.Serializable;
 /**
  * One explicit multinomial root sample instance.
  *
- * Duplicates are allowed:
+ * Multiple sample instances may reference the same immutable source
+ * candidate because Phase 2 samples with replacement.
  *
- * sampleInstanceId=1 -> root candidate A
- * sampleInstanceId=2 -> root candidate A
- *
- * These must remain separate because Phase 3 may extend them differently.
+ * Sample instances remain distinct because Phase 3 may extend duplicate
+ * roots differently.
  */
 public final class OnePassRootSampleInstance implements Serializable {
 
     private static final long serialVersionUID = 1L;
-
     private final long sampleInstanceId;
-    private final long sourceCandidateId;
-    private final String rootAlias;
-    private final JsonNode rootTuple;
-    private final double rootGroupWeight;
 
-    public OnePassRootSampleInstance(
-            long sampleInstanceId,
-            OnePassRootSampleCandidate candidate) {
+    /*
+     * Shared immutable root candidate.
+     * One candidate may be referenced by multiple sample instances.
+     */
+    private final OnePassRootSampleCandidate candidate;
 
+    public OnePassRootSampleInstance(long sampleInstanceId, OnePassRootSampleCandidate candidate) {
         if (candidate == null) {
             throw new IllegalArgumentException("candidate must not be null");
         }
 
         this.sampleInstanceId = sampleInstanceId;
-        this.sourceCandidateId = candidate.getCandidateId();
-        this.rootAlias = candidate.getRootAlias();
-        this.rootTuple = candidate.getRootTuple();
-        this.rootGroupWeight = candidate.getRootGroupWeight();
+        this.candidate = candidate;
     }
 
     public long getSampleInstanceId() {
@@ -44,28 +38,25 @@ public final class OnePassRootSampleInstance implements Serializable {
     }
 
     public long getSourceCandidateId() {
-        return sourceCandidateId;
+        return candidate.getCandidateId();
     }
 
     public String getRootAlias() {
-        return rootAlias;
+        return candidate.getRootAlias();
     }
 
     public JsonNode getRootTuple() {
-        return rootTuple.deepCopy();
+        return candidate.getRootTuple();
     }
 
     public double getRootGroupWeight() {
-        return rootGroupWeight;
+        return candidate.getRootGroupWeight();
     }
 
     @Override
     public String toString() {
-        return "OnePassRootSampleInstance{" +
-                "sampleInstanceId=" + sampleInstanceId +
-                ", sourceCandidateId=" + sourceCandidateId +
-                ", rootAlias='" + rootAlias + '\'' +
-                ", rootGroupWeight=" + rootGroupWeight +
-                '}';
+        return "OnePassRootSampleInstance{" + "sampleInstanceId=" +
+                sampleInstanceId + ", sourceCandidateId=" + getSourceCandidateId() +
+                ", rootAlias='" + getRootAlias() + '\'' + ", rootGroupWeight=" + getRootGroupWeight() + '}';
     }
 }
