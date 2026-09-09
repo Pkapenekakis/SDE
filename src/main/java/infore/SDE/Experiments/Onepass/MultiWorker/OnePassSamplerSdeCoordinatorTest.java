@@ -46,12 +46,15 @@ import java.util.UUID;
  * AFTER Phase 1 completes and BEFORE phase2_algorithm_total starts.
  * - commitTransaction() is the Phase-2 release/start signal and IS inside
  * phase2_algorithm_total.
- * - the test waits for both:
+ * - the measured phase ends when:
  * <p>
- * GLOBAL_PHASE2_ROOT_SAMPLE_READY
  * GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED
  * <p>
- * on the SDE output topic.
+ * is observed on the SDE output topic.
+ * <p>
+ * Under the coordinator-free StateTopic architecture this event is the
+ * global installation barrier: every worker has received and installed the
+ * globally merged Phase-2 root sample.
  * <p>
  * This keeps expensive local file parsing / JSON creation / producer.send()
  * outside both algorithm timers while preserving the actual Kafka visibility
@@ -508,8 +511,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
                 int installedWorkerCount = intField(installed, "installedWorkerCount", -1);
 
-                JsonNode failedWorkers = installed.get("failedWorkers");
-
                 if (rootTuplesSeen != preparedPhaseTwoRoot.rows) {
 
                     throw new IllegalStateException("Phase-2 root tuple count mismatch." + " expected=" + preparedPhaseTwoRoot.rows + ", actual=" + rootTuplesSeen + ", ready=" + ready);
@@ -538,11 +539,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 if (installedWorkerCount != EXPECTED_WORKERS) {
 
                     throw new IllegalStateException("Phase-2 installed worker count mismatch." + " expected=" + EXPECTED_WORKERS + ", actual=" + installedWorkerCount + ", installed=" + installed);
-                }
-
-                if (failedWorkers != null && failedWorkers.isArray() && failedWorkers.size() > 0) {
-
-                    throw new IllegalStateException("Phase-2 root sample install failed on workers: " + failedWorkers + ". Installed=" + installed);
                 }
 
                 printPhaseTwoBenchmarkSummary(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed);
@@ -991,40 +987,40 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // =====================================================================
 
     /**
-     * Waits for both Phase-2 milestones:
+     * Waits for the single global Phase-2 completion barrier:
      * <p>
-     * 1) GLOBAL_PHASE2_ROOT_SAMPLE_READY
-     * - contains deterministic global metrics:
-     * rootTuplesSeen
-     * positiveRootCandidatesSeen
-     * totalRootGroupWeight
-     * sampleInstanceCount
+     * GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED
      * <p>
-     * 2) GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED
-     * - confirms the globally reduced sample has been installed on all
-     * workers.
+     * Under the coordinator-free StateTopic architecture, this event is
+     * emitted only after every worker has installed the same globally merged
+     * Phase-2 root sample.
      * <p>
-     * One loop is used deliberately. Kafka poll() advances the consumer
-     * position for the whole returned batch, so returning immediately on READY
-     * could otherwise discard an INSTALLED event that was in the same poll.
+     * The payload also carries the global Phase-2 counters and sample metadata
+     * used by the benchmark and correctness validator.
      */
-    private static PhaseTwoCompletion waitForShardedPhaseTwoCompletion(KafkaConsumer<String, String> consumer, int uid, String expectedResultId, long timeoutMs) throws Exception {
+    private static PhaseTwoCompletion waitForShardedPhaseTwoCompletion(
+            KafkaConsumer<String, String> consumer,
+            int uid,
+            String expectedResultId,
+            long timeoutMs) throws Exception {
 
-        long deadline = System.currentTimeMillis() + timeoutMs;
+        long deadline =
+                System.currentTimeMillis()
+                        + timeoutMs;
 
-        JsonNode readyPayload = null;
+        int recordsSeen =
+                0;
 
-        JsonNode installedPayload = null;
+        while (System.currentTimeMillis()
+                < deadline) {
 
-        String expectedStateRef = "";
+            ConsumerRecords<String, String> records =
+                    consumer.poll(
+                            1000L
+                    );
 
-        int recordsSeen = 0;
-
-        while (System.currentTimeMillis() < deadline) {
-
-            ConsumerRecords<String, String> records = consumer.poll(1000L);
-
-            for (ConsumerRecord<String, String> record : records) {
+            for (ConsumerRecord<String, String> record
+                    : records) {
 
                 recordsSeen++;
 
@@ -1032,90 +1028,202 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
                 try {
 
-                    envelope = MAPPER.readTree(record.value());
+                    envelope =
+                            MAPPER.readTree(
+                                    record.value()
+                            );
 
                 } catch (Exception ignored) {
 
                     continue;
                 }
 
-                JsonNode payload = unwrapEstimationPayload(envelope);
+                JsonNode payload =
+                        unwrapEstimationPayload(
+                                envelope
+                        );
 
-                if (payload == null || payload.isNull() || !payload.isObject()) {
-
-                    continue;
-                }
-
-                if (intField(payload, "uid", -1) != uid) {
-
-                    continue;
-                }
-
-                String type = textField(payload, "type", "");
-
-                if ("GLOBAL_PHASE2_ROOT_SAMPLE_READY".equals(type)) {
-
-                    String resultId = textField(payload, "resultId", "");
-
-                    if (!expectedResultId.equals(resultId)) {
-
-                        continue;
-                    }
-
-                    readyPayload = payload.deepCopy();
-
-                    expectedStateRef = textField(payload, "stateRef", "");
-
-                    System.out.println("Observed GLOBAL_PHASE2_ROOT_SAMPLE_READY:" + " resultId=" + resultId + ", stateRef=" + expectedStateRef + ", rootTuplesSeen=" + longField(payload, "rootTuplesSeen", -1L) + ", positiveRootCandidatesSeen=" + longField(payload, "positiveRootCandidatesSeen", -1L) + ", totalRootGroupWeight=" + doubleField(payload, "totalRootGroupWeight", 0.0d) + ", sampleInstanceCount=" + intField(payload, "sampleInstanceCount", -1));
-
-                    /*
-                     * If INSTALLED was seen first for some unexpected reason,
-                     * verify its stateRef now.
-                     */
-                    if (installedPayload != null) {
-
-                        String installedStateRef = textField(installedPayload, "stateRef", "");
-
-                        if (!expectedStateRef.equals(installedStateRef)) {
-
-                            installedPayload = null;
-                        }
-                    }
+                if (payload == null
+                        || payload.isNull()
+                        || !payload.isObject()) {
 
                     continue;
                 }
 
-                if ("GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type)) {
+                if (intField(
+                        payload,
+                        "uid",
+                        -1
+                ) != uid) {
 
-                    String stateRef = textField(payload, "stateRef", "");
-
-                    if (readyPayload != null && !expectedStateRef.equals(stateRef)) {
-
-                        continue;
-                    }
-
-                    installedPayload = payload.deepCopy();
-
-                    System.out.println("Observed GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED:" + " stateRef=" + stateRef + ", installedWorkerCount=" + intField(payload, "installedWorkerCount", -1) + ", expectedWorkers=" + intField(payload, "expectedWorkers", -1) + ", failedWorkers=" + payload.get("failedWorkers"));
-                }
-            }
-
-            if (readyPayload != null && installedPayload != null) {
-
-                String readyStateRef = textField(readyPayload, "stateRef", "");
-
-                String installedStateRef = textField(installedPayload, "stateRef", "");
-
-                if (!readyStateRef.equals(installedStateRef)) {
-
-                    throw new IllegalStateException("Phase-2 READY/INSTALLED stateRef mismatch." + " ready=" + readyStateRef + ", installed=" + installedStateRef);
+                    continue;
                 }
 
-                return new PhaseTwoCompletion(readyPayload, installedPayload);
+                String type =
+                        textField(
+                                payload,
+                                "type",
+                                ""
+                        );
+
+                /*
+                 * The old coordinator-era request-84 READY event no longer
+                 * exists.
+                 *
+                 * Request 86 / GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED is now the
+                 * global Phase-2 completion barrier.
+                 */
+                if (!"GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED"
+                        .equals(type)) {
+
+                    continue;
+                }
+
+                String resultId =
+                        textField(
+                                payload,
+                                "resultId",
+                                ""
+                        );
+
+                if (!expectedResultId.equals(
+                        resultId
+                )) {
+
+                    continue;
+                }
+
+                String stateRef =
+                        textField(
+                                payload,
+                                "stateRef",
+                                ""
+                        );
+
+                if (stateRef == null
+                        || stateRef.trim().isEmpty()) {
+
+                    throw new IllegalStateException(
+                            "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED "
+                                    + "has no stateRef. Payload="
+                                    + payload
+                    );
+                }
+
+                int expectedWorkers =
+                        intField(
+                                payload,
+                                "expectedWorkers",
+                                -1
+                        );
+
+                if (expectedWorkers
+                        != EXPECTED_WORKERS) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 expectedWorkers mismatch."
+                                    + " configured="
+                                    + EXPECTED_WORKERS
+                                    + ", payload="
+                                    + expectedWorkers
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int installedWorkerCount =
+                        intField(
+                                payload,
+                                "installedWorkerCount",
+                                -1
+                        );
+
+                if (installedWorkerCount
+                        != EXPECTED_WORKERS) {
+
+                    throw new IllegalStateException(
+                            "Phase-2 installation barrier completed "
+                                    + "with unexpected worker count."
+                                    + " expected="
+                                    + EXPECTED_WORKERS
+                                    + ", installed="
+                                    + installedWorkerCount
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                System.out.println(
+                        "Observed GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED:"
+                                + " resultId="
+                                + resultId
+                                + ", stateRef="
+                                + stateRef
+                                + ", rootTuplesSeen="
+                                + longField(
+                                payload,
+                                "rootTuplesSeen",
+                                -1L
+                        )
+                                + ", positiveRootCandidatesSeen="
+                                + longField(
+                                payload,
+                                "positiveRootCandidatesSeen",
+                                -1L
+                        )
+                                + ", totalRootGroupWeight="
+                                + doubleField(
+                                payload,
+                                "totalRootGroupWeight",
+                                0.0d
+                        )
+                                + ", sampleInstanceCount="
+                                + intField(
+                                payload,
+                                "sampleInstanceCount",
+                                -1
+                        )
+                                + ", installedWorkerCount="
+                                + installedWorkerCount
+                                + ", expectedWorkers="
+                                + expectedWorkers
+                );
+
+                /*
+                 * Compatibility with the existing benchmark and validator.
+                 *
+                 * The rest of this test still uses the historical names:
+                 *
+                 *     readyPayload
+                 *     installedPayload
+                 *
+                 * Request 86 now contains all information that used to be
+                 * split between the old READY and INSTALLED events.
+                 *
+                 * Return copies of the same request-86 payload in both fields
+                 * so benchmark and validation code can remain unchanged for
+                 * this migration.
+                 */
+                JsonNode completion =
+                        payload.deepCopy();
+
+                return new PhaseTwoCompletion(
+                        completion,
+                        completion.deepCopy()
+                );
             }
         }
 
-        throw new IllegalStateException("Timed out waiting for sharded Phase-2 completion." + " uid=" + uid + ", resultId=" + expectedResultId + ", sawReady=" + (readyPayload != null) + ", sawInstalled=" + (installedPayload != null) + ", recordsSeen=" + recordsSeen);
+        throw new IllegalStateException(
+                "Timed out waiting for "
+                        + "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED."
+                        + " uid="
+                        + uid
+                        + ", resultId="
+                        + expectedResultId
+                        + ", recordsSeen="
+                        + recordsSeen
+        );
     }
 
 

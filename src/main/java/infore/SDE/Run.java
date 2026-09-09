@@ -12,9 +12,7 @@ import infore.SDE.sources.kafkaStringConsumer;
 
 import infore.SDE.sources.kafkaStringProducer;
 import infore.SDE.transformations.*;
-import infore.SDE.transformations.onepass.OnePassGlobalStateSplitter;
 import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
-import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorOperator;
 import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
 import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneEnrichmentBuffer;
 import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentBuffer;
@@ -27,7 +25,6 @@ import org.apache.flink.streaming.api.datastream.SplitStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import infore.SDE.messages.Estimation;
 import infore.SDE.messages.Request;
-import infore.SDE.transformations.onepass.OnePassStateTransferToJson;
 import infore.SDE.transformations.onepass.OnePassPhaseOneTransitionMapper;
 
 /**
@@ -211,13 +208,6 @@ public class Run {
 					}
 				})
 				.name("ONEPASS_STATE_TRANSFER_BRANCH");
-
-		onePassStateTransferStream
-				.map(new OnePassStateTransferToJson())
-				.name("ONEPASS_STATE_TRANSFER_SERIALIZER")
-				.addSink(onePassGlobalStateKp.getProducer())
-				.name("ONEPASS_STATE_TOPIC_OUTPUT");
-
 		/*
 		 * Pre-reduce coordinator input.
 		 *
@@ -363,20 +353,6 @@ public class Run {
 				}).name("ONEPASS_POST_REDUCE_COORDINATOR_INPUT");
 
 
-		/*
-		 * Global state payload path.
-		 *
-		 * This is now the legacy Phase 2/3 global-state path only.
-		 * Phase 1 feedback is carried through RequestTopic above.
-		 */
-		DataStream<String> onePassGlobalStateChunks = onePassPostReduceCoordinatorInput
-				.flatMap(new OnePassGlobalStateSplitter())
-				.name("ONEPASS_GLOBAL_STATE_SPLITTER");
-
-		onePassGlobalStateChunks
-				.addSink(onePassGlobalStateKp.getProducer())
-				.name("ONEPASS_GLOBAL_STATE_TOPIC_OUTPUT");
-
 		DataStream<Estimation> finalStreamExternalOutput = finalStream
 				.filter(new FilterFunction<Estimation>() {
 					private static final long serialVersionUID = 1L;
@@ -402,31 +378,6 @@ public class Run {
 		 *   - GLOBAL_BARRIER_READY
 		 *   - GLOBAL_PHASE1_RESULT_READY
 		 */
-		DataStream<Estimation> onePassCoordinatorOutput = onePassPreReduceCoordinatorInput
-				.union(onePassPostReduceCoordinatorInput)
-				.flatMap(new OnePassCoordinatorOperator())
-				.name("ONEPASS_COORDINATOR")
-				.setParallelism(1);
-
-		DataStream<Estimation> onePassCoordinatorRequestOutput = onePassCoordinatorOutput
-				.filter(new FilterFunction<Estimation>() {
-					private static final long serialVersionUID = 1L;
-
-					@Override
-					public boolean filter(Estimation value) {
-						return isOnePassCoordinatorRequestCommand(value);
-					}
-				}).name("ONEPASS_COORDINATOR_REQUEST_OUTPUT");
-
-		DataStream<Estimation> onePassCoordinatorEstimationOutput = onePassCoordinatorOutput
-				.filter(new FilterFunction<Estimation>() {
-					private static final long serialVersionUID = 1L;
-
-					@Override
-					public boolean filter(Estimation value) {
-						return !isOnePassCoordinatorRequestCommand(value);
-					}
-				}).name("ONEPASS_COORDINATOR_ESTIMATION_OUTPUT");
 
 		/*
 		 * requestID == 7 is serialized as Request by kafkaProducerEstimation.
@@ -434,19 +385,6 @@ public class Run {
 		 * Phase 1 uses the new BEGIN/CHUNK/COMMIT + transition path.
 		 * Phase 2/3 still use requests emitted by OnePassCoordinatorOperator.
 		 */
-		DataStream<Estimation> onePassRequestFeedback = onePassPhaseOneTransitions
-				.union(onePassCoordinatorRequestOutput);
-
-		onePassRequestFeedback
-				.addSink(pRequest.getProducer())
-				.name("ONEPASS_REQUEST_TOPIC_FEEDBACK")
-				.setParallelism(1);
-
-		/*
-		 * Readiness/status events stay in estimationTopic.
-		 */
-		onePassCoordinatorEstimationOutput.addSink(kp.getProducer()).name("ONEPASS_COORDINATOR_OUTPUT");
-
 		env.execute("Streaming SDE");
 
 	}

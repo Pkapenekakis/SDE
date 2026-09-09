@@ -12,8 +12,7 @@ public final class OnePassReduceFunctionFactory {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private OnePassReduceFunctionFactory() {
-    }
+    private OnePassReduceFunctionFactory() {}
 
     public static ReduceFunction create(Estimation value) {
         String type = resolveType(value);
@@ -29,7 +28,17 @@ public final class OnePassReduceFunctionFactory {
         }
 
         if ("LOCAL_PHASE1_SHARD_READY".equals(type) || value.getRequestID() == 76) {
-            return new OnePassPhaseOneReadyReduceFunction(
+            return new OnePassWorkerReadyReduceFunction(
+                    value.getNoOfP(),
+                    0,
+                    value.getParam(),
+                    value.getSynopsisID(),
+                    value.getRequestID()
+            );
+        }
+
+        if ("LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type) || value.getRequestID() == 85) {
+            return new OnePassWorkerReadyReduceFunction(
                     value.getNoOfP(),
                     0,
                     value.getParam(),

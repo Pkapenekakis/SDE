@@ -1,200 +1,397 @@
 package infore.SDE;
 
-
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+
 import infore.SDE.messages.Datapoint;
+import infore.SDE.messages.Estimation;
+import infore.SDE.messages.Request;
 import infore.SDE.sources.kafkaProducerEstimation;
 import infore.SDE.sources.kafkaStringConsumer;
-
-import infore.SDE.transformations.*;
+import infore.SDE.sources.kafkaStringProducer;
+import infore.SDE.transformations.GReduceFlatMap;
+import infore.SDE.transformations.ReduceFlatMap;
+import infore.SDE.transformations.RqRouterFlatMap;
+import infore.SDE.transformations.SDEcoFlatMap;
 import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
+import infore.SDE.transformations.onepass.OnePassPhaseOneTransitionMapper;
+import infore.SDE.transformations.onepass.OnePassStateTopicEmitter;
+import infore.SDE.transformations.onepass.OnePassStateTopicParser;
 import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
+import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneEnrichmentBuffer;
+import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentBuffer;
+
 import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.streaming.api.collector.selector.OutputSelector;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SplitStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import infore.SDE.messages.Estimation;
-import infore.SDE.messages.Request;
-import infore.SDE.transformations.onepass.coordinator.OnePassCoordinatorOperator;
 
 /**
- * <br>
- * Implementation code for SDE for INFORE-PROJECT" <br> *
- * ATHENA Research and Innovation Center <br> *
- * Author: Antonis_Kontaxakis <br> *
- * email: adokontax15@gmail.com *
+ * SDE runtime with the coordinator-free OnePass StateTopic architecture.
  */
-
-
 public class RunOnepass {
+
+    private static final int ONEPASS_SYNOPSIS_ID = 30;
 
     private static String kafkaDataInputTopic;
     private static String kafkaRequestInputTopic;
     private static String kafkaBrokersList;
     private static int parallelism;
     private static String kafkaOutputTopic;
+    private static String kafkaOnePassStateTopic;
 
-    /**
-     * @param args Program arguments. You have to provide 4 arguments otherwise
-     *             DEFAULT values will be used.<br>
-     *             <ol>
-     *             <li>args[0]={@link #kafkaDataInputTopic} DEFAULT: "Forex")
-     *             <li>args[1]={@link #kafkaRequestInputTopic} DEFAULT: "Requests")
-     *             <li>args[2]={@link #kafkaBrokersList} (DEFAULT: "localhost:9092")
-     *             <li>args[3]={@link #parallelism} Job parallelism (DEFAULT: "4")
-     *             <li>args[4]={@link #kafkaOutputTopic} DEFAULT: "OUT")
-     *             "O10")
-     *             </ol>
-     *
-     */
+    private static OnePassDataRouterCoFlatMap.RoutingMode onePassRoutingMode =
+            OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
 
     public static void main(String[] args) throws Exception {
-        // Initialize Input Parameters
         initializeParameters(args);
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
-        kafkaStringConsumer kc = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic);
-        kafkaStringConsumer requests = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic);
-        kafkaProducerEstimation kp = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
+        kafkaStringConsumer dataConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic, true);
+        kafkaStringConsumer requestConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic);
+        kafkaStringConsumer onePassStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic);
+        kafkaProducerEstimation estimationProducer = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
 
+        //RequestTopic feedback is used for stateless OnePass lifecycle
+        kafkaProducerEstimation requestFeedbackProducer = new kafkaProducerEstimation(kafkaBrokersList, kafkaRequestInputTopic);
+        kafkaStringProducer onePassStateProducer = new kafkaStringProducer(kafkaBrokersList, kafkaOnePassStateTopic);
 
-        DataStream<String> datastream = env.addSource(kc.getFc());
-        DataStream<String> RQ_stream = env.addSource(requests.getFc());
+        DataStream<String> kafkaDataStream = env.addSource(dataConsumer.getFc());
+        DataStream<String> kafkaRequestStream = env.addSource(requestConsumer.getFc());
+        DataStream<String> kafkaOnePassStateStream = env.addSource(onePassStateConsumer.getFc());
 
-        //map kafka data input to tuple2<int,double>
-        DataStream<Datapoint> dataStream = datastream
-                .map(new MapFunction<String, Datapoint>() {
-                    @Override
-                    public Datapoint map(String node) throws IOException {
-                        // TODO Auto-generated method stub
-                        ObjectMapper objectMapper = new ObjectMapper();
-                        Datapoint dp = objectMapper.readValue(node, Datapoint.class);
-                        return dp;
-                    }
-                }).name("DATA_SOURCE").keyBy((KeySelector<Datapoint, String>)Datapoint::getKey);
+        // ================================================================
+        // NORMAL DATA SOURCE
+        // ================================================================
+        DataStream<Datapoint> parsedDataStream = kafkaDataStream.map(new MapFunction<String, Datapoint>() {
+            private static final long serialVersionUID = 1L;
 
-        //DataStream<Tuple2<String, String>> dataStream = datastream.flatMap(new IngestionMultiplierFlatMap(multi)).setParallelism(parallelism2).keyBy(0);
-        DataStream<Request> RQ_Stream = RQ_stream
-                .map(new MapFunction<String, Request>() {
-                    private static final long serialVersionUID = 1L;
-                    @Override
-                    public Request map(String node) throws IOException {
-                        // TODO Auto-generated method stub
-                        //String[] valueTokens = node.replace("\"", "").split(",");
-                        //if(valueTokens.length > 6) {
-                        ObjectMapper objectMapper = new ObjectMapper();
+            @Override
+            public Datapoint map(String node) throws IOException {
+                ObjectMapper objectMapper = new ObjectMapper();
+                return objectMapper.readValue(node, Datapoint.class);
+            }
+        }).name("DATA_SOURCE").keyBy((KeySelector<Datapoint, String>) Datapoint::getKey);
 
-                        // byte[] jsonData = json.toString().getBytes();
-                        Request request = objectMapper.readValue(node, Request.class);
-                        return  request;
-                    }
-                }).name("REQUEST_SOURCE").keyBy((KeySelector<Request, String>) Request::getKey);
+        // ================================================================
+        // REQUEST SOURCE
+        // ================================================================
 
-        DataStream<Request> SynopsisRequests = RQ_Stream.flatMap(new RqRouterFlatMap()).name("REQUEST_ROUTER");
+        DataStream<Request> parsedRequestStream = kafkaRequestStream.map(new MapFunction<String, Request>() {
+            private static final long serialVersionUID = 1L;
 
+            @Override
+            public Request map(String node) throws IOException {
+                ObjectMapper objectMapper = new ObjectMapper();
+                return objectMapper.readValue(node, Request.class);
+            }
+        }).name("REQUEST_SOURCE").keyBy((KeySelector<Request, String>) Request::getKey);
+        DataStream<Request> synopsisRequests = parsedRequestStream.flatMap(new RqRouterFlatMap()).name("REQUEST_ROUTER");
+
+        // ================================================================
+        // ONEPASS STATE TOPIC SOURCE
+        // ================================================================
         /*
-         * OnePass logical data router:
-         *   baseKey -> baseKey_2_KEYED_0, baseKey_2_KEYED_1, ...
-         */
-        DataStream<Datapoint> routedDataStream = dataStream.connect(RQ_Stream)
-                .flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_ROUND_ROBIN_DATA_ROUTER");
-
-        /*
-         * Force routed data to the intended physical worker.
-         */
-        DataStream<Datapoint> partitionedDataStream = routedDataStream.partitionCustom(new OnePassWorkerPartitioner(),
-                                (KeySelector<Datapoint, String>) Datapoint::getKey);
-
-        /*
-         * Force routed requests to the same intended physical worker.
-         */
-        DataStream<Request> partitionedRequestStream = SynopsisRequests.partitionCustom(new OnePassWorkerPartitioner(),
-                                (KeySelector<Request, String>) Request::getKey);
-
-        /*
-         * Important:
-         * Do NOT keyBy again here.
-         * keyBy would re-hash and could send _KEYED_0 and _KEYED_1 to the same subtask.
-         */
-        DataStream<Estimation> estimationStream = partitionedDataStream.connect(partitionedRequestStream)
-                        .flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
-
-        DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
-                .flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_ROUND_ROBIN_DATA_ROUTER")
-                .keyBy((KeySelector<Datapoint, String>) Datapoint::getKey);
-
-        /*
-         * Route One-pass* coordinator messages away from the old generic SDE
-         * multi-parallel reduce path.
-         */
-        DataStream<Estimation> onePassCoordinatorInput = estimationStream.filter(new FilterFunction<Estimation>() {
-                            private static final long serialVersionUID = 1L;
-
-                            @Override
-                            public boolean filter(Estimation value) {
-                                return isOnePassCoordinatorMessage(value);
-                            }
-                        }).name("ONEPASS_COORDINATOR_INPUT");
-
-        DataStream<Estimation> normalEstimationStream = estimationStream.filter(new FilterFunction<Estimation>() {
-                            private static final long serialVersionUID = 1L;
-
-                            @Override
-                            public boolean filter(Estimation value) {
-                                return !isOnePassCoordinatorMessage(value);
-                            }
-                        }).name("NORMAL_ESTIMATION_STREAM");
-
-
-        /*
-         * First real Flink coordinator stage.
+         * Targeted request-78 messages already contain workerKey.
          *
-         * V0 behavior:
-         *   workers -> DATA_BARRIER_ACK
-         *   coordinator -> GLOBAL_BARRIER_READY
+         * Global Phase-2 sample chunks are written only once to Kafka and
+         * OnePassStateTopicParser fans them out to the physical workers
+         * after Kafka.
          */
-        DataStream<Estimation> onePassCoordinatorOutput =
-                onePassCoordinatorInput.flatMap(new OnePassCoordinatorOperator())
-                        .name("ONEPASS_COORDINATOR")
-                        .setParallelism(1);
+        DataStream<Datapoint> onePassStateTopicDataStream = kafkaOnePassStateStream.
+                flatMap(new OnePassStateTopicParser()).name("ONEPASS_STATE_TOPIC_PARSER");
+
+        // ================================================================
+        // ONEPASS-AWARE DATA ROUTING
+        // ================================================================
+        DataStream<Datapoint> routedDataStream = parsedDataStream.connect(parsedRequestStream).
+                flatMap(new OnePassDataRouterCoFlatMap(onePassRoutingMode)).name("ONEPASS_AWARE_DATA_ROUTER");
+
+        //StateTopic records enter exactly the same physical worker path as ordinary routed data.
+        DataStream<Datapoint> dataStreamWithState = routedDataStream.union(onePassStateTopicDataStream);
 
         /*
-         * For now we write coordinator output to the same estimation output topic.
+         * IMPORTANT:
+         * Do not keyBy again after partitionCustom.
+         *
+         * _KEYED_0, _KEYED_1, ... must reach their intended physical
+         * Flink subtasks.
          */
-        onePassCoordinatorOutput.addSink(kp.getProducer()).name("ONEPASS_COORDINATOR_OUTPUT");
+        DataStream<Datapoint> partitionedDataStream = dataStreamWithState.
+                partitionCustom(new OnePassWorkerPartitioner(), (KeySelector<Datapoint, String>) Datapoint::getKey);
 
-        DataStream<Estimation> single = normalEstimationStream.filter(new FilterFunction<Estimation>() {
-                            private static final long serialVersionUID = 1L;
+        DataStream<Request> partitionedSynopsisRequests = synopsisRequests.
+                partitionCustom(new OnePassWorkerPartitioner(), (KeySelector<Request, String>) Request::getKey);
 
-                            @Override
-                            public boolean filter(Estimation value) {
-                                return value.getNoOfP() == 1;
-                            }
-                        }).name("SINGLE_OUTPUT");
+        // ================================================================
+        // SYNOPSIS MAINTENANCE
+        // ================================================================
+        DataStream<Estimation> estimationStream = partitionedDataStream.
+                connect(partitionedSynopsisRequests).flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
 
-        DataStream<Estimation> multy = normalEstimationStream.filter(new FilterFunction<Estimation>() {
-                            private static final long serialVersionUID = 1L;
+        // ================================================================
+        // STATE TOPIC WORK - REQUEST 78
+        // ================================================================
+        DataStream<Estimation> onePassStateTransferStream = estimationStream.filter(new FilterFunction<Estimation>() {
+            private static final long serialVersionUID = 1L;
 
-                            @Override
-                            public boolean filter(Estimation value) {
-                                return value.getNoOfP() != 1;
-                            }
-                        }).name("MULTY_OUTPUT")
-                        .keyBy((KeySelector<Estimation, String>) Estimation::getKey);
+            @Override
+            public boolean filter(Estimation value) {
+                return isOnePassStateTransferMessage(value);
+            }
+        }).name("ONEPASS_STATE_TRANSFER_BRANCH");
 
-        single.addSink(kp.getProducer()).name("SINGLE_KAFKA_OUTPUT");
+        // ================================================================
+        // NORMAL REDUCE INPUT
+        // ================================================================
+        /*
+         * request 78 is StateTopic traffic and must not reach ReduceFlatMap.
+         * IMPORTANT:
+         *
+         * request 85 is NOT filtered here.
+         * LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED must enter ReduceFlatMap so
+         * P local installation-ready messages become request 86.
+         */
+        DataStream<Estimation> normalEstimationStream = estimationStream.filter(new FilterFunction<Estimation>() {
+            private static final long serialVersionUID = 1L;
 
+            @Override
+            public boolean filter(Estimation value) {
+                return !isOnePassControlAck(value) && !isOnePassStateTransferMessage(value);
+            }
+        }).name("NORMAL_ESTIMATION_STREAM");
+
+        //Preserve existing SDE single-vs-multi behavior.
+        SplitStream<Estimation> split = normalEstimationStream.split(new OutputSelector<Estimation>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public Iterable<String> select(Estimation value) {
+                List<String> output = new ArrayList<String>();
+                output.add(value.getNoOfP() == 1 ? "single" : "multy");
+
+                return output;
+            }
+        });
+
+        DataStream<Estimation> single = split.select("single");
+        DataStream<Estimation> multy = split.select("multy").
+                keyBy((KeySelector<Estimation, String>) Estimation::getKey);
+
+        single.addSink(estimationProducer.getProducer()).name("SINGLE_ESTIMATION_OUTPUT");
+
+        /*
+         * The normal federated merge point.
+         *
+         * OnePass currently uses:
+         *
+         * 76 -> LOCAL_PHASE1_SHARD_READY
+         * 82 -> LOCAL_PHASE2_ROOT_SUMMARY
+         * 85 -> LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED
+         */
         DataStream<Estimation> partialOutputStream = multy.flatMap(new ReduceFlatMap()).name("REDUCE");
+        // ================================================================
+        // PHASE 1 GLOBAL READINESS - REQUEST 77
+        // ================================================================
 
-        DataStream<Estimation> finalStream = partialOutputStream.flatMap(new GReduceFlatMap()).name("GLOBAL_REDUCE")
-                        .setParallelism(1);
+        DataStream<Estimation> onePassPhaseOneAliasReady = partialOutputStream.filter(new FilterFunction<Estimation>() {
+            private static final long serialVersionUID = 1L;
 
-        finalStream.addSink(kp.getProducer()).name("FINAL_KAFKA_OUTPUT");
+            @Override
+            public boolean filter(Estimation value) {
+                return value != null &&
+                        value.getSynopsisID() == ONEPASS_SYNOPSIS_ID &&
+                        value.getRequestID() == 77 &&
+                        "GLOBAL_PHASE1_ALIAS_READY".equals(firstParam(value));
+            }
+        }).name("ONEPASS_PHASE1_ALIAS_READY");
+
+        /*
+         * Stateless transition:
+         * GLOBAL_PHASE1_ALIAS_READY  -> START_NEXT_ALIAS / START_PHASE_2
+         */
+        DataStream<Estimation> onePassPhaseOneTransitions = onePassPhaseOneAliasReady.
+                flatMap(new OnePassPhaseOneTransitionMapper()).name("ONEPASS_PHASE1_TRANSITION_MAPPER").setParallelism(1);
+
+        // ================================================================
+        // PHASE 2 GLOBAL ROOT SAMPLE - REQUEST 83
+        // ================================================================
+        DataStream<Estimation> onePassGlobalPhaseTwoRootSamples = partialOutputStream.filter(new FilterFunction<Estimation>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public boolean filter(Estimation value) {
+                return value != null &&
+                        value.getSynopsisID() == ONEPASS_SYNOPSIS_ID &&
+                        value.getRequestID() == 83 &&
+                        "GLOBAL_PHASE2_ROOT_SAMPLE".equals(firstParam(value));
+            }
+        }).name("ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE");
+
+        // ================================================================
+        // PHASE 2 GLOBAL INSTALL READY - REQUEST 86
+        // ================================================================
+        DataStream<Estimation> onePassGlobalPhaseTwoInstalled = partialOutputStream.filter(new FilterFunction<Estimation>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public boolean filter(Estimation value) {
+                return value != null &&
+                        value.getSynopsisID() == ONEPASS_SYNOPSIS_ID &&
+                        value.getRequestID() == 86 &&
+                        "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(firstParam(value));
+            }
+        }).name("ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED");
+
+        // ================================================================
+        // UNIFIED STATE TOPIC OUTPUT
+        // ================================================================
+
+        /*
+         * request 78: targeted sharded computation/state work.
+         *
+         * request 83: bounded global root sample.
+         *
+         * OnePassStateTopicEmitter understands both.
+         */
+        DataStream<Estimation> onePassStateTopicFeedback = onePassStateTransferStream.
+                union(onePassGlobalPhaseTwoRootSamples);
+
+        onePassStateTopicFeedback.flatMap(new OnePassStateTopicEmitter()).name("ONEPASS_STATE_TOPIC_EMITTER").
+                addSink(onePassStateProducer.getProducer()).name("ONEPASS_STATE_TOPIC_OUTPUT");
+
+        // ================================================================
+        // REQUEST TOPIC LIFECYCLE FEEDBACK
+        // ================================================================
+
+        /*
+         * For the current Phase-1 + Phase-2 implementation the automatic
+         * RequestTopic feedback is only:
+         *
+         * request 77 -> START_NEXT_ALIAS / START_PHASE_2
+         *
+         * When sharded Phase 3 is implemented, its transition should begin from request 86.
+         */
+        onePassPhaseOneTransitions.addSink(requestFeedbackProducer.getProducer()).
+                name("ONEPASS_REQUEST_TOPIC_FEEDBACK").setParallelism(1);
+
+        // ================================================================
+        // PHASE 2 COMPLETION OUTPUT
+        // ================================================================
+
+        /*
+         * request 86 means every worker has installed the complete global
+         * Phase-2 root sample.
+         *
+         * Until sharded Phase 3 exists, this is the clean Phase-2 endpoint.
+         */
+        onePassGlobalPhaseTwoInstalled.addSink(estimationProducer.getProducer()).name("ONEPASS_PHASE2_INSTALLED_OUTPUT");
+
+        // ================================================================
+        // GENERIC SDE GLOBAL REDUCE
+        // ================================================================
+        /*
+         * 77, 83 and 86 are already globally reduced and have dedicated
+         * OnePass branches above.
+         *
+         * They should not go through GReduceFlatMap.
+         */
+        DataStream<Estimation> genericPartialOutputStream = partialOutputStream.filter(new FilterFunction<Estimation>() {
+            private static final long serialVersionUID = 1L;
+            @Override
+            public boolean filter(Estimation value) {
+                return !isOnePassInternalReducedFeedback(value);
+            }
+        }).name("GENERIC_PARTIAL_OUTPUT");
+
+        DataStream<Estimation> finalStream = genericPartialOutputStream.flatMap(new GReduceFlatMap()).
+                name("GLOBAL_REDUCE").setParallelism(1);
+
+        finalStream.addSink(estimationProducer.getProducer()).name("FINAL_STREAM_EXTERNAL_OUTPUT");
+
         env.execute("Streaming SDE");
+    }
 
+    /**
+     * request 78 StateTopic traffic.
+     */
+    private static boolean isOnePassStateTransferMessage(Estimation value) {
+
+        if (value == null || value.getSynopsisID() != ONEPASS_SYNOPSIS_ID || value.getRequestID() != 78) {
+            return false;
+        }
+
+        String type = firstParam(value);
+        return "SHARD_BATCH".equals(type) ||
+                "SOURCE_DONE".equals(type) ||
+                OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type) ||
+                OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type) ||
+                OnePassPhaseTwoEnrichmentBuffer.TYPE_ROOT_ENRICH_BATCH.equals(type) ||
+                OnePassPhaseTwoEnrichmentBuffer.TYPE_ROOT_ENRICH_SOURCE_DONE.equals(type);
+    }
+
+    /**
+     * Temporary compatibility filter for the remaining worker-local
+     * request-7 status messages.
+     * <p>
+     * request 85 is deliberately NOT included.
+     */
+    private static boolean isOnePassControlAck(Estimation value) {
+        if (value == null || value.getSynopsisID() != ONEPASS_SYNOPSIS_ID || value.getRequestID() != 7) {
+            return false;
+        }
+
+        String type = firstParam(value);
+        return "FINISH_PHASE_1".equals(type) ||
+                "FINISH_PHASE_2".equals(type) ||
+                "START_PHASE_3_ALIAS".equals(type) ||
+                "FINISH_PHASE_3_ALIAS".equals(type) ||
+                "FINISH_PHASE_3".equals(type) ||
+                "STATUS".equals(type);
+    }
+
+    /**
+     * OnePass results that are already globally reduced and have their own
+     * feedback/output path.
+     */
+    private static boolean isOnePassInternalReducedFeedback(Estimation value) {
+        if (value == null || value.getSynopsisID() != ONEPASS_SYNOPSIS_ID) {
+            return false;
+        }
+
+        String type = firstParam(value);
+
+        if (value.getRequestID() == 77 && "GLOBAL_PHASE1_ALIAS_READY".equals(type)) {
+            return true;
+        }
+
+        if (value.getRequestID() == 83 && "GLOBAL_PHASE2_ROOT_SAMPLE".equals(type)) {
+            return true;
+        }
+
+        return value.getRequestID() == 86 && "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type);
+    }
+
+    private static String firstParam(Estimation value) {
+
+        if (value == null) {
+            return "";
+        }
+
+        String[] param = value.getParam();
+
+        if (param == null || param.length == 0 || param[0] == null) {
+
+            return "";
+        }
+
+        return param[0].trim();
     }
 
     private static void initializeParameters(String[] args) {
@@ -202,59 +399,35 @@ public class RunOnepass {
         if (args.length > 4) {
 
             System.out.println("[INFO] User Defined program arguments");
-            //User defined program arguments
             kafkaDataInputTopic = args[0];
             kafkaRequestInputTopic = args[1];
             kafkaOutputTopic = args[2];
             kafkaBrokersList = args[3];
-            //kafkaBrokersList = "localhost:9092";
             parallelism = Integer.parseInt(args[4]);
-            //parallelism2 = Integer.parseInt(args[5]);
-            //multi = Integer.parseInt(args[5]);
+            kafkaOnePassStateTopic = args.length > 5 ? args[5] : "onepassStateTopic";
 
-        }else{
+            //JOIN_KEY_HASH is the correct fallback for the current distributed OnePass design.
+            onePassRoutingMode = args.length > 6 ? OnePassDataRouterCoFlatMap.RoutingMode.fromString(args[6]) :
+                    OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
+
+        } else {
 
             System.out.println("[INFO] Default values");
-            //Default values
-            //kafkaDataInputTopic = "FAN";
             kafkaDataInputTopic = "dataTopic";
             kafkaRequestInputTopic = "requestTopic";
-            //kafkaRequestInputTopic = "Rq_FAN";
-            parallelism = 4;
-            //parallelism2 = 4;
-            //kafkaBrokersList = "clu02.softnet.tuc.gr:6667,clu03.softnet.tuc.gr:6667,clu04.softnet.tuc.gr:6667,clu06.softnet.tuc.gr:6667";
-            //kafkaBrokersList = "45.10.26.123:19092";
-            kafkaBrokersList = "localhost:9092";
-            //kafkaBrokersList = "159.69.32.166:9092";
             kafkaOutputTopic = "estimationTopic";
-        }
-    }
-
-    private static boolean isOnePassCoordinatorMessage(Estimation value) {
-        if (value == null) {
-            return false;
+            kafkaBrokersList = "localhost:9092";
+            parallelism = 4;
+            kafkaOnePassStateTopic = "onepassStateTopic";
+            onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
         }
 
-        if (value.getSynopsisID() != 30) {
-            return false;
-        }
-
-        String[] param = value.getParam();
-
-        if (param == null || param.length == 0 || param[0] == null) {
-            return false;
-        }
-
-        String type = param[0].trim();
-
-        if (value.getRequestID() == 70 && "DATA_BARRIER_ACK".equals(type)) {
-            return true;
-        }
-
-        if (value.getRequestID() == 72 && "LOCAL_PHASE1_RESULT".equals(type)) {
-            return true;
-        }
-
-        return false;
+//        System.out.println("[INFO] dataTopic=" + kafkaDataInputTopic);
+//        System.out.println("[INFO] requestTopic=" + kafkaRequestInputTopic);
+//        System.out.println("[INFO] outputTopic=" + kafkaOutputTopic);
+//        System.out.println("[INFO] onePassStateTopic=" + kafkaOnePassStateTopic);
+//        System.out.println("[INFO] brokers=" + kafkaBrokersList);
+//        System.out.println("[INFO] parallelism=" + parallelism);
+//        System.out.println("[INFO] onePassRoutingMode=" + onePassRoutingMode);
     }
 }

@@ -7,15 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Estimation;
 import infore.SDE.reduceFunctions.ReduceFunction;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Set;
+import java.util.*;
 
 /**
  * Phase 2 parallel merge for OnePass*.
@@ -44,7 +36,15 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Set<Integer> receivedWorkers = new HashSet<Integer>();
-    private final List<ReservoirCandidate> candidates = new ArrayList<ReservoirCandidate>();
+    /*
+     * Bounded global ES reservoir.
+     * The worst globally retained candidate is at the head.
+     * Memory: O(K)
+     */
+    private final PriorityQueue<ReservoirCandidate> globalReservoir =
+            new PriorityQueue<ReservoirCandidate>(11, worstCandidateFirst());
+
+    private boolean sampleSizeInitialized = false;
 
     private int uid = -1;
     private String phase = "PHASE2";
@@ -88,10 +88,21 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
             queryName = textField(payload, "queryName", "");
             rootAlias = textField(payload, "rootAlias", "");
             datasetSeed = textField(payload, "datasetSeed", datasetSeed);
-            sampleSize = intField(payload, "sampleSize", sampleSize);
+            int incomingSampleSize = intField(payload, "sampleSize", -1);
+            if (incomingSampleSize <= 0) {
+                throw new IllegalStateException("LOCAL_PHASE2_ROOT_SUMMARY has invalid sampleSize=" + incomingSampleSize);
+            }
+
+            if (!sampleSizeInitialized) {
+                sampleSize = incomingSampleSize;
+                sampleSizeInitialized = true;
+
+            } else if (sampleSize != incomingSampleSize) {
+                throw new IllegalStateException("Conflicting Phase-2 sample sizes." + " expected=" + sampleSize +
+                        ", received=" + incomingSampleSize);
+            }
 
             String payloadBaseKey = textField(payload, "baseKey", "");
-
             if (payloadBaseKey != null && !payloadBaseKey.trim().isEmpty()) {
                 if (baseKey == null || baseKey.trim().isEmpty()) {
                     baseKey = payloadBaseKey.trim();
@@ -124,7 +135,8 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
 
             if (reservoir != null && reservoir.isArray()) {
                 for (JsonNode entry : reservoir) {
-                    candidates.add(ReservoirCandidate.fromJson(workerId, entry));
+                    ReservoirCandidate candidate = ReservoirCandidate.fromJson(workerId, entry);
+                    offerGlobalCandidate(candidate);
                 }
             }
 
@@ -167,20 +179,11 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
             payload.put("expectedWorkers", expectedWorkers);
             payload.put("localResultCount", receivedWorkers.size());
             payload.set("receivedWorkers", MAPPER.valueToTree(workers));
-
             payload.put("rootTuplesSeen", rootTuplesSeen);
             payload.put("positiveRootCandidatesSeen", positiveRootCandidatesSeen);
             payload.put("totalRootGroupWeight", totalRootGroupWeight);
             payload.put("globalReservoirSize", globalReservoir.size());
             payload.put("sampleInstanceCount", samples.size());
-
-            ArrayNode reservoirNode = MAPPER.createArrayNode();
-
-            for (ReservoirCandidate candidate : globalReservoir) {
-                reservoirNode.add(candidate.toJson());
-            }
-
-            payload.set("globalReservoir", reservoirNode);
 
             ArrayNode sampleInstances = MAPPER.createArrayNode();
 
@@ -202,14 +205,10 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
     }
 
     private List<ReservoirCandidate> buildGlobalReservoir() {
-        List<ReservoirCandidate> sorted = new ArrayList<ReservoirCandidate>(candidates);
-        Collections.sort(sorted, bestCandidateFirst());
+        List<ReservoirCandidate> sorted = new ArrayList<ReservoirCandidate>(globalReservoir);
+        sorted.sort(bestCandidateFirst());
 
-        if (sorted.size() <= sampleSize) {
-            return sorted;
-        }
-
-        return new ArrayList<ReservoirCandidate>(sorted.subList(0, sampleSize));
+        return sorted;
     }
 
     private List<ReservoirCandidate> buildMultinomialSamples(List<ReservoirCandidate> globalReservoir) {
@@ -248,10 +247,8 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
         return output;
     }
 
-    private static ReservoirCandidate drawFromIntroduced(
-            List<ReservoirCandidate> introduced,
-            double introducedWeight,
-            Random outputRandom) {
+    private static ReservoirCandidate drawFromIntroduced(List<ReservoirCandidate> introduced, double introducedWeight,
+                                                         Random outputRandom) {
 
         if (introduced.isEmpty()) {
             throw new IllegalStateException("Cannot draw from an empty introduced set");
@@ -312,6 +309,47 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
         }
 
         return MAPPER.valueToTree(estimation);
+    }
+
+    private void offerGlobalCandidate(ReservoirCandidate candidate) {
+        if (candidate == null) {
+            return;
+        }
+
+        if (globalReservoir.size() < sampleSize) {
+            globalReservoir.add(candidate);
+            return;
+        }
+        ReservoirCandidate currentWorst = globalReservoir.peek();
+
+        if (currentWorst == null) {
+            globalReservoir.add(candidate);
+            return;
+        }
+
+        /*
+         * bestCandidateFirst:
+         * negative => candidate is globally better
+         */
+        if (bestCandidateFirst().compare(candidate, currentWorst) < 0) {
+            globalReservoir.poll();
+            globalReservoir.add(candidate);
+        }
+    }
+
+    private static Comparator<ReservoirCandidate>
+    worstCandidateFirst() {
+        return new Comparator<ReservoirCandidate>() {
+            @Override
+            public int compare(ReservoirCandidate left, ReservoirCandidate right) {
+                /*
+                 * Exact reverse of the deterministic global ordering.
+                 * The head of the PriorityQueue is therefore the candidate
+                 * that should be discarded first.
+                 */
+                return bestCandidateFirst().compare(right, left);
+            }
+        };
     }
 
     private static String textField(JsonNode node, String fieldName, String defaultValue) {
