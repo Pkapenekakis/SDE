@@ -212,15 +212,22 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
     }
 
     private List<ReservoirCandidate> buildMultinomialSamples(List<ReservoirCandidate> globalReservoir) {
-        List<ReservoirCandidate> output = new ArrayList<ReservoirCandidate>();
+        List<ReservoirCandidate> output = new ArrayList<ReservoirCandidate>(sampleSize);
 
         if (globalReservoir.isEmpty()) {
             return output;
         }
 
         Random outputRandom = new Random(stableSeed(datasetSeed) + 31L);
+        List<ReservoirCandidate> introduced = new ArrayList<ReservoirCandidate>(globalReservoir.size());
 
-        List<ReservoirCandidate> introduced = new ArrayList<ReservoirCandidate>();
+
+        /*
+         * cumulativeWeights[i] is the sum of introduced candidate weights
+         * from 0 through i.
+         * Primitive array avoids Double boxing.
+         */
+        double[] cumulativeWeights = new double[globalReservoir.size()];
         double introducedWeight = 0.0d;
         int nextReservoirIndex = 0;
 
@@ -231,41 +238,51 @@ public final class OnePassSampleReduceFunction extends ReduceFunction {
             boolean noMoreReservoirEntries = nextReservoirIndex >= globalReservoir.size();
 
             ReservoirCandidate selected;
-
             if (repeatPrevious || noMoreReservoirEntries) {
-                selected = drawFromIntroduced(introduced, introducedWeight, outputRandom);
+                selected = drawFromIntroducedBinary(introduced, cumulativeWeights, introducedWeight, outputRandom);
             } else {
                 selected = globalReservoir.get(nextReservoirIndex);
                 nextReservoirIndex++;
+
                 introduced.add(selected);
                 introducedWeight += selected.rootGroupWeight;
-            }
 
+                cumulativeWeights[introduced.size() - 1] = introducedWeight;
+            }
             output.add(selected);
         }
 
         return output;
     }
 
-    private static ReservoirCandidate drawFromIntroduced(List<ReservoirCandidate> introduced, double introducedWeight,
-                                                         Random outputRandom) {
+    private static ReservoirCandidate drawFromIntroducedBinary(List<ReservoirCandidate> introduced,
+                                                               double[] cumulativeWeights, double introducedWeight,
+                                                               Random outputRandom) {
 
-        if (introduced.isEmpty()) {
+        if (introduced == null || introduced.isEmpty()) {
             throw new IllegalStateException("Cannot draw from an empty introduced set");
         }
 
         double u = nextPositiveDouble(outputRandom) * introducedWeight;
-        double cumulative = 0.0d;
+        int low = 0;
+        int high = introduced.size() - 1;
 
-        for (ReservoirCandidate candidate : introduced) {
-            cumulative += candidate.rootGroupWeight;
-
-            if (u < cumulative) {
-                return candidate;
+        /*
+         * Find the first cumulative weight strictly greater than u.
+         * This is equivalent to the existing:
+         *     if (u < cumulative)
+         * linear scan.
+         */
+        while (low < high) {
+            int mid = (low + high) >>> 1;
+            if (u < cumulativeWeights[mid]) {
+                high = mid;
+            } else {
+                low = mid + 1;
             }
         }
 
-        return introduced.get(introduced.size() - 1);
+        return introduced.get(low);
     }
 
     private static Comparator<ReservoirCandidate> bestCandidateFirst() {
