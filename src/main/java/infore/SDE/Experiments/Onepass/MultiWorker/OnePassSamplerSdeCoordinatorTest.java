@@ -73,7 +73,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // LOCAL TEST SETTINGS
     // ---------------------------------------------------------------------
 
-    /*
     private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
             "dataTopic");
@@ -93,27 +92,34 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
             "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase2_sharded_local.csv";
-*/
+
+    private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
+            "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
+
     // =========================
     // SOFTNET
     // Uncomment these and comment the LOCAL definitions above.
     // =========================
 
-     private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
-     private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
-     private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
-     private static final String OUTPUT_TOPIC = "pkapenekakis-estimationTopic";
-     private static final String STATE_TOPIC = "pkapenekakis-onepassStateTopic";
+    /*
+    private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
+    private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
+    private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
+    private static final String OUTPUT_TOPIC = "pkapenekakis-estimationTopic";
+    private static final String STATE_TOPIC = "pkapenekakis-onepassStateTopic";
 
     private static final String TEST_TPCH_DIR = System.getProperty("onepass.tpchDir",
             "/home/pkapenekakis/onepass/tpch-data/sf1");
 
-     private static final String DEFAULT_PHASE1_BENCHMARK_CSV_PATH =
-     "/home/pkapenekakis/onepass/results/onepass_phase1_softnet.csv";
+    private static final String DEFAULT_PHASE1_BENCHMARK_CSV_PATH =
+            "/home/pkapenekakis/onepass/results/onepass_phase1_softnet.csv";
 
-     private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
-             "/home/pkapenekakis/onepass/results/onepass_phase2_softnet.csv";
+    private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
+            "/home/pkapenekakis/onepass/results/onepass_phase2_softnet.csv";
 
+    private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
+            "/home/pkapenekakis/onepass/results/onepass_all_phases_softnet.csv";
+*/
     // ---------------------------------------------------------------------
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------
@@ -124,9 +130,12 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final String PHASE2_BENCHMARK_CSV_PATH =
             System.getProperty("onepass.phase2Csv", DEFAULT_PHASE2_BENCHMARK_CSV_PATH);
 
+    private static final String COMBINED_BENCHMARK_CSV_PATH =
+            System.getProperty("onepass.combinedCsv", DEFAULT_COMBINED_BENCHMARK_CSV_PATH);
+
 
     private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY " +
-            "(" + "o.o_totalprice * (l.l_extendedprice * (2 - l.l_discount))) " +
+            "(" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
             "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
 //    private static final String TEST_ONEPASS_SQL = "SELECT * FROM w_branch_supplier WEIGHTED BY " +
@@ -135,7 +144,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     //Use -1 for the full TPC-H relation.
     private static final long TEST_ROW_LIMIT = Long.parseLong(System.getProperty("onepass.testRowLimit",
-            "1000000"));
+            "100000"));
 
     private static final int EXPECTED_WORKERS = Integer.parseInt(System.getProperty("onepass.workers",
             "4"));
@@ -154,8 +163,33 @@ public final class OnePassSamplerSdeCoordinatorTest {
             Integer.parseInt(System.getProperty("onepass.transactionTimeoutMs", "600000"));
 
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
-    private static final boolean WRITE_PHASE1_BENCHMARK_CSV = true;
-    private static final boolean WRITE_PHASE2_BENCHMARK_CSV = true;
+
+    /*
+     * Primary benchmark output.
+     * One completed Phase-1 + Phase-2 run appends exactly one row to the
+     * combined CSV. This is the file intended for P=2 / P=4 / P=8 comparisons.
+     */
+    private static final boolean WRITE_COMBINED_BENCHMARK_CSV = true;
+
+    /*
+     * false:
+     *   Only the compact comparison fields are populated.
+     * true:
+     *   The detailed Phase-1 / Phase-2 metrics used by the older graphing
+     *   workflow are populated as extra columns in THE SAME combined CSV.
+     * The CSV schema is stable in both modes; detailed columns are simply left
+     * empty when this flag is false.
+     */
+    private static final boolean WRITE_DETAILED_BENCHMARK_DATA = false;
+
+    /*
+     * Legacy compatibility only.
+     * The old per-phase CSV writer methods are intentionally kept in this
+     * class. Leave this false for the new one-file workflow. Set it to true
+     * only if you explicitly want the historical separate Phase-1 / Phase-2
+     * CSV files in addition to the combined file.
+     */
+    private static final boolean WRITE_LEGACY_SEPARATE_BENCHMARK_CSV = false;
 
     private static final boolean RUN_PHASE_2 = Boolean.parseBoolean(System.getProperty("onepass.runPhase2", "true"));
 
@@ -258,6 +292,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println("RUN_PHASE_2      = " + RUN_PHASE_2);
         System.out.println("EXPORT_PHASE1_INDEXES = " + EXPORT_PHASE1_INDEXES);
         System.out.println("VALIDATE_PHASE2  = " + VALIDATE_PHASE2);
+        System.out.println("combinedBenchmarkCsv = " + COMBINED_BENCHMARK_CSV_PATH);
+        System.out.println("WRITE_COMBINED_BENCHMARK_CSV = " + WRITE_COMBINED_BENCHMARK_CSV);
+        System.out.println("WRITE_DETAILED_BENCHMARK_DATA = " + WRITE_DETAILED_BENCHMARK_DATA);
+        System.out.println("WRITE_LEGACY_SEPARATE_BENCHMARK_CSV = " + WRITE_LEGACY_SEPARATE_BENCHMARK_CSV);
 
         if (EXPORT_PHASE1_INDEXES) {
             System.out.println("phase1IndexExportDir = " + PHASE1_INDEX_EXPORT_DIR);
@@ -456,7 +494,15 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
             printPhaseOneBenchmarkSummary(plan, phaseOnePreloadNanos);
 
-            writePhaseOneBenchmarkCsv(plan, phaseOnePreloadNanos, "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE1_LOCAL");
+            /*
+             * Historical per-phase CSV writer. The method is retained, but
+             * it is a no-op unless WRITE_LEGACY_SEPARATE_BENCHMARK_CSV=true.
+             */
+            writePhaseOneBenchmarkCsv(
+                    plan,
+                    phaseOnePreloadNanos,
+                    "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE1_LOCAL"
+            );
 
             // =============================================================
             // PHASE 2
@@ -569,7 +615,32 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
                 printPhaseTwoBenchmarkSummary(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed);
 
-                writePhaseTwoBenchmarkCsv(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed, "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE2_LOCAL");
+                /*
+                 * Primary benchmark output: exactly one row for the completed
+                 * Phase-1 + Phase-2 run.
+                 */
+                writeCombinedBenchmarkCsv(
+                        plan,
+                        phaseOnePreloadNanos,
+                        preparedPhaseTwoRoot.rows,
+                        phaseTwoPreloadNanos,
+                        ready,
+                        installed,
+                        "SDE_KAFKA_MULTIWORKER_SHARDED_ONEPASS"
+                );
+
+                /*
+                 * Historical per-phase CSV writer. The method is retained, but
+                 * it is a no-op unless WRITE_LEGACY_SEPARATE_BENCHMARK_CSV=true.
+                 */
+                writePhaseTwoBenchmarkCsv(
+                        plan,
+                        preparedPhaseTwoRoot.rows,
+                        phaseTwoPreloadNanos,
+                        ready,
+                        installed,
+                        "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE2_LOCAL"
+                );
 
                 /*
                  * TEST-ONLY correctness validation.
@@ -2528,7 +2599,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static void writePhaseOneBenchmarkCsv(CompiledOnePassPlan plan, long preloadNanos, String implementation) throws Exception {
 
-        if (!WRITE_PHASE1_BENCHMARK_CSV) {
+        if (!WRITE_LEGACY_SEPARATE_BENCHMARK_CSV) {
             return;
         }
 
@@ -2641,7 +2712,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static void writePhaseTwoBenchmarkCsv(CompiledOnePassPlan plan, long rootRows, long preloadNanos, JsonNode ready, JsonNode installed, String implementation) throws Exception {
 
-        if (!WRITE_PHASE2_BENCHMARK_CSV) {
+        if (!WRITE_LEGACY_SEPARATE_BENCHMARK_CSV) {
 
             return;
         }
@@ -2690,6 +2761,247 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         System.out.println("Phase-2 benchmark CSV appended to: " + csvFile.getAbsolutePath());
+    }
+
+
+
+    /**
+     * Writes exactly one row for a completed Phase-1 + Phase-2 run.
+     *
+     * Main comparison fields are always populated:
+     *
+     * workers
+     * query
+     * test_row_limit
+     * sample_size
+     * phase1_algorithm_total_s
+     * phase1_alias_algorithm_s
+     * phase2_algorithm_total_s
+     * full_algorithm_time_s
+     *
+     * full_algorithm_time_s is deliberately the sum of the measured algorithm
+     * phases only. Kafka/TPC-H preload work remains excluded, matching the
+     * existing timing semantics.
+     *
+     * If WRITE_DETAILED_BENCHMARK_DATA=true, the old detailed graphing metrics
+     * are populated as additional columns in the same row/file.
+     */
+    private static void writeCombinedBenchmarkCsv(
+            CompiledOnePassPlan plan,
+            long phaseOnePreloadNanos,
+            long phaseTwoRootRows,
+            long phaseTwoPreloadNanos,
+            JsonNode ready,
+            JsonNode installed,
+            String implementation) throws Exception {
+
+        if (!WRITE_COMBINED_BENCHMARK_CSV) {
+            return;
+        }
+
+        File csvFile = new File(COMBINED_BENCHMARK_CSV_PATH);
+
+        File parent = csvFile.getParentFile();
+
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IllegalStateException(
+                    "Could not create combined benchmark directory: "
+                            + parent.getAbsolutePath()
+            );
+        }
+
+        boolean writeHeader = !csvFile.exists() || csvFile.length() == 0L;
+
+        // -----------------------------------------------------------------
+        // Main comparison metrics.
+        // -----------------------------------------------------------------
+
+        double phaseOneAlgorithmSeconds =
+                secondsFor("phase1_algorithm_total");
+
+        double phaseTwoAlgorithmSeconds =
+                secondsFor("phase2_algorithm_total");
+
+        double fullAlgorithmSeconds =
+                phaseOneAlgorithmSeconds + phaseTwoAlgorithmSeconds;
+
+        String phaseOneAliasAlgorithmSeconds =
+                String.valueOf(phaseOneAliasAlgorithmSecondsMap(plan));
+
+        // -----------------------------------------------------------------
+        // Detailed Phase-1 metrics.
+        // -----------------------------------------------------------------
+
+        double phaseOnePreloadSeconds =
+                phaseOnePreloadNanos / 1_000_000_000.0d;
+
+        long phaseOneRows =
+                countFor("phase1_rows_processed");
+
+        double phaseOneRowsPerSecond =
+                rowsPerSecond(phaseOneRows, phaseOneAlgorithmSeconds);
+
+        String phaseOneAliasRows =
+                String.valueOf(phaseOneAliasRowsMap(plan));
+
+        // -----------------------------------------------------------------
+        // Detailed Phase-2 metrics.
+        // -----------------------------------------------------------------
+
+        double phaseTwoPreloadSeconds =
+                phaseTwoPreloadNanos / 1_000_000_000.0d;
+
+        long rootTuplesSeen =
+                longField(ready, "rootTuplesSeen", -1L);
+
+        long positiveRootCandidatesSeen =
+                longField(ready, "positiveRootCandidatesSeen", -1L);
+
+        double totalRootGroupWeight =
+                doubleField(ready, "totalRootGroupWeight", 0.0d);
+
+        int sampleInstanceCount =
+                intField(ready, "sampleInstanceCount", -1);
+
+        int installedWorkerCount =
+                intField(installed, "installedWorkerCount", -1);
+
+        String stateRef =
+                textField(ready, "stateRef", "");
+
+        double phaseTwoRowsPerSecond =
+                rowsPerSecond(phaseTwoRootRows, phaseTwoAlgorithmSeconds);
+
+        FileWriter writer =
+                new FileWriter(csvFile, true);
+
+        try {
+
+            if (writeHeader) {
+
+                /*
+                 * Keep the compact comparison columns first.
+                 *
+                 * Detailed columns always remain in the schema so switching
+                 * WRITE_DETAILED_BENCHMARK_DATA between runs cannot corrupt
+                 * the shape of an existing CSV.
+                 */
+                writer.write(
+                        "workers,"
+                                + "query,"
+                                + "test_row_limit,"
+                                + "sample_size,"
+                                + "phase1_algorithm_total_s,"
+                                + "phase1_alias_algorithm_s,"
+                                + "phase2_algorithm_total_s,"
+                                + "full_algorithm_time_s,"
+                                // Optional detailed columns:
+                                + "timestamp_ms,"
+                                + "implementation,"
+                                + "seed,"
+                                + "root_alias,"
+                                + "leaf_to_root_order,"
+                                + "phase1_rows_processed,"
+                                + "phase1_kafka_preload_s,"
+                                + "phase1_algorithm_rows_per_sec,"
+                                + "phase1_alias_rows_processed,"
+                                + "root_child_edge_count,"
+                                + "phase2_root_rows_processed,"
+                                + "phase2_root_tuples_seen,"
+                                + "phase2_positive_root_candidates_seen,"
+                                + "phase2_total_root_group_weight,"
+                                + "phase2_sample_instance_count,"
+                                + "phase2_installed_worker_count,"
+                                + "phase2_root_kafka_preload_s,"
+                                + "phase2_algorithm_rows_per_sec,"
+                                + "state_ref"
+                                + System.lineSeparator()
+                );
+            }
+
+            List<String> fields =
+                    new ArrayList<String>();
+
+            // -------------------------------------------------------------
+            // Main fields - always populated.
+            // -------------------------------------------------------------
+
+            fields.add(Integer.toString(EXPECTED_WORKERS));
+            fields.add(csv(plan.getQueryName()));
+            fields.add(csv(formatRowLimit(TEST_ROW_LIMIT)));
+            fields.add(Integer.toString(plan.getSampleSize()));
+            fields.add(Double.toString(phaseOneAlgorithmSeconds));
+            fields.add(csv(phaseOneAliasAlgorithmSeconds));
+            fields.add(Double.toString(phaseTwoAlgorithmSeconds));
+            fields.add(Double.toString(fullAlgorithmSeconds));
+
+            // -------------------------------------------------------------
+            // Optional detailed fields - always present in the schema.
+            // -------------------------------------------------------------
+
+            if (WRITE_DETAILED_BENCHMARK_DATA) {
+
+                fields.add(Long.toString(System.currentTimeMillis()));
+                fields.add(csv(implementation));
+                fields.add(csv(plan.getDatasetSeed()));
+                fields.add(csv(plan.getRootAlias()));
+                fields.add(csv(String.valueOf(plan.getLeafToRootOrder())));
+                fields.add(Long.toString(phaseOneRows));
+                fields.add(Double.toString(phaseOnePreloadSeconds));
+                fields.add(Double.toString(phaseOneRowsPerSecond));
+                fields.add(csv(phaseOneAliasRows));
+                fields.add(Integer.toString(
+                        plan.getChildEdges(plan.getRootAlias()).size()
+                ));
+                fields.add(Long.toString(phaseTwoRootRows));
+                fields.add(Long.toString(rootTuplesSeen));
+                fields.add(Long.toString(positiveRootCandidatesSeen));
+                fields.add(Double.toString(totalRootGroupWeight));
+                fields.add(Integer.toString(sampleInstanceCount));
+                fields.add(Integer.toString(installedWorkerCount));
+                fields.add(Double.toString(phaseTwoPreloadSeconds));
+                fields.add(Double.toString(phaseTwoRowsPerSecond));
+                fields.add(csv(stateRef));
+
+            } else {
+
+                /*
+                 * 19 optional detailed columns.
+                 */
+                for (int i = 0; i < 19; i++) {
+                    fields.add("");
+                }
+            }
+
+            writer.write(
+                    String.join(",", fields)
+                            + System.lineSeparator()
+            );
+
+        } finally {
+
+            writer.close();
+        }
+
+        System.out.println(
+                "Combined OnePass benchmark CSV appended to: "
+                        + csvFile.getAbsolutePath()
+        );
+
+        System.out.println(
+                "  phase1_algorithm_total_s = "
+                        + phaseOneAlgorithmSeconds
+        );
+
+        System.out.println(
+                "  phase2_algorithm_total_s = "
+                        + phaseTwoAlgorithmSeconds
+        );
+
+        System.out.println(
+                "  full_algorithm_time_s    = "
+                        + fullAlgorithmSeconds
+        );
     }
 
 

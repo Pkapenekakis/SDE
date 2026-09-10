@@ -428,7 +428,6 @@ public class OnePassPhaseOneState implements Serializable {
         List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
 
         if (childIndex < 0 || childIndex >= childEdges.size()) {
-
             throw new IllegalArgumentException("Invalid Phase-2 root childIndex=" + childIndex +
                     " for root=" + alias + ", childCount=" + childEdges.size());
         }
@@ -441,6 +440,45 @@ public class OnePassPhaseOneState implements Serializable {
         if (localIndex == null) {
             throw new IllegalStateException("Missing local Phase-1 child index for Phase-2 lookup." +
                     " edgeId=" + childEdge.getEdgeId() + ", rootAlias=" + alias + ", childIndex=" + childIndex);
+        }
+
+        return localIndex.getOrZero(lookupKey);
+    }
+
+    /**
+     * Reads one physically local continuation entry for a Phase-3 candidate.
+     * The caller MUST first route the work item to the deterministic owner of (childEdge.edgeId, lookupKey).
+     * This method deliberately does not attempt to reconstruct a global OnePassPhaseOneResult.
+     */
+    public double lookupPhaseThreeChildContinuationWeight(OnePassTuple tuple, int childIndex) {
+
+        if (tuple == null) {
+            throw new IllegalArgumentException("tuple must not be null");
+        }
+
+        String alias = tuple.getTable();
+        if (!plan.containsAlias(alias)) {
+            throw new IllegalArgumentException("Unknown Phase-3 alias: " + alias);
+        }
+        if (plan.isRoot(alias)) {
+            throw new IllegalArgumentException("Phase-3 child continuation lookup cannot target root alias " + alias);
+        }
+
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
+
+        if (childIndex < 0 || childIndex >= childEdges.size()) {
+            throw new IllegalArgumentException("Invalid Phase-3 childIndex=" + childIndex +
+                    " for alias=" + alias + ", childCount=" + childEdges.size());
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(childIndex);
+        JoinValue lookupKey = JoinValue.fromTuple(tuple, childEdge.getParentFields());
+
+        Phase1LinkWeightIndex localIndex = indexByEdgeId.get(childEdge.getEdgeId());
+
+        if (localIndex == null) {
+            throw new IllegalStateException("Missing local Phase-1 index for Phase-3 lookup. edge=" +
+                    childEdge.getEdgeId() + ", alias=" + alias + ", childIndex=" + childIndex);
         }
 
         return localIndex.getOrZero(lookupKey);

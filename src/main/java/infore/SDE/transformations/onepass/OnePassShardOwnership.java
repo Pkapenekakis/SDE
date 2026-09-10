@@ -8,10 +8,9 @@ import java.util.List;
 
 /**
  * Single source of truth for OnePass sharded-state ownership.
- *
- * IMPORTANT: both the data router and the worker-side state writer must use
- * this class. Otherwise, the worker selected to read a continuation entry and
- * the worker selected to own the corresponding shard can diverge.
+ * IMPORTANT: both the data router and worker-side state readers/writers must use this class.
+ * Otherwise, the worker selected to read continuation state and
+ * the worker that physically owns that state can diverge.
  */
 public final class OnePassShardOwnership {
 
@@ -33,7 +32,8 @@ public final class OnePassShardOwnership {
         canonical.append(edgeId.length()).append(':').append(edgeId).append('|');
 
         for (String part : joinValue.getParts()) {
-            String value = part == null ? "" : part;canonical.append(value.length()).append(':').append(value).append('|');
+            String value = part == null ? "" : part;
+            canonical.append(value.length()).append(':').append(value).append('|');
         }
 
         return stableWorkerHash(canonical.toString(), parallelism);
@@ -41,33 +41,61 @@ public final class OnePassShardOwnership {
 
     /**
      * Phase-1 input owner.
-     *
-     * Leaf alias:
-     *   no child continuation state exists yet, therefore route directly to
-     *   the owner of the parent-edge entry that this tuple will build.
-     *
-     * Internal chain alias:
-     *   route to the owner of the already-built child-edge entry that this
-     *   tuple must read.
+     * Internal alias -> first child continuation owner.
+     * Leaf alias     -> final parent-edge index owner.
      */
     public static int ownerForPhaseOneInputTuple(OnePassTuple tuple, CompiledOnePassPlan plan, int parallelism) {
 
         if (tuple == null) {
             throw new IllegalArgumentException("tuple must not be null");
         }
-
         if (plan == null) {
             throw new IllegalArgumentException("plan must not be null");
         }
 
         String alias = tuple.getTable();
+        List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
+
+        if (!childEdges.isEmpty()) {
+            CompiledOnePassPlan.DirectedJoinEdge firstChild = childEdges.get(0);
+            JoinValue lookupKey = JoinValue.fromTuple(tuple, firstChild.getParentFields());
+            return ownerForEdgeKey(firstChild.getEdgeId(), lookupKey, parallelism);
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias);
+        if (parentEdge == null) {
+            throw new IllegalStateException(
+                    "Non-root Phase-1 alias '" + alias + "' has no parent edge");
+        }
+
+        JoinValue writeKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
+        return ownerForEdgeKey(parentEdge.getEdgeId(), writeKey, parallelism);
+    }
+
+    /**
+     * Initial Phase-3 input owner.
+     * Internal alias -> child-edge-0 continuation owner.
+     * Leaf alias     -> parent-edge selection owner.
+     */
+    public static int ownerForPhaseThreeInputTuple(OnePassTuple tuple, CompiledOnePassPlan plan, int parallelism) {
+
+        if (tuple == null) {
+            throw new IllegalArgumentException("tuple must not be null");
+        }
+        if (plan == null) {
+            throw new IllegalArgumentException("plan must not be null");
+        }
+
+        String alias = tuple.getTable();
+        if (!plan.containsAlias(alias)) {
+            throw new IllegalArgumentException("Unknown Phase-3 alias '" + alias + "'");
+        }
+        if (plan.isRoot(alias)) {
+            throw new IllegalArgumentException("Phase-3 input cannot be root alias '" + alias + "'");
+        }
 
         List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
 
-        /*
-         * Any internal Phase-1 alias starts at the first child index that it
-         * needs to read.
-         */
         if (!childEdges.isEmpty()) {
             CompiledOnePassPlan.DirectedJoinEdge firstChild = childEdges.get(0);
             JoinValue lookupKey = JoinValue.fromTuple(tuple, firstChild.getParentFields());
@@ -75,18 +103,14 @@ public final class OnePassShardOwnership {
             return ownerForEdgeKey(firstChild.getEdgeId(), lookupKey, parallelism);
         }
 
-        /*
-         * Leaf alias: there is nothing to read. Route directly to the owner of
-         * the parent index entry that the tuple builds.
-         */
         CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias);
-
-        if (parentEdge == null) {throw new IllegalStateException("Non-root Phase-1 alias '" + alias + "' has no parent edge");
+        if (parentEdge == null) {
+            throw new IllegalStateException("Non-root Phase-3 alias '" + alias + "' has no parent edge");
         }
 
-        JoinValue writeKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
+        JoinValue selectionKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
 
-        return ownerForEdgeKey(parentEdge.getEdgeId(), writeKey, parallelism);
+        return ownerForEdgeKey(parentEdge.getEdgeId(), selectionKey, parallelism);
     }
 
     public static String workerKey(String baseKey, int parallelism, int workerId) {
@@ -103,35 +127,24 @@ public final class OnePassShardOwnership {
         return workerKey.endsWith(suffix) ? workerKey.substring(0, workerKey.length() - suffix.length()) : workerKey;
     }
 
-    /**
-     * Initial Phase-2 root owner.
-     * A root tuple must first read child edge 0, so route it directly to the owner
-     * of that child continuation entry.
-     */
+    //Initial Phase-2 root owner: first child continuation owner.
     public static int ownerForPhaseTwoRootTuple(OnePassTuple tuple, CompiledOnePassPlan plan, int parallelism) {
 
         if (tuple == null) {
             throw new IllegalArgumentException("tuple must not be null");
         }
-
         if (plan == null) {
             throw new IllegalArgumentException("plan must not be null");
         }
 
         String alias = tuple.getTable();
-
         if (!plan.isRoot(alias)) {
-            throw new IllegalArgumentException("Phase-2 input must be root alias '" +
-                    plan.getRootAlias() + "' but received '" + alias + "'");
+            throw new IllegalArgumentException("Phase-2 input must be root alias '" + plan.getRootAlias() +
+                    "' but received '" + alias + "'");
         }
 
         List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(alias);
 
-        /*
-         * A connected multi-relation query should always have at least one root
-         * child. Keep worker 0 as a safe fallback for a hypothetical single-relation
-         * query.
-         */
         if (childEdges.isEmpty()) {
             return 0;
         }
@@ -142,7 +155,7 @@ public final class OnePassShardOwnership {
         return ownerForEdgeKey(firstChild.getEdgeId(), lookupKey, parallelism);
     }
 
-    /** deterministic FNV-1a 64-bit hash, folded to int */
+    // deterministic FNV-1a 64-bit hash, folded to int
     private static int stableWorkerHash(String routingKey, int parallelism) {
         byte[] bytes = routingKey.getBytes(StandardCharsets.UTF_8);
 

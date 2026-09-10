@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import infore.SDE.messages.Datapoint;
@@ -16,12 +17,10 @@ import infore.SDE.transformations.GReduceFlatMap;
 import infore.SDE.transformations.ReduceFlatMap;
 import infore.SDE.transformations.RqRouterFlatMap;
 import infore.SDE.transformations.SDEcoFlatMap;
-import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
-import infore.SDE.transformations.onepass.OnePassPhaseOneTransitionMapper;
-import infore.SDE.transformations.onepass.OnePassStateTopicEmitter;
-import infore.SDE.transformations.onepass.OnePassStateTopicParser;
+import infore.SDE.transformations.onepass.*;
 import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
 import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneEnrichmentBuffer;
+import infore.SDE.transformations.onepass.worker.PhaseThree.OnePassPhaseThreeEnrichmentBuffer;
 import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentBuffer;
 
 import org.apache.flink.api.common.functions.FilterFunction;
@@ -250,6 +249,38 @@ public class RunOnepass {
         }).name("ONEPASS_GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED");
 
         // ================================================================
+        // PHASE 3 GLOBAL ALIAS SELECTIONS - REQUEST 88
+        // ================================================================
+        DataStream<Estimation> onePassGlobalPhaseThreeAliasSelections =
+                partialOutputStream.filter(new FilterFunction<Estimation>() {
+                    private static final long serialVersionUID = 1L;
+
+                    @Override
+                    public boolean filter(Estimation value) {
+                        return value != null &&
+                                value.getSynopsisID() == ONEPASS_SYNOPSIS_ID &&
+                                value.getRequestID() == 88 &&
+                                "GLOBAL_PHASE3_ALIAS_SELECTIONS".equals(firstParam(value));
+                    }
+                }).name("ONEPASS_GLOBAL_PHASE3_ALIAS_SELECTIONS");
+
+        // ================================================================
+        // PHASE 3 GLOBAL INSTALL READY - REQUEST 91
+        // ================================================================
+        DataStream<Estimation> onePassGlobalPhaseThreeInstalled =
+                partialOutputStream.filter(new FilterFunction<Estimation>() {
+                    private static final long serialVersionUID = 1L;
+
+                    @Override
+                    public boolean filter(Estimation value) {
+                        return value != null &&
+                                value.getSynopsisID() == ONEPASS_SYNOPSIS_ID &&
+                                value.getRequestID() == 91 &&
+                                "GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED".equals(firstParam(value));
+                    }
+                }).name("ONEPASS_GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED");
+
+        // ================================================================
         // UNIFIED STATE TOPIC OUTPUT
         // ================================================================
 
@@ -261,10 +292,19 @@ public class RunOnepass {
          * OnePassStateTopicEmitter understands both.
          */
         DataStream<Estimation> onePassStateTopicFeedback = onePassStateTransferStream.
-                union(onePassGlobalPhaseTwoRootSamples);
+                union(onePassGlobalPhaseTwoRootSamples, onePassGlobalPhaseThreeAliasSelections);
 
         onePassStateTopicFeedback.flatMap(new OnePassStateTopicEmitter()).name("ONEPASS_STATE_TOPIC_EMITTER").
                 addSink(onePassStateProducer.getProducer()).name("ONEPASS_STATE_TOPIC_OUTPUT");
+
+        /*
+         * Stateless Phase-3 transitions:
+         *   request 86 -> START_PHASE_3_ALIAS(first)
+         *   request 91 -> START_PHASE_3_ALIAS(next), unless final.
+         */
+        DataStream<Estimation> onePassPhaseThreeTransitions = onePassGlobalPhaseTwoInstalled.
+                union(onePassGlobalPhaseThreeInstalled).flatMap(new OnePassPhaseThreeTransitionMapper()).
+                name("ONEPASS_PHASE3_TRANSITION_MAPPER").setParallelism(1);
 
         // ================================================================
         // REQUEST TOPIC LIFECYCLE FEEDBACK
@@ -278,7 +318,7 @@ public class RunOnepass {
          *
          * When sharded Phase 3 is implemented, its transition should begin from request 86.
          */
-        onePassPhaseOneTransitions.addSink(requestFeedbackProducer.getProducer()).
+        onePassPhaseOneTransitions.union(onePassPhaseThreeTransitions).addSink(requestFeedbackProducer.getProducer()).
                 name("ONEPASS_REQUEST_TOPIC_FEEDBACK").setParallelism(1);
 
         // ================================================================
@@ -292,6 +332,24 @@ public class RunOnepass {
          * Until sharded Phase 3 exists, this is the clean Phase-2 endpoint.
          */
         onePassGlobalPhaseTwoInstalled.addSink(estimationProducer.getProducer()).name("ONEPASS_PHASE2_INSTALLED_OUTPUT");
+
+        // ================================================================
+        // PHASE 3 COMPLETION OUTPUT
+        // ================================================================
+        DataStream<Estimation> onePassPhaseThreeComplete =
+                onePassGlobalPhaseThreeInstalled.filter(
+                        new FilterFunction<Estimation>() {
+                            private static final long serialVersionUID = 1L;
+
+                            @Override
+                            public boolean filter(Estimation value) {
+                                return isPhaseThreeComplete(value);
+                            }
+                        }).name("ONEPASS_PHASE3_COMPLETE");
+
+        onePassPhaseThreeComplete
+                .addSink(estimationProducer.getProducer())
+                .name("ONEPASS_PHASE3_COMPLETE_OUTPUT");
 
         // ================================================================
         // GENERIC SDE GLOBAL REDUCE
@@ -333,7 +391,9 @@ public class RunOnepass {
                 OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type) ||
                 OnePassPhaseOneEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type) ||
                 OnePassPhaseTwoEnrichmentBuffer.TYPE_ROOT_ENRICH_BATCH.equals(type) ||
-                OnePassPhaseTwoEnrichmentBuffer.TYPE_ROOT_ENRICH_SOURCE_DONE.equals(type);
+                OnePassPhaseTwoEnrichmentBuffer.TYPE_ROOT_ENRICH_SOURCE_DONE.equals(type) ||
+                OnePassPhaseThreeEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type) ||
+                OnePassPhaseThreeEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type);
     }
 
     /**
@@ -375,7 +435,39 @@ public class RunOnepass {
             return true;
         }
 
-        return value.getRequestID() == 86 && "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type);
+        if (value.getRequestID() == 86 && "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type)) {
+            return true;
+        }
+
+        if (value.getRequestID() == 88 && "GLOBAL_PHASE3_ALIAS_SELECTIONS".equals(type)) {
+            return true;
+        }
+
+        return value.getRequestID() == 91
+                && "GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED".equals(type);
+    }
+
+    private static boolean isPhaseThreeComplete(Estimation value) {
+        if (value == null || value.getEstimation() == null) {
+            return false;
+        }
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode payload;
+            if (value.getEstimation() instanceof JsonNode) {
+                payload = (JsonNode) value.getEstimation();
+            } else if (value.getEstimation() instanceof String) {
+                payload = mapper.readTree((String) value.getEstimation());
+            } else {
+                payload = mapper.valueToTree(value.getEstimation());
+            }
+
+            JsonNode complete = payload.get("phaseThreeComplete");
+            return complete != null && !complete.isNull() && complete.asBoolean(false);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not parse GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED payload", e);
+        }
     }
 
     private static String firstParam(Estimation value) {

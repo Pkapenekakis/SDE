@@ -185,6 +185,35 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
                     stateRef, resultId, rootAlias, Integer.toString(value.getNoOfP())});
         }
 
+        if (value.getRequestID() == 87 && param != null && param.length > 0 && "LOCAL_PHASE3_ALIAS_SELECTIONS".equals(param[0])) {
+
+            String resultId = param.length > 1 ? param[1] : "PHASE3_ALIAS_" + value.getUID();
+            String alias = param.length > 2 ? param[2] : "";
+            String globalKey = value.getUID() + "_PHASE3_ALIAS_" + resultId + "_GLOBAL";
+
+            value.setRequestID(88);
+            value.setEstimationkey(globalKey);
+            value.setKey(globalKey);
+            value.setParam(new String[] {"GLOBAL_PHASE3_ALIAS_SELECTIONS", resultId, alias,
+                    Integer.toString(value.getNoOfP())});
+        }
+
+        if (value.getRequestID() == 90 && param != null && param.length > 0 &&
+                "LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED".equals(param[0])) {
+
+            String stateRef = param.length > 1 ? param[1] : "";
+            String resultId = param.length > 2 ? param[2] : "";
+            String alias = param.length > 3 ? param[3] : "";
+            String globalKey = value.getUID() + "_PHASE3_INSTALLED_" + resultId + "_GLOBAL";
+
+            value.setRequestID(91);
+            value.setEstimationkey(globalKey);
+            value.setKey(globalKey);
+            value.setParam(new String[] {"GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED", stateRef, resultId, alias,
+                    Integer.toString(value.getNoOfP())
+            });
+        }
+
         if (value.getRequestID() == 92 && param != null && param.length > 0 && "LOCAL_PHASE3_ALIAS_RESULT".equals(param[0])) {
 
             String resultId = "PHASE3_ALIAS_RESULT_" + value.getUID();

@@ -1210,10 +1210,16 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
                 positiveRootCandidatesSeen, totalRootGroupWeight, instances);
 
         if (lifecycle.isShardedPhaseTwoActive()) {
-            lifecycle.installGlobalShardedPhaseTwoRootSampleResult(globalResult);
+            int workerId = intField(state, "workerId", -1);
+            int expectedWorkers = intField(state, "expectedWorkers", 0);
+
+            if (workerId < 0 || expectedWorkers <= 0 || workerId >= expectedWorkers) {
+                throw new IllegalStateException("Invalid sharded Phase-2 install worker metadata. workerId=" +
+                        workerId + ", expectedWorkers=" + expectedWorkers);
+            }
+            lifecycle.installGlobalShardedPhaseTwoRootSampleResult(globalResult, workerId, expectedWorkers);
         } else {
-            lifecycle.installGlobalPhaseTwoRootSampleResult(globalResult
-            );
+            lifecycle.installGlobalPhaseTwoRootSampleResult(globalResult);
         }
 
         Map<String, Object> summary = new LinkedHashMap<String, Object>();
@@ -1229,6 +1235,143 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
         System.out.println("[OnePassSamplerSdeSynopsis] Installed global Phase 2 root sample: " + summary);
 
+        return summary;
+    }
+
+    public void startShardedPhaseThreeAlias(String alias) {
+        lifecycle.startShardedPhaseThreeAlias(alias);
+    }
+
+    public double beginShardedPhaseThreeCandidate(Object payload) {
+        return lifecycle.beginShardedPhaseThreeCandidate(payload);
+    }
+
+    public double lookupShardedPhaseThreeChildWeight(Object payload, int childIndex) {
+        return lifecycle.lookupShardedPhaseThreeChildWeight(payload, childIndex);
+    }
+
+    public void acceptShardedPhaseThreeCandidate(Object payload, double candidateWeight) {
+        lifecycle.acceptShardedPhaseThreeCandidate(payload, candidateWeight);
+    }
+
+    public List<Map<String, Object>> exportShardedPhaseThreeOwnedSelections() {
+        return lifecycle.exportShardedPhaseThreeOwnedSelections();
+    }
+
+    public boolean isShardedPhaseThreeActive() {
+        return lifecycle.isShardedPhaseThreeActive();
+    }
+
+    public boolean isShardedPhaseThreeComplete() {
+        return lifecycle.isShardedPhaseThreeComplete();
+    }
+
+    public String getShardedPhaseThreeActiveAlias() {
+        if (lifecycle.getShardedPhaseThreeState() == null) {
+            return null;
+        }
+        return lifecycle.getShardedPhaseThreeState().getActiveAlias();
+    }
+
+    /**
+     * Request 87 payload. Every worker emits exactly one local result, even if
+     * its ownedSelections array is empty.
+     */
+    public Estimation buildLocalShardedPhaseThreeAliasSelectionsEstimation(String baseKey, int uid, int workerId,
+                                                                           int expectedWorkers, int actualParallelism,
+                                                                           String resultId, String alias, int aliasIndex,
+                                                                           boolean isLastAlias, String nextAlias) {
+
+        if (baseKey == null || baseKey.trim().isEmpty()) {
+            throw new IllegalArgumentException("baseKey must not be blank");
+        }
+        if (resultId == null || resultId.trim().isEmpty()) {
+            throw new IllegalArgumentException("resultId must not be blank");
+        }
+        if (alias == null || alias.trim().isEmpty()) {
+            throw new IllegalArgumentException("alias must not be blank");
+        }
+        if (workerId < 0 || workerId >= expectedWorkers) {
+            throw new IllegalArgumentException("Invalid worker metadata. workerId=" + workerId +
+                    ", expectedWorkers=" + expectedWorkers);
+        }
+
+        List<Map<String, Object>> ownedSelections = lifecycle.exportShardedPhaseThreeOwnedSelections();
+
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        payload.put("type", "LOCAL_PHASE3_ALIAS_SELECTIONS");
+        payload.put("protocol", "SHARDED_PHASE3_V1");
+        payload.put("phase", "PHASE3");
+        payload.put("uid", uid);
+        payload.put("workerId", workerId);
+        payload.put("expectedWorkers", expectedWorkers);
+        payload.put("actualParallelism", actualParallelism);
+        payload.put("resultId", resultId);
+        payload.put("queryName", plan.getQueryName());
+        payload.put("rootAlias", plan.getRootAlias());
+        payload.put("alias", alias);
+        payload.put("phaseThreeAlias", alias);
+        payload.put("baseKey", baseKey);
+        payload.put("sampleSize", plan.getSampleSize());
+        payload.put("aliasIndex", aliasIndex);
+        payload.put("isLastAlias", isLastAlias);
+        payload.put("nextAlias", nextAlias == null ? "" : nextAlias);
+        payload.put("ownedSelectionCount", ownedSelections.size());
+        payload.put("ownedSelections", ownedSelections);
+
+        String json;
+        try {
+            json = MAPPER.writeValueAsString(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Could not serialize LOCAL_PHASE3_ALIAS_SELECTIONS", e);
+        }
+
+        String reduceKey = uid + "_PHASE3_ALIAS_" + resultId;
+        Estimation out = new Estimation(uid, reduceKey, 87, 30, reduceKey, json,
+                new String[] {
+                        "LOCAL_PHASE3_ALIAS_SELECTIONS",
+                        resultId,
+                        alias,
+                        Integer.toString(aliasIndex),
+                        Integer.toString(workerId),
+                        Integer.toString(expectedWorkers)
+                },
+                expectedWorkers);
+        out.setKey(reduceKey);
+        out.setEstimationkey(reduceKey);
+        return out;
+    }
+
+    //Installs request-88 global strict-union selections on this worker.
+    public Map<String, Object> installGlobalShardedPhaseThreeAliasSelections(
+            JsonNode state) {
+
+        if (state == null || state.isNull()) {
+            throw new IllegalArgumentException("state must not be null");
+        }
+
+        String alias = textField(state, "phaseThreeAlias", textField(state, "alias", ""));
+        if (alias.isEmpty()) {
+            throw new IllegalArgumentException("Missing phaseThreeAlias in global sharded selections state");
+        }
+
+        JsonNode entries = state.get("entries");
+        if (entries == null || !entries.isArray()) {
+            throw new IllegalArgumentException("Missing entries array in global sharded selections state");
+        }
+
+        lifecycle.installGlobalShardedPhaseThreeAliasSelections(alias, entries);
+
+        Map<String, Object> summary = new LinkedHashMap<String, Object>();
+        summary.put("type", "INSTALL_SHARDED_PHASE3_ALIAS_SELECTIONS_SUMMARY");
+        summary.put("queryName", plan.getQueryName());
+        summary.put("rootAlias", plan.getRootAlias());
+        summary.put("phaseThreeAlias", alias);
+        summary.put("entryCount", entries.size());
+        summary.put("phase", lifecycle.getPhase().name());
+        summary.put("phaseThreeAliasActive", lifecycle.isPhaseThreeAliasActive());
+        summary.put("phaseThreeComplete", lifecycle.isShardedPhaseThreeComplete());
         return summary;
     }
 

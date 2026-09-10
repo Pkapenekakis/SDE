@@ -4,10 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.*;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeState;
+import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassShardedPhaseThreeState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassPhaseTwoState;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassRootSampleResult;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassShardedPhaseTwoState;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
+import infore.SDE.transformations.onepass.OnePassShardOwnership;
 import infore.SDE.transformations.onepass.OnePassTupleExtractor;
 
 import java.io.Serializable;
@@ -62,6 +64,9 @@ public final class OnePassSamplerSynopsis implements Serializable {
     private OnePassPhaseThreeState phaseThreeState;
     private OnePassPhaseThreeResult phaseThreeResult;
 
+    private OnePassShardedPhaseThreeState shardedPhaseThreeState;
+    private boolean shardedPhaseThreeComplete;
+
     public OnePassSamplerSynopsis(CompiledOnePassPlan plan) {
         if (plan == null) {
             throw new IllegalArgumentException("plan must not be null");
@@ -89,6 +94,8 @@ public final class OnePassSamplerSynopsis implements Serializable {
         this.shardedPhaseTwoComplete = false;
         this.phaseThreeState = null;
         this.phaseThreeResult = null;
+        this.shardedPhaseThreeState = null;
+        this.shardedPhaseThreeComplete = false;
     }
 
     /**
@@ -168,6 +175,13 @@ public final class OnePassSamplerSynopsis implements Serializable {
     }
 
     private void addPhaseThreeTuple(OnePassTuple tuple) {
+        if (shardedPhaseThreeState != null) {
+            throw new IllegalStateException("Generic lifecycle.add() must not be used for sharded Phase 3. "
+                            + "Use beginShardedPhaseThreeCandidate(), "
+                            + "lookupShardedPhaseThreeChildWeight(), and "
+                            + "acceptShardedPhaseThreeCandidate().");
+        }
+
         if (phaseThreeState == null) {
             throw new IllegalStateException("Phase 3 state has not been initialized");
         }
@@ -177,11 +191,8 @@ public final class OnePassSamplerSynopsis implements Serializable {
 
     /**
      * Completes Phase 1 and initializes Phase 2.
-     *
      * This is the single-worker version of the Phase 1 barrier.
-     *
      * Later, for multiworker execution, this method should correspond to:
-     *
      *   all local Phase 1 states complete
      *   -> merge Phase 1 indexes globally
      *   -> distribute final Phase 1 result
@@ -340,10 +351,8 @@ public final class OnePassSamplerSynopsis implements Serializable {
     }
 
     /**
-     * Installs the globally merged Phase-2 root sample in sharded mode.
-     *
-     * Phase 3 is deliberately NOT activated here because the current Phase 3
-     * implementation still assumes the old replicated Phase-1 result.
+     * Compatibility overload. It preserves the old sharded Phase-2 endpoint
+     * for direct callers that do not provide physical worker metadata.
      */
     public OnePassRootSampleResult installGlobalShardedPhaseTwoRootSampleResult(OnePassRootSampleResult globalPhaseTwoResult) {
 
@@ -352,26 +361,40 @@ public final class OnePassSamplerSynopsis implements Serializable {
         }
 
         requireShardedPhaseTwoActive();
-
         this.phaseTwoResult = globalPhaseTwoResult;
         this.shardedPhaseTwoComplete = true;
-
-        //Keep phase == PHASE_2 until sharded Phase 3 is explicitly implemented.
         return phaseTwoResult;
     }
 
-
-
     /**
-     * Completes Phase 2.
-     *
-     * For now this ends the lifecycle because Phase 3 is not implemented yet.
-     *
-     * Later, this should initialize Phase 3 using:
-     *
-     *   phaseOneResult
-     *   phaseTwoResult
+     * Sharded Phase-2 installation path.
+     * The replicated O(K) root sample is converted into bounded replicated
+     * partial samples. No complete OnePassPhaseOneResult is created.
+     * The lifecycle deliberately remains in PHASE_2 until the first
+     * START_PHASE_3_ALIAS request is consumed. Request 86 is the distributed
+     * installation barrier that triggers that stateless transition.
      */
+    public OnePassRootSampleResult installGlobalShardedPhaseTwoRootSampleResult(
+            OnePassRootSampleResult globalPhaseTwoResult, int workerId, int expectedWorkers) {
+
+        installGlobalShardedPhaseTwoRootSampleResult(globalPhaseTwoResult);
+
+        if (expectedWorkers <= 0) {
+            throw new IllegalArgumentException("expectedWorkers must be > 0");
+        }
+        if (workerId < 0 || workerId >= expectedWorkers) {
+            throw new IllegalArgumentException("Invalid workerId=" + workerId + ", expectedWorkers=" + expectedWorkers);
+        }
+
+        this.shardedPhaseThreeState = new OnePassShardedPhaseThreeState(plan, phaseTwoResult, plan.getDatasetSeed(),
+                workerId, expectedWorkers);
+        this.shardedPhaseThreeComplete = false;
+        this.phaseThreeState = null;
+        this.phaseThreeResult = null;
+
+        return phaseTwoResult;
+    }
+
     public OnePassRootSampleResult finishPhaseTwo() {
         if (phase != Phase.PHASE_2) {
             throw new IllegalStateException(
@@ -386,18 +409,116 @@ public final class OnePassSamplerSynopsis implements Serializable {
         return phaseTwoResult;
     }
 
+    public void startShardedPhaseThreeAlias(String alias) {
+        if (!shardedPhaseTwoComplete || phaseTwoResult == null) {
+            throw new IllegalStateException("Cannot start sharded Phase 3 before the global Phase-2 " +
+                    "root sample has been installed");
+        }
+
+        if (shardedPhaseThreeState == null) {
+            throw new IllegalStateException("Sharded Phase-3 state has not been initialized");
+        }
+
+        if (phase != Phase.PHASE_2 && phase != Phase.PHASE_3) {
+            throw new IllegalStateException("startShardedPhaseThreeAlias() requires PHASE_2 or PHASE_3. " +
+                    "Current phase=" + phase);
+        }
+
+        if (shardedPhaseThreeComplete) {
+            throw new IllegalStateException("Sharded Phase 3 is already complete");
+        }
+
+        shardedPhaseThreeState.startAlias(alias);
+        this.phase = Phase.PHASE_3;
+    }
+
+    public double beginShardedPhaseThreeCandidate(Object payload) {
+        requireShardedPhaseThreeActive();
+        return shardedPhaseThreeState.beginCandidate(
+                OnePassTupleExtractor.extract(payload));
+    }
+
+    /**
+     * Local Phase-1 continuation lookup for one child edge. The caller must
+     * already have routed the candidate to the owner of this edge/key.
+     */
+    public double lookupShardedPhaseThreeChildWeight(Object payload, int childIndex) {
+
+        requireShardedPhaseThreeActive();
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+
+        java.util.List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(tuple.getTable());
+        if (childIndex < 0 || childIndex >= childEdges.size()) {
+            throw new IllegalArgumentException("Invalid sharded Phase-3 childIndex=" + childIndex +
+                    " for alias=" + tuple.getTable());
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(childIndex);
+        JoinValue key = JoinValue.fromTuple(tuple, childEdge.getParentFields());
+
+        int expectedOwner = OnePassShardOwnership.ownerForEdgeKey(childEdge.getEdgeId(), key,
+                shardedPhaseThreeState.getExpectedWorkers());
+
+        if (expectedOwner != shardedPhaseThreeState.getWorkerId()) {
+            throw new IllegalStateException(
+                    "Phase-3 continuation lookup attempted on wrong worker. alias="
+                            + tuple.getTable()
+                            + ", childIndex=" + childIndex
+                            + ", edge=" + childEdge.getEdgeId()
+                            + ", expectedOwner=" + expectedOwner
+                            + ", actualWorker="
+                            + shardedPhaseThreeState.getWorkerId());
+        }
+
+        return phaseOneState.lookupPhaseThreeChildContinuationWeight(tuple, childIndex);
+    }
+
+    public void acceptShardedPhaseThreeCandidate(Object payload, double candidateWeight) {
+        requireShardedPhaseThreeActive();
+        shardedPhaseThreeState.acceptCompletedCandidate(OnePassTupleExtractor.extract(payload), candidateWeight);
+    }
+
+    public java.util.List<java.util.Map<String, Object>> exportShardedPhaseThreeOwnedSelections() {
+        requireShardedPhaseThreeActive();
+        return shardedPhaseThreeState.exportOwnedSelections();
+    }
+
+    public void installGlobalShardedPhaseThreeAliasSelections(String alias, JsonNode selectionsNode) {
+
+        if (phase != Phase.PHASE_3 || shardedPhaseThreeState == null) {
+            throw new IllegalStateException("Sharded Phase 3 is not active. phase=" + phase);
+        }
+
+        shardedPhaseThreeState.installGlobalAliasSelections(alias, selectionsNode);
+
+        if (shardedPhaseThreeState.areAllSamplesComplete()) {
+            this.phaseThreeResult = shardedPhaseThreeState.buildResultIfComplete();
+            this.shardedPhaseThreeComplete = true;
+            this.phase = Phase.DONE;
+        }
+    }
+
+    private void requireShardedPhaseThreeActive() {
+        if (phase != Phase.PHASE_3 || shardedPhaseThreeState == null || !shardedPhaseThreeState.isAliasActive()) {
+            throw new IllegalStateException(
+                    "Sharded Phase 3 alias is not active. phase=" + phase
+                            + ", state=" + shardedPhaseThreeState
+                            + ", activeAlias="
+                            + (shardedPhaseThreeState == null
+                            ? null
+                            : shardedPhaseThreeState.getActiveAlias()));
+        }
+    }
+
     public void startPhaseThreeAlias(String alias) {
         if (phase != Phase.PHASE_3) {
             throw new IllegalStateException(
-                    "startPhaseThreeAlias() is only valid during PHASE_3. Current phase: "
-                            + phase
+                    "startPhaseThreeAlias() is only valid during PHASE_3. Current phase: " + phase
             );
         }
 
         if (phaseThreeState == null) {
-            throw new IllegalStateException(
-                    "Phase 3 state has not been initialized"
-            );
+            throw new IllegalStateException("Phase 3 state has not been initialized");
         }
 
         phaseThreeState.startAlias(alias);
@@ -514,15 +635,33 @@ public final class OnePassSamplerSynopsis implements Serializable {
     }
 
     public boolean isPhaseThreeComplete() {
-        return phaseThreeResult != null;
+        return phaseThreeResult != null || shardedPhaseThreeComplete;
     }
 
     public boolean isPhaseThreeAliasActive() {
+        if (shardedPhaseThreeState != null) {
+            return shardedPhaseThreeState.isAliasActive();
+        }
         return phaseThreeState != null && phaseThreeState.isAliasActive();
     }
 
     public String getPhaseThreeActiveAlias() {
+        if (shardedPhaseThreeState != null) {
+            return shardedPhaseThreeState.getActiveAlias();
+        }
         return phaseThreeState == null ? null : phaseThreeState.getActiveAlias();
+    }
+
+    public OnePassShardedPhaseThreeState getShardedPhaseThreeState() {
+        return shardedPhaseThreeState;
+    }
+
+    public boolean isShardedPhaseThreeActive() {
+        return phase == Phase.PHASE_3 && shardedPhaseThreeState != null && shardedPhaseThreeState.isAliasActive();
+    }
+
+    public boolean isShardedPhaseThreeComplete() {
+        return shardedPhaseThreeComplete;
     }
 
     public OnePassShardedPhaseTwoState getShardedPhaseTwoState() {

@@ -25,6 +25,8 @@ import infore.SDE.transformations.onepass.debug.OnePassPhaseOneValidatorExporter
 import infore.SDE.transformations.onepass.debug.OnePassPhaseTwoValidatorExporter;
 import infore.SDE.transformations.onepass.OnePassRequestParser;
 import infore.SDE.transformations.onepass.worker.OnePassTupleBufferGate;
+import infore.SDE.transformations.onepass.worker.PhaseThree.OnePassPhaseThreeEnrichmentBuffer;
+import infore.SDE.transformations.onepass.worker.PhaseThree.OnePassPhaseThreeEnrichmentCompletionTracker;
 import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentBuffer;
 import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentCompletionTracker;
 import lib.WDFT.controlBucket;
@@ -82,6 +84,18 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	 */
 	private final Set<String> installedOnePassPhaseTwoStateRefs = new HashSet<String>();
 
+	private final OnePassPhaseThreeEnrichmentBuffer onePassPhaseThreeEnrichmentBuffer =
+			new OnePassPhaseThreeEnrichmentBuffer();
+	private final OnePassPhaseThreeEnrichmentCompletionTracker onePassPhaseThreeEnrichmentCompletionTracker =
+			new OnePassPhaseThreeEnrichmentCompletionTracker();
+	private final Map<Integer, List<JsonNode>> pendingOnePassPhaseThreeStateByUid =
+			new HashMap<Integer, List<JsonNode>>();
+	private final Set<String> emittedOnePassPhaseThreeLocalSelections =
+			new HashSet<String>();
+	// Tiny stateRef strings only; no selection payloads are retained here.
+	private final Set<String> installedOnePassPhaseThreeStateRefs =
+			new HashSet<String>();
+
 	//State-topic messages may race ahead of START_PHASE_2 on another Flink input.
 	private final Map<Integer, List<JsonNode>> pendingOnePassPhaseTwoStateByUid = new HashMap<Integer, List<JsonNode>>();
 	private final Set<String> emittedOnePassPhaseTwoLocalSummaries = new HashSet<String>();
@@ -89,10 +103,16 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	private static final String ONEPASS_COMMAND_START_NEXT_ALIAS = "START_NEXT_ALIAS";
 	private static final String ONEPASS_COMMAND_START_PHASE_2 = "START_PHASE_2";
 	private static final String ONEPASS_STATE_TYPE_PHASE2_ROOT_SAMPLE = "GLOBAL_PHASE2_ROOT_SAMPLE";
+	private static final String ONEPASS_STATE_TYPE_PHASE3_ALIAS_SELECTIONS = "GLOBAL_PHASE3_ALIAS_SELECTIONS";
 
 	@Override
 	public void flatMap1(Datapoint node, Collector<Estimation> collector) throws JsonProcessingException {
 		ArrayList<Synopsis>  Synopses =  M_Synopses.get(node.getKey());
+
+		if (isOnePassPhaseThreeAliasSelectionsChunk(node)) {
+			handleOnePassPhaseThreeAliasSelectionsChunk(node, Synopses, collector);
+			return;
+		}
 
 		if (isOnePassPhaseTwoStateTransfer(node)) {
 			handleOnePassPhaseTwoStateTransfer(node, Synopses, collector);
@@ -182,6 +202,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 			handleOnePassRemove(rq, Synopses);
 
+			return;
+		}
+
+		if (isOnePassShardedPhaseThreeTransitionRequest(rq)) {
+			handleOnePassShardedPhaseThreeTransitionRequest(rq, Synopses, collector);
 			return;
 		}
 
@@ -938,12 +963,6 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		int uid = onePass.getSynopsisID();
 
-		// Keep current Phase 3 behavior until Phase 3 migration.
-		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_3) {
-			onePass.add(payload);
-			return;
-		}
-
 		if (!onePassTupleBufferGate.isRegistered(uid)) {
 			registerOnePassTupleGate(onePass);
 		}
@@ -958,21 +977,24 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		int expectedWorkers = onePassExpectedWorkersByUid.getOrDefault(uid, 1);
 
-		//SHARDED PHASE 1.
 		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_1 && expectedWorkers > 1) {
 			processShardedPhaseOneTuple(onePass, payload, collector);
 			return;
 		}
 
-		//SHARDED PHASE 2.
-		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_2 && expectedWorkers > 1
-				&& onePass.isShardedPhaseTwoActive()) {
-
+		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_2 && expectedWorkers > 1 &&
+				onePass.isShardedPhaseTwoActive()) {
 			processShardedPhaseTwoRootTuple(onePass, payload, collector);
 			return;
 		}
 
-		// Single-worker / not-yet-migrated phases preserve the existing path.
+		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_3 && expectedWorkers > 1 &&
+				onePass.isShardedPhaseThreeActive()) {
+			processShardedPhaseThreeTuple(onePass, payload, collector);
+			return;
+		}
+
+		// Single-worker / legacy paths remain unchanged.
 		onePass.add(payload);
 	}
 
@@ -1071,10 +1093,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		boolean phaseOne = "PHASE1".equalsIgnoreCase(phase);
 		boolean phaseTwo = "PHASE2".equalsIgnoreCase(phase);
+		boolean phaseThree = "PHASE3".equalsIgnoreCase(phase);
 
-		if (!phaseOne && !phaseTwo) {
-			throw new IllegalStateException("END_ALIAS currently supports PHASE1 and PHASE2 only." +
-					" Received phase=" + phase + ", payload=" + values);
+		if (!phaseOne && !phaseTwo && !phaseThree) {
+			throw new IllegalStateException("END_ALIAS supports PHASE1, PHASE2 and PHASE3. Received phase=" +
+					phase + ", payload=" + values);
 		}
 
 		if (alias == null || alias.trim().isEmpty()) {
@@ -1219,6 +1242,44 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			return;
 		}
 
+		// =============================================================
+		// SHARDED PHASE 3 END_ALIAS
+		// =============================================================
+		if (phaseThree) {
+			if (expectedWorkers <= 1) {
+				throw new IllegalStateException("PHASE3 END_ALIAS belongs to the sharded Phase-3 path " +
+						"and requires expectedWorkers > 1. uid=" + uid);
+			}
+
+			if (!onePass.isShardedPhaseThreeActive() || !alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
+
+				String pendingKey = onePassEndAliasPendingKey(uid, alias);
+				if (!pendingOnePassEndAliasByUidAlias.containsKey(pendingKey)) {
+					JsonNode copy = node.getValues() == null ? null : node.getValues().deepCopy();
+					pendingOnePassEndAliasByUidAlias.put(pendingKey, new Datapoint(node.getKey(), node.getStreamID(), copy));
+				}
+
+				System.out.println("[OnePass PHASE3 END_ALIAS DEFERRED] uid=" + uid
+								+ ", alias=" + alias
+								+ ", active="
+								+ onePass.getShardedPhaseThreeActiveAlias()
+								+ ", worker=" + pId);
+				return;
+			}
+
+			String canonicalResultId = shardedPhaseThreeResultId(uid, alias);
+			if (!canonicalResultId.equals(resultId)) {
+				throw new IllegalStateException("PHASE3 END_ALIAS resultId mismatch. expected=" +
+						canonicalResultId + ", received=" + resultId);
+			}
+
+			handleShardedPhaseThreeEndAlias(onePass, uid, alias, canonicalResultId, expectedWorkers, collector);
+			processedOnePassEndAliasMarkers.add(markerKey);
+			pendingOnePassEndAliasByUidAlias.remove(
+					onePassEndAliasPendingKey(uid, alias));
+			return;
+		}
+
 
 		// =============================================================
 		// PHASE 1
@@ -1230,37 +1291,20 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		 */
 		onePassTupleBufferGate.sealAlias(uid, alias);
 
-
 		if (expectedWorkers > 1) {
-
 			handleShardedPhaseOneEndAlias(node, onePass, uid, alias, resultId, nextCommand, nextAlias, expectedWorkers, collector);
-
-
 			processedOnePassEndAliasMarkers.add(markerKey);
-
-
 			pendingOnePassEndAliasByUidAlias.remove(onePassEndAliasPendingKey(uid, alias));
-
-
 			return;
 		}
 
-
-		/*
-		 * Existing single-worker / legacy Phase-1 path.
-		 */
-		Estimation localPhaseOneResult = onePass.buildLocalPhaseOneResultEstimation(node.getKey(), uid, pId, expectedWorkers, actualParallelism, resultId, alias, nextCommand, nextAlias);
-
+		//Existing single-worker / legacy Phase-1 path.
+		Estimation localPhaseOneResult = onePass.buildLocalPhaseOneResultEstimation(node.getKey(), uid, pId,
+				expectedWorkers, actualParallelism, resultId, alias, nextCommand, nextAlias);
 
 		collector.collect(localPhaseOneResult);
-
-
 		processedOnePassEndAliasMarkers.add(markerKey);
-
-
 		System.out.println("[OnePass END_ALIAS] LOCAL_PHASE1_RESULT emitted." + " uid=" + uid + ", alias=" + alias + ", resultId=" + resultId + ", nextCommand=" + nextCommand + ", nextAlias=" + nextAlias + ", workerId=" + pId + ", expectedWorkers=" + expectedWorkers + ", key=" + node.getKey());
-
-
 		completeOnePassEndAlias(node, synopses, collector);
 	}
 
@@ -1351,12 +1395,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	}
 
 	private void handleOnePassRemove(Request request, ArrayList<Synopsis> synopses) {
-
 		int uid = request.getUID();
 
 		//1. Remove the actual OnePass synopsis.
 		if (synopses != null) {
-
             synopses.removeIf(synopsis -> synopsis instanceof OnePassSamplerSdeSynopsis
 					&& synopsis.getSynopsisID() == uid);
 
@@ -1393,6 +1435,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		String statePrefix = uid + "_";
 		onePassStateChunksByRef.keySet().removeIf(key -> key != null && key.startsWith(statePrefix));
 		installedOnePassPhaseTwoStateRefs.removeIf(key -> key != null && key.startsWith(statePrefix));
+
+		onePassPhaseThreeEnrichmentBuffer.clearUid(uid);
+		onePassPhaseThreeEnrichmentCompletionTracker.clearUid(uid);
+		pendingOnePassPhaseThreeStateByUid.remove(uid);
+		emittedOnePassPhaseThreeLocalSelections.removeIf(key -> key.startsWith(uid + "|"));
+		installedOnePassPhaseThreeStateRefs.removeIf(key -> key != null && key.startsWith(uid + "_"));
 
 		System.out.println("[OnePass REMOVE] worker-local state cleared." + " uid=" + uid + ", workerId=" + pId +
 				", key=" + request.getKey());
@@ -2618,18 +2666,15 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	private void installCompletedOnePassPhaseTwoRootSample(String workerKey, JsonNode state, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
 		int uid = intField(state, "uid", -1);
 
-
 		if (uid < 0) {
 			throw new IllegalStateException("Assembled Phase-2 sample has invalid uid: " + state);
 		}
 
 		String stateRef = textField(state, "stateRef", "");
 
-
 		if (stateRef.isEmpty()) {
 			throw new IllegalStateException("Assembled Phase-2 sample has no stateRef." + " uid=" + uid);
 		}
-
 
 		if (installedOnePassPhaseTwoStateRefs.contains(stateRef)) {
 			return;
@@ -2653,6 +2698,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		 * sample. No assembled transport JSON is retained in an instance field.
 		 */
 		Map<String, Object> installSummary = onePass.installGlobalPhaseTwoRootSample(state);
+
+		List<String> phaseThreeOrder = phaseThreeAliasOrder(onePass.getPlan());
+		String firstPhaseThreeAlias = phaseThreeOrder.isEmpty() ? "" : phaseThreeOrder.get(0);
 
 		installedOnePassPhaseTwoStateRefs.add(stateRef);
 		String resultId = textField(state, "resultId", "PHASE2_RESULT_" + uid);
@@ -2679,6 +2727,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		ready.put("rootTuplesSeen", longField(state, "rootTuplesSeen", 0L));
 		ready.put("positiveRootCandidatesSeen", longField(state, "positiveRootCandidatesSeen", 0L));
 		ready.put("totalRootGroupWeight", doubleField(state, "totalRootGroupWeight", 0.0d));
+		ready.put("firstPhaseThreeAlias", firstPhaseThreeAlias);
+		ready.put("phaseThreeAliasCount", phaseThreeOrder.size());
 
 		String json;
 		try {
@@ -2697,5 +2747,692 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				", stateRef=" + stateRef + ", sampleSize=" + sampleSize +
 				", sampleInstanceCount=" + sampleInstanceCount + ", lifecycle=" +
 				installSummary.get("nextLifecyclePhase"));
+	}
+
+	private boolean isOnePassShardedPhaseThreeTransitionRequest(Request request) {
+		if (request == null || request.getSynopsisID() != ONEPASS_SYNOPSIS_ID || request.getRequestID() != 7) {
+			return false;
+		}
+
+		JsonNode payload = request.getParameters();
+		return payload != null && !payload.isNull() && OnePassPhaseThreeEnrichmentBuffer.PROTOCOL.
+				equals(textField(payload, "protocol", "")) &&
+				"START_PHASE_3_ALIAS".equals(textField(payload, "type", ""));
+	}
+
+	private void handleOnePassShardedPhaseThreeTransitionRequest(Request request, ArrayList<Synopsis> synopses,
+																 Collector<Estimation> collector) {
+
+		int uid = request.getUID();
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
+
+		if (onePass == null) {
+			throw new IllegalStateException("START_PHASE_3_ALIAS reached worker without OnePass synopsis. uid=" + uid + ", worker=" + pId);
+		}
+
+		JsonNode payload = request.getParameters();
+		String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+		int expectedWorkers = intField(payload, "expectedWorkers", onePassExpectedWorkersByUid.getOrDefault(uid, 1));
+		int aliasIndex = intField(payload, "aliasIndex", -1);
+
+		if (alias.isEmpty() || expectedWorkers <= 1) {
+			throw new IllegalStateException("Invalid sharded START_PHASE_3_ALIAS: " + payload);
+		}
+
+		List<String> order = phaseThreeAliasOrder(onePass.getPlan());
+		if (aliasIndex < 0 || aliasIndex >= order.size() || !alias.equals(order.get(aliasIndex))) {
+			throw new IllegalStateException(
+					"Phase-3 traversal mismatch. alias=" + alias + ", aliasIndex=" + aliasIndex + ", expectedOrder=" + order);
+		}
+
+		onePass.startShardedPhaseThreeAlias(alias);
+		List<JsonNode> released = onePassTupleBufferGate.activateAliasAndDrain(uid, alias);
+
+		for (JsonNode buffered : released) {
+			processShardedPhaseThreeTuple(onePass, buffered, collector);
+		}
+
+		// Process StateTopic work that raced ahead of the RequestTopic
+		// transition before closing a deferred END_ALIAS marker.
+		drainPendingOnePassPhaseThreeState(uid, onePass, collector);
+		processPendingOnePassEndAlias(uid, alias, synopses, collector);
+
+		System.out.println("[OnePass SHARDED PHASE3 START] uid=" + uid + ", worker=" + pId + ", alias=" + alias +
+						", aliasIndex=" + aliasIndex + ", released=" + released.size());
+	}
+
+	private void processShardedPhaseThreeTuple(OnePassSamplerSdeSynopsis onePass, JsonNode payload, Collector<Estimation> collector) {
+
+		int uid = onePass.getSynopsisID();
+		int expectedWorkers = onePassExpectedWorkersByUid.get(uid);
+		String baseKey = onePassBaseKeyByUid.get(uid);
+		String alias = onePass.getShardedPhaseThreeActiveAlias();
+		String resultId = shardedPhaseThreeResultId(uid, alias);
+
+		OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+		if (alias == null || !alias.equals(tuple.getTable())) {
+			throw new IllegalStateException("Phase-3 tuple alias mismatch. active=" + alias + ", received=" + tuple.getTable());
+		}
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges =
+				onePass.getPlan().getChildEdges(alias);
+
+		double partialWeight = onePass.beginShardedPhaseThreeCandidate(payload);
+		if (partialWeight == 0.0d) {
+			return;
+		}
+
+		if (childEdges.isEmpty()) {
+			// Router placed a leaf directly on the parent-edge selection owner.
+			onePass.acceptShardedPhaseThreeCandidate(payload, partialWeight);
+			return;
+		}
+
+		// Router placed an internal tuple on child-edge-0 owner.
+		double childWeight = onePass.lookupShardedPhaseThreeChildWeight(payload, 0);
+		double enriched = OnePassShardedPhaseTwoState.checkedMultiply(partialWeight, childWeight, "phase3Candidate.child0");
+
+		if (enriched == 0.0d) {
+			return;
+		}
+
+		// Stage 1 is either child-edge-1 or, for a one-child alias, the final
+		// parent-edge selection owner.
+		routeShardedPhaseThreeWork(onePass, payload, enriched, 1, uid, resultId, baseKey, expectedWorkers,
+				alias, collector);
+	}
+
+	private int phaseThreeTargetWorker(OnePassSamplerSdeSynopsis onePass, OnePassTuple tuple, String alias,
+									   int stageIndex, int expectedWorkers) {
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
+
+		if (stageIndex >= 0 && stageIndex < childEdges.size()) {
+			CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(stageIndex);
+			JoinValue key = JoinValue.fromTuple(tuple, childEdge.getParentFields());
+			return OnePassShardOwnership.ownerForEdgeKey(childEdge.getEdgeId(), key, expectedWorkers);
+		}
+
+		if (stageIndex == childEdges.size()) {
+			CompiledOnePassPlan.DirectedJoinEdge parentEdge = onePass.getPlan().getParentEdge(alias);
+			if (parentEdge == null) {
+				throw new IllegalStateException("Phase-3 alias has no parent edge: " + alias);
+			}
+
+			JoinValue key = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
+			return OnePassShardOwnership.ownerForEdgeKey(parentEdge.getEdgeId(), key, expectedWorkers);
+		}
+
+		throw new IllegalArgumentException(
+				"Invalid Phase-3 stageIndex=" + stageIndex + " for alias=" + alias + ", childCount=" + childEdges.size());
+	}
+
+	private void routeShardedPhaseThreeWork(OnePassSamplerSdeSynopsis onePass, JsonNode tuplePayload,
+											double partialWeight, int stageIndex, int uid, String resultId,
+											String baseKey, int expectedWorkers, String alias,
+											Collector<Estimation> collector) {
+
+		if (partialWeight == 0.0d) {
+			return;
+		}
+
+		OnePassTuple tuple = OnePassTupleExtractor.extract(tuplePayload);
+		int targetWorker = phaseThreeTargetWorker(onePass, tuple, alias, stageIndex, expectedWorkers);
+
+		if (targetWorker == pId) {
+			processShardedPhaseThreeWork(onePass, tuplePayload, partialWeight, stageIndex, uid, resultId, baseKey,
+					expectedWorkers, alias, collector);
+			return;
+		}
+
+		for (Estimation message : onePassPhaseThreeEnrichmentBuffer.addRemoteWork(uid, resultId, baseKey,
+				expectedWorkers, pId, targetWorker, alias, stageIndex, tuplePayload, partialWeight)) {
+			collector.collect(message);
+		}
+	}
+
+	private void processShardedPhaseThreeWork(OnePassSamplerSdeSynopsis onePass, JsonNode tuplePayload,
+											  double partialWeight, int stageIndex, int uid, String resultId,
+											  String baseKey, int expectedWorkers, String alias,
+											  Collector<Estimation> collector) {
+
+		if (partialWeight == 0.0d) {
+			return;
+		}
+
+		OnePassTuple tuple = OnePassTupleExtractor.extract(tuplePayload);
+		if (!alias.equals(tuple.getTable())) {
+			throw new IllegalStateException("Phase-3 work alias mismatch. messageAlias=" + alias +
+					", tupleAlias=" + tuple.getTable());
+		}
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
+
+		if (stageIndex <= 0 || stageIndex > childEdges.size()) {
+			throw new IllegalArgumentException("Invalid transported Phase-3 stageIndex=" + stageIndex +
+					", alias=" + alias + ", childCount=" + childEdges.size());
+		}
+
+		if (stageIndex == childEdges.size()) {
+			// Final parent-edge selection owner.
+			onePass.acceptShardedPhaseThreeCandidate(tuplePayload, partialWeight);
+			return;
+		}
+
+		double childWeight = onePass.lookupShardedPhaseThreeChildWeight(tuplePayload, stageIndex);
+		double enriched = OnePassShardedPhaseTwoState.checkedMultiply(partialWeight, childWeight,
+				"phase3Candidate.child" + stageIndex);
+
+		if (enriched == 0.0d) {
+			return;
+		}
+
+		routeShardedPhaseThreeWork(onePass, tuplePayload, enriched, stageIndex + 1, uid, resultId, baseKey,
+				expectedWorkers, alias, collector);
+	}
+
+	private boolean isOnePassPhaseThreeStateTransfer(Datapoint node) {
+		if (node == null || node.getValues() == null || node.getValues().isNull()) {
+			return false;
+		}
+
+		JsonNode payload = node.getValues();
+		if (!OnePassPhaseThreeEnrichmentBuffer.PROTOCOL.equals(textField(payload, "protocol", ""))) {
+			return false;
+		}
+
+		String type = textField(payload, "type", "");
+		return OnePassPhaseThreeEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type) ||
+				OnePassPhaseThreeEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type);
+	}
+
+	private void handleOnePassPhaseThreeStateTransfer(Datapoint node, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+
+		JsonNode payload = node.getValues();
+		int uid = intField(payload, "uid", -1);
+		String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
+		if (onePass == null) {
+			throw new IllegalStateException("Phase-3 state message reached worker without OnePass synopsis. " +
+					"uid=" + uid + ", worker=" + pId);
+		}
+
+		if (!onePass.isShardedPhaseThreeActive() || !alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
+
+            List<JsonNode> pending = pendingOnePassPhaseThreeStateByUid.computeIfAbsent(uid, k -> new ArrayList<JsonNode>());
+            pending.add(payload.deepCopy());
+
+			System.out.println("[OnePass PHASE3 STATE DEFERRED] uid=" + uid
+							+ ", alias=" + alias
+							+ ", type=" + textField(payload, "type", "")
+							+ ", worker=" + pId
+							+ ", pending=" + pending.size());
+			return;
+		}
+
+		handleOnePassPhaseThreeStateTransferPayload(payload, onePass, collector);
+	}
+
+	private void drainPendingOnePassPhaseThreeState(int uid, OnePassSamplerSdeSynopsis onePass, Collector<Estimation> collector) {
+
+		List<JsonNode> pending = pendingOnePassPhaseThreeStateByUid.get(uid);
+		if (pending == null || pending.isEmpty()) {
+			return;
+		}
+
+		String activeAlias = onePass.getShardedPhaseThreeActiveAlias();
+		List<JsonNode> remaining = new ArrayList<JsonNode>();
+
+		for (JsonNode payload : pending) {
+			String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+
+			if (activeAlias != null && activeAlias.equals(alias)) {
+				handleOnePassPhaseThreeStateTransferPayload(payload, onePass, collector);
+			} else {
+				remaining.add(payload);
+			}
+		}
+
+		if (remaining.isEmpty()) {
+			pendingOnePassPhaseThreeStateByUid.remove(uid);
+		} else {
+			pendingOnePassPhaseThreeStateByUid.put(uid, remaining);
+		}
+	}
+
+	private void handleOnePassPhaseThreeStateTransferPayload(JsonNode payload, OnePassSamplerSdeSynopsis onePass, Collector<Estimation> collector) {
+
+		int uid = intField(payload, "uid", -1);
+		String alias = textField(payload, "phaseThreeAlias", textField(payload, "alias", ""));
+		String resultId = textField(payload, "resultId", shardedPhaseThreeResultId(uid, alias));
+		int stageIndex = intField(payload, "stageIndex", -1);
+		int sourceWorker = intField(payload, "sourceWorker", -1);
+		int targetWorker = intField(payload, "targetWorker", -1);
+		int expectedWorkers = intField(payload, "expectedWorkers", 0);
+		String type = textField(payload, "type", "");
+
+		if (!shardedPhaseThreeResultId(uid, alias).equals(resultId)) {
+			throw new IllegalStateException("Phase-3 state resultId mismatch. alias=" + alias + ", resultId=" + resultId);
+		}
+		if (targetWorker != pId) {
+			throw new IllegalStateException("Phase-3 state message reached wrong worker. target=" + targetWorker + ", actual=" + pId);
+		}
+		if (!alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
+			throw new IllegalStateException("Phase-3 state alias is not active. active=" +
+					onePass.getShardedPhaseThreeActiveAlias() + ", received=" + alias);
+		}
+
+		if (OnePassPhaseThreeEnrichmentBuffer.TYPE_ENRICH_BATCH.equals(type)) {
+			int sequence = intField(payload, "sequence", -1);
+			boolean firstDelivery = onePassPhaseThreeEnrichmentCompletionTracker.acceptBatch(uid, resultId, alias,
+					stageIndex, expectedWorkers, sourceWorker, sequence);
+
+			if (!firstDelivery) {
+				return;
+			}
+
+			JsonNode items = payload.get("items");
+			if (items == null || !items.isArray()) {
+				throw new IllegalStateException("PHASE3_ALIAS_ENRICH_BATCH has no items array: " + payload);
+			}
+
+			String baseKey = onePassBaseKeyByUid.get(uid);
+			for (JsonNode item : items) {
+				JsonNode tuplePayload = item.get("tuple");
+				if (tuplePayload == null || tuplePayload.isNull()) {
+					throw new IllegalStateException("Phase-3 enrichment item has no tuple: " + item);
+				}
+
+				double partialWeight = doubleField(item, "partialWeight", 0.0d);
+
+				processShardedPhaseThreeWork(onePass, tuplePayload, partialWeight, stageIndex, uid, resultId,
+						baseKey, expectedWorkers, alias, collector);
+			}
+
+			maybeAdvanceShardedPhaseThreeStage(onePass, uid, resultId, alias, stageIndex, expectedWorkers, collector);
+			return;
+		}
+
+		if (OnePassPhaseThreeEnrichmentBuffer.TYPE_ENRICH_SOURCE_DONE.equals(type)) {
+			int lastSequence = intField(payload, "lastSequence", -1);
+			onePassPhaseThreeEnrichmentCompletionTracker.acceptSourceDone(uid, resultId, alias, stageIndex,
+					expectedWorkers, sourceWorker, lastSequence);
+
+			maybeAdvanceShardedPhaseThreeStage(onePass, uid, resultId, alias, stageIndex, expectedWorkers, collector);
+			return;
+		}
+
+		throw new IllegalStateException("Unknown sharded Phase-3 StateTopic type: " + type);
+	}
+
+	private void handleShardedPhaseThreeEndAlias(OnePassSamplerSdeSynopsis onePass, int uid, String alias,
+												 String resultId, int expectedWorkers, Collector<Estimation> collector) {
+
+		if (!onePass.isShardedPhaseThreeActive() || !alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
+			throw new IllegalStateException("Cannot finish inactive sharded Phase-3 alias " + alias);
+		}
+
+		onePassTupleBufferGate.sealAlias(uid, alias);
+
+		int childCount = onePass.getPlan().getChildEdges(alias).size();
+		int firstClosableStage = childCount == 0 ? 0 : 1;
+
+		flushShardedPhaseThreeStageAndDeclareDone(uid, resultId, onePassBaseKeyByUid.get(uid), expectedWorkers, alias,
+				firstClosableStage, collector);
+
+		maybeAdvanceShardedPhaseThreeStage(onePass, uid, resultId, alias, firstClosableStage, expectedWorkers, collector);
+	}
+
+	private void flushShardedPhaseThreeStageAndDeclareDone(int uid, String resultId, String baseKey, int expectedWorkers,
+														   String alias, int stageIndex, Collector<Estimation> collector) {
+
+		for (Estimation batch : onePassPhaseThreeEnrichmentBuffer.flushStage(uid, resultId, alias, stageIndex)) {
+			collector.collect(batch);
+		}
+
+		for (Estimation done : onePassPhaseThreeEnrichmentBuffer.buildStageDoneMessages(uid, resultId, baseKey,
+				expectedWorkers, pId, alias, stageIndex)) {
+			collector.collect(done);
+		}
+
+		onePassPhaseThreeEnrichmentCompletionTracker.acceptLocalSourceDone(uid, resultId, alias, stageIndex, expectedWorkers, pId);
+	}
+
+	private void maybeAdvanceShardedPhaseThreeStage(OnePassSamplerSdeSynopsis onePass, int uid, String resultId,
+													String alias, int stageIndex, int expectedWorkers,
+													Collector<Estimation> collector) {
+
+		boolean complete = onePassPhaseThreeEnrichmentCompletionTracker.markCompleteIfReady(uid, resultId, alias, stageIndex);
+		if (!complete) {
+			return;
+		}
+
+		int childCount = onePass.getPlan().getChildEdges(alias).size();
+		if (stageIndex < 0 || stageIndex > childCount) {
+			throw new IllegalStateException("Completed invalid Phase-3 stageIndex=" + stageIndex + ", alias=" +
+					alias + ", childCount=" + childCount);
+		}
+
+		if (stageIndex < childCount) {
+			int nextStage = stageIndex + 1;
+
+			// Every input to this worker at stageIndex is now known complete,
+			// therefore every output this worker can generate for nextStage
+			// has also been generated.
+			flushShardedPhaseThreeStageAndDeclareDone(uid, resultId, onePassBaseKeyByUid.get(uid), expectedWorkers,
+					alias, nextStage, collector);
+			maybeAdvanceShardedPhaseThreeStage(onePass, uid, resultId, alias, nextStage, expectedWorkers, collector);
+			return;
+		}
+
+		// stageIndex == childCount is the final parent-edge selection stage.
+		emitLocalShardedPhaseThreeSelections(onePass, uid, resultId, alias, expectedWorkers, collector);
+	}
+
+	private void emitLocalShardedPhaseThreeSelections(OnePassSamplerSdeSynopsis onePass, int uid, String resultId,
+													  String alias, int expectedWorkers, Collector<Estimation> collector) {
+
+		String dedupeKey = uid + "|" + resultId + "|" + alias + "|worker=" + pId;
+		if (!emittedOnePassPhaseThreeLocalSelections.add(dedupeKey)) {
+			return;
+		}
+
+		List<String> order = phaseThreeAliasOrder(onePass.getPlan());
+		int aliasIndex = order.indexOf(alias);
+		if (aliasIndex < 0) {
+			throw new IllegalStateException("Active Phase-3 alias is absent from root-to-leaf order: " + alias);
+		}
+
+		boolean isLastAlias = aliasIndex == order.size() - 1;
+		String nextAlias = isLastAlias ? "" : order.get(aliasIndex + 1);
+
+		int actualParallelism;
+		try {
+			actualParallelism = getRuntimeContext().getNumberOfParallelSubtasks();
+		} catch (Exception ignored) {
+			actualParallelism = expectedWorkers;
+		}
+
+		Estimation local = onePass.buildLocalShardedPhaseThreeAliasSelectionsEstimation(onePassBaseKeyByUid.get(uid),
+				uid, pId, expectedWorkers, actualParallelism, resultId, alias, aliasIndex, isLastAlias, nextAlias);
+
+		collector.collect(local);
+
+		System.out.println("[OnePass LOCAL_PHASE3_ALIAS_SELECTIONS] uid=" + uid + ", worker=" + pId + ", alias=" + alias +
+						", resultId=" + resultId + ", aliasIndex=" + aliasIndex + ", isLastAlias=" + isLastAlias);
+	}
+
+	private boolean isOnePassPhaseThreeAliasSelectionsChunk(Datapoint node) {
+		if (node == null || node.getValues() == null || node.getValues().isNull()) {
+			return false;
+		}
+
+		JsonNode payload = node.getValues();
+		return "GLOBAL_STATE_CHUNK".equals(textField(payload, "type", "")) &&
+				ONEPASS_STATE_TYPE_PHASE3_ALIAS_SELECTIONS.equals(textField(payload, "stateType", ""));
+	}
+
+	private void handleOnePassPhaseThreeAliasSelectionsChunk(Datapoint node, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+
+		JsonNode chunk = node.getValues();
+		String stateRef = textField(chunk, "stateRef", "");
+		int chunkId = intField(chunk, "chunkId", -1);
+		int chunkCount = intField(chunk, "chunkCount", -1);
+		int workerId = intField(chunk, "workerId", -1);
+
+		if (stateRef.isEmpty()) {
+			throw new IllegalStateException("Phase-3 selection chunk has no stateRef: " + chunk);
+		}
+		if (workerId != pId) {
+			throw new IllegalStateException("Phase-3 selection chunk reached wrong worker. target=" +
+					workerId + ", actual=" + pId);
+		}
+		if (chunkId < 0 || chunkCount <= 0 || chunkId >= chunkCount) {
+			throw new IllegalStateException("Invalid Phase-3 selection chunk metadata: " + chunk);
+		}
+		if (installedOnePassPhaseThreeStateRefs.contains(stateRef)) {
+			return;
+		}
+
+        Map<Integer, JsonNode> chunks = onePassStateChunksByRef.
+				computeIfAbsent(stateRef, k -> new HashMap<Integer, JsonNode>());
+
+        for (JsonNode existingChunk : chunks.values()) {
+			if (intField(existingChunk, "chunkCount", -1) != chunkCount) {
+				throw new IllegalStateException("Conflicting Phase-3 chunkCount for stateRef=" + stateRef);
+			}
+			break;
+		}
+
+		JsonNode existing = chunks.get(chunkId);
+		if (existing != null) {
+			if (!existing.equals(chunk)) {
+				throw new IllegalStateException("Conflicting duplicate Phase-3 chunk. stateRef=" +
+						stateRef + ", chunkId=" + chunkId);
+			}
+			return;
+		}
+
+		chunks.put(chunkId, chunk.deepCopy());
+		if (chunks.size() < chunkCount) {
+			return;
+		}
+
+		JsonNode assembled = assembleOnePassPhaseThreeAliasSelections(stateRef, chunks, chunkCount);
+
+		// Drop transport chunks before the lifecycle installs the bounded state.
+		onePassStateChunksByRef.remove(stateRef);
+		installCompletedOnePassPhaseThreeAliasSelections(node.getKey(), assembled, synopses, collector);
+	}
+
+	private JsonNode assembleOnePassPhaseThreeAliasSelections(String stateRef, Map<Integer, JsonNode> chunks, int chunkCount) {
+
+		JsonNode first = chunks.get(0);
+		if (first == null) {
+			throw new IllegalStateException("Missing Phase-3 chunk 0 for stateRef=" + stateRef);
+		}
+
+		ObjectNode assembled = MAPPER.createObjectNode();
+		assembled.put("type", ONEPASS_STATE_TYPE_PHASE3_ALIAS_SELECTIONS);
+		assembled.put("stateType", ONEPASS_STATE_TYPE_PHASE3_ALIAS_SELECTIONS);
+		assembled.put("stateRef", stateRef);
+
+		copyIfPresent(first, assembled, "protocol");
+		copyIfPresent(first, assembled, "uid");
+		copyIfPresent(first, assembled, "synopsisID");
+		copyIfPresent(first, assembled, "phase");
+		copyIfPresent(first, assembled, "resultId");
+		copyIfPresent(first, assembled, "queryName");
+		copyIfPresent(first, assembled, "rootAlias");
+		copyIfPresent(first, assembled, "baseKey");
+		copyIfPresent(first, assembled, "workerId");
+		copyIfPresent(first, assembled, "workerKey");
+		copyIfPresent(first, assembled, "expectedWorkers");
+		copyIfPresent(first, assembled, "alias");
+		copyIfPresent(first, assembled, "phaseThreeAlias");
+		copyIfPresent(first, assembled, "sampleSize");
+		copyIfPresent(first, assembled, "selectionCount");
+		copyIfPresent(first, assembled, "aliasIndex");
+		copyIfPresent(first, assembled, "isLastAlias");
+		copyIfPresent(first, assembled, "nextAlias");
+
+		ArrayNode entries = MAPPER.createArrayNode();
+
+		for (int id = 0; id < chunkCount; id++) {
+			JsonNode chunk = chunks.get(id);
+			if (chunk == null) {
+				throw new IllegalStateException("Missing Phase-3 chunk " + id + " for stateRef=" + stateRef);
+			}
+
+			requireSameChunkText(first, chunk, "resultId", stateRef);
+			requireSameChunkText(first, chunk, "alias", stateRef);
+			requireSameChunkText(first, chunk, "baseKey", stateRef);
+			requireSameChunkInt(first, chunk, "expectedWorkers", stateRef);
+			requireSameChunkInt(first, chunk, "sampleSize", stateRef);
+			requireSameChunkInt(first, chunk, "selectionCount", stateRef);
+			requireSameChunkInt(first, chunk, "aliasIndex", stateRef);
+			requireSameChunkText(first, chunk, "nextAlias", stateRef);
+			requireSameChunkBoolean(first, chunk, "isLastAlias", stateRef);
+
+			JsonNode chunkEntries = chunk.get("entries");
+			if (chunkEntries == null || !chunkEntries.isArray()) {
+				throw new IllegalStateException("Phase-3 chunk has no entries array. stateRef=" + stateRef + ", chunkId=" + id);
+			}
+
+			int declaredEntryCount = intField(chunk, "entryCount", -1);
+			if (declaredEntryCount != chunkEntries.size()) {
+				throw new IllegalStateException("Phase-3 chunk entryCount mismatch. stateRef=" + stateRef + ", chunkId=" + id);
+			}
+
+			for (JsonNode entry : chunkEntries) {
+				entries.add(entry);
+			}
+		}
+
+		int selectionCount = intField(first, "selectionCount", -1);
+		int sampleSize = intField(first, "sampleSize", -1);
+		if (selectionCount != sampleSize || entries.size() != selectionCount) {
+			throw new IllegalStateException("Assembled Phase-3 selection count mismatch. stateRef=" + stateRef +
+					", sampleSize=" + sampleSize + ", selectionCount=" + selectionCount + ", actual=" + entries.size());
+		}
+
+		assembled.set("entries", entries);
+		return assembled;
+	}
+
+	private void requireSameChunkBoolean(JsonNode first, JsonNode current, String field, String stateRef) {
+
+		boolean expected = first.has(field) && first.get(field).asBoolean(false);
+		boolean actual = current.has(field) && current.get(field).asBoolean(false);
+
+		if (expected != actual) {
+			throw new IllegalStateException("Conflicting " + field + " across Phase-3 chunks. stateRef=" + stateRef);
+		}
+	}
+
+	private void installCompletedOnePassPhaseThreeAliasSelections(String workerKey, JsonNode state,
+																  ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+
+		int uid = intField(state, "uid", -1);
+		String stateRef = textField(state, "stateRef", "");
+		String alias = textField(state, "phaseThreeAlias", textField(state, "alias", ""));
+
+		if (uid < 0 || stateRef.isEmpty() || alias.isEmpty()) {
+			throw new IllegalStateException("Invalid assembled Phase-3 state: " + state);
+		}
+		if (installedOnePassPhaseThreeStateRefs.contains(stateRef)) {
+			return;
+		}
+
+		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
+		if (onePass == null) {
+			throw new IllegalStateException("Phase-3 selections reached worker without OnePass synopsis. " +
+					"uid=" + uid + ", worker=" + pId);
+		}
+
+		if (!onePass.isShardedPhaseThreeActive() || !alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
+			throw new IllegalStateException(
+					"Cannot install Phase-3 selections for inactive alias. active=" +
+							onePass.getShardedPhaseThreeActiveAlias() + ", received=" + alias);
+		}
+
+		int expectedWorkers = intField(state, "expectedWorkers", getRuntimeContext().getNumberOfParallelSubtasks());
+		int sampleSize = intField(state, "sampleSize", -1);
+		int selectionCount = intField(state, "selectionCount", -1);
+		int aliasIndex = intField(state, "aliasIndex", -1);
+		boolean isLastAlias = state.has("isLastAlias") && state.get("isLastAlias").asBoolean(false);
+		String nextAlias = textField(state, "nextAlias", "");
+		String resultId = textField(state, "resultId", shardedPhaseThreeResultId(uid, alias));
+		String baseKey = textField(state, "baseKey", OnePassShardOwnership.baseKeyFromWorkerKey(workerKey, expectedWorkers, pId));
+
+		if (sampleSize <= 0 || selectionCount != sampleSize) {
+			throw new IllegalStateException("Invalid Phase-3 global selection metadata. sampleSize="
+							+ sampleSize + ", selectionCount=" + selectionCount);
+		}
+
+		List<String> order = phaseThreeAliasOrder(onePass.getPlan());
+		if (aliasIndex < 0 || aliasIndex >= order.size() || !alias.equals(order.get(aliasIndex))) {
+			throw new IllegalStateException("Installed Phase-3 traversal metadata mismatch. alias=" + alias +
+					", aliasIndex=" + aliasIndex + ", order=" + order);
+		}
+
+		boolean expectedLast = aliasIndex == order.size() - 1;
+		String expectedNext = expectedLast ? "" : order.get(aliasIndex + 1);
+		if (isLastAlias != expectedLast || !expectedNext.equals(nextAlias)) {
+			throw new IllegalStateException("Installed Phase-3 next-alias metadata mismatch. alias=" + alias +
+					", isLastAlias=" + isLastAlias + ", nextAlias=" + nextAlias);
+		}
+
+		Map<String, Object> installSummary = onePass.installGlobalShardedPhaseThreeAliasSelections(state);
+
+		if (isLastAlias && !onePass.isShardedPhaseThreeComplete()) {
+			throw new IllegalStateException("Final Phase-3 alias installed but lifecycle is not complete");
+		}
+		if (!isLastAlias && onePass.isShardedPhaseThreeComplete()) {
+			throw new IllegalStateException("Non-final Phase-3 alias unexpectedly completed lifecycle");
+		}
+
+		installedOnePassPhaseThreeStateRefs.add(stateRef);
+
+		Map<String, Object> ready = new LinkedHashMap<String, Object>();
+		ready.put("type", "LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED");
+		ready.put("protocol", "SHARDED_PHASE3_V1");
+		ready.put("phase", "PHASE3");
+		ready.put("uid", uid);
+		ready.put("workerId", pId);
+		ready.put("expectedWorkers", expectedWorkers);
+		ready.put("resultId", resultId);
+		ready.put("stateRef", stateRef);
+		ready.put("baseKey", baseKey);
+		ready.put("alias", alias);
+		ready.put("phaseThreeAlias", alias);
+		ready.put("sampleSize", sampleSize);
+		ready.put("selectionCount", selectionCount);
+		ready.put("aliasIndex", aliasIndex);
+		ready.put("isLastAlias", isLastAlias);
+		ready.put("nextAlias", nextAlias);
+		ready.put("phaseThreeAliasCount", order.size());
+		ready.put("phaseThreeComplete", isLastAlias);
+
+		String json;
+		try {
+			json = MAPPER.writeValueAsString(ready);
+		} catch (Exception e) {
+			throw new IllegalStateException("Could not serialize LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED", e);
+		}
+
+		String reduceKey = uid + "_PHASE3_INSTALLED_" + resultId;
+		collector.collect(new Estimation(uid, reduceKey, 90, ONEPASS_SYNOPSIS_ID, reduceKey, json,
+				new String[] {
+						"LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED",
+						stateRef,
+						resultId,
+						alias,
+						Integer.toString(pId),
+						Integer.toString(expectedWorkers)
+				},
+				expectedWorkers));
+
+		System.out.println("[OnePass PHASE3 ALIAS SELECTIONS INSTALLED] uid=" + uid
+						+ ", worker=" + pId
+						+ ", alias=" + alias
+						+ ", stateRef=" + stateRef
+						+ ", selectionCount=" + selectionCount
+						+ ", phaseThreeComplete=" + isLastAlias
+						+ ", lifecycle=" + installSummary.get("phase"));
+	}
+
+	private static List<String> phaseThreeAliasOrder(CompiledOnePassPlan plan) {
+		List<String> out = new ArrayList<String>();
+		for (String alias : plan.getRootToLeafOrder()) {
+			if (!plan.isRoot(alias)) {
+				out.add(alias);
+			}
+		}
+		return out;
+	}
+
+	private static String shardedPhaseThreeResultId(int uid, String alias) {
+		return "PHASE3_" + alias + "_" + uid;
 	}
 }
