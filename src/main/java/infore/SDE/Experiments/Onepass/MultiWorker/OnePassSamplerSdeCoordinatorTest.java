@@ -207,13 +207,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final boolean WRITE_LEGACY_SEPARATE_BENCHMARK_CSV = false;
 
     private static final boolean RUN_PHASE_2 = Boolean.parseBoolean(System.getProperty("onepass.runPhase2", "true"));
-
-    /*
-     * Phase 3 depends on the globally installed Phase-2 root sample.
-     * The production runtime automatically emits the first START_PHASE_3_ALIAS
-     * after request 86. This flag controls whether this test replays the
-     * non-root relations and waits for the final request-91 barrier.
-     */
     private static final boolean RUN_PHASE_3 = Boolean.parseBoolean(System.getProperty("onepass.runPhase3", "true"));
 
     private static final int SYNOPSIS_ID = 30;
@@ -282,6 +275,12 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final String PHASE2_CHECKSUM_VERSION =
             "ONEPASS_PHASE2_ROOT_SAMPLE_SHA256_V1";
+
+    //Get the query output at console
+    private static final int REQUEST_ESTIMATE = 3;
+    private static final int FINAL_RESULT_PREVIEW_LIMIT = 4;
+    private static final boolean PRINT_FINAL_RESULTS = Boolean.
+            parseBoolean(System.getProperty("onepass.printFinalResults", "false"));
 
     private OnePassSamplerSdeCoordinatorTest() {}
 
@@ -364,15 +363,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println();
 
         KafkaProducer<String, String> controlProducer = createProducer();
-
         KafkaConsumer<String, String> phaseOneFeedbackConsumer = createObserverConsumer();
-
         KafkaConsumer<String, String> phaseTwoOutputConsumer = null;
-
         List<PreparedAliasTransaction> preparedPhaseOne = new ArrayList<PreparedAliasTransaction>();
-
         PreparedAliasTransaction preparedPhaseTwoRoot = null;
-
         List<PreparedAliasTransaction> preparedPhaseThree = new ArrayList<PreparedAliasTransaction>();
 
         try {
@@ -932,12 +926,14 @@ public final class OnePassSamplerSdeCoordinatorTest {
                                 "Phase-3 loop completed without the final GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED barrier.");
                     }
 
-                    printPhaseThreeBenchmarkSummary(
-                            plan,
-                            phaseThreeOrder,
-                            phaseThreePreloadNanos,
-                            finalPhaseThreeCompletion
-                    );
+                    if (PRINT_FINAL_RESULTS) {
+                        JsonNode finalQueryResult = requestFinalQueryResult(controlProducer,
+                                phaseTwoOutputConsumer, uid, baseKey, streamId, TIMEOUT_MS);
+                        printFinalQueryResultPreview(finalQueryResult, FINAL_RESULT_PREVIEW_LIMIT);
+                    }
+
+
+                    printPhaseThreeBenchmarkSummary(plan, phaseThreeOrder, phaseThreePreloadNanos, finalPhaseThreeCompletion);
 
                     writeCombinedBenchmarkCsv(
                             plan,
@@ -5116,5 +5112,156 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         System.out.println("[OnePass TEST CONFIG]" + " kafka=" + BOOTSTRAP_SERVERS);
+    }
+
+    private static ObjectNode buildOnePassFinalResultRequest(String baseKey, String streamId, int uid) {
+
+        /*
+         * Every worker owns the same globally installed completed sample once
+         * request 91 / phaseThreeComplete=true has been observed.
+         *
+         * Query worker 0 only. noOfP=1 is intentional: this makes the result a
+         * single-worker Estimation and therefore sends it directly to OUTPUT_TOPIC
+         * instead of trying to run another distributed OnePass reduction.
+         */
+        String workerKey = baseKey + "_" + EXPECTED_WORKERS + "_KEYED_0";
+        ObjectNode request = MAPPER.createObjectNode();
+
+        request.put("dataSetkey", workerKey);
+        request.put("key", workerKey);
+        request.put("requestID", REQUEST_ESTIMATE);
+        request.put("synopsisID", SYNOPSIS_ID);
+        request.put("uid", uid);
+        request.put("streamID", streamId);
+
+        /*
+         * Important:
+         * We only want one worker's status/result because the completed global
+         * sample has already been installed identically everywhere.
+         */
+        request.put("noOfP", 1);
+        ArrayNode param = MAPPER.createArrayNode();
+        param.add("FINAL_RESULT");
+        request.set("param", param);
+
+        return request;
+    }
+
+    private static JsonNode requestFinalQueryResult(KafkaProducer<String, String> controlProducer,
+                                                    KafkaConsumer<String, String> outputConsumer, int uid,
+                                                    String baseKey, String streamId, long timeoutMs) throws Exception {
+
+        String workerKey = baseKey + "_" + EXPECTED_WORKERS + "_KEYED_0";
+        ObjectNode request = buildOnePassFinalResultRequest(baseKey, streamId, uid);
+
+        System.out.println();
+        System.out.println("Requesting final OnePass query result from worker 0...");
+
+        /*
+         * Do NOT reinitialize the output consumer here.
+         * It has just consumed the final request-91 barrier, so its current
+         * position is exactly where we want it. The request-3 result will be a
+         * new record written after this point.
+         */
+        sendJson(controlProducer, REQUEST_TOPIC, workerKey, request);
+        controlProducer.flush();
+
+        return waitForFinalQueryResult(outputConsumer, uid, timeoutMs);
+    }
+
+    private static JsonNode waitForFinalQueryResult(KafkaConsumer<String, String> consumer, int uid, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        int recordsSeen = 0;
+
+        while (System.currentTimeMillis() < deadline) {
+            ConsumerRecords<String, String> records = consumer.poll(1000L);
+            for (ConsumerRecord<String, String> record : records) {
+                recordsSeen++;
+                JsonNode envelope;
+                try {
+                    envelope = MAPPER.readTree(record.value());
+                } catch (Exception ignored) {
+                    continue;
+                }
+
+              //This is a normal Estimation response to requestID=3.
+                 int envelopeUid = intField(envelope, "UID", intField(envelope, "uid", -1));
+
+                if (envelopeUid != uid) {
+                    continue;
+                }
+
+                if (intField(envelope, "requestID", -1) != REQUEST_ESTIMATE) {
+                    continue;
+                }
+
+                if (intField(envelope, "synopsisID", -1) != SYNOPSIS_ID) {
+                    continue;
+                }
+
+                JsonNode payload = unwrapEstimationPayload(envelope);
+                if (payload == null || payload.isNull() || !payload.isObject()) {
+                    continue;
+                }
+
+                if (!booleanField(payload, "phaseThreeComplete", false)) {
+                    throw new IllegalStateException("Final result request returned before Phase 3 was complete. " +
+                            "Payload=" + payload);
+                }
+
+                int completedSampleCount = intField(payload, "completedSampleCount", -1);
+                if (completedSampleCount <= 0) {
+                    throw new IllegalStateException("Final OnePass result contains no completed samples. " +
+                            "Payload=" + payload);
+                }
+
+                System.out.println("Observed final OnePass result:" + " completedSampleCount=" + completedSampleCount +
+                        ", projectedSamplesIncluded=" + booleanField(payload, "projectedSamplesIncluded", false) +
+                        ", projectedSamplesTruncated=" + booleanField(payload, "projectedSamplesTruncated", false));
+
+                return payload.deepCopy();
+            }
+        }
+        throw new IllegalStateException("Timed out waiting for final OnePass query result." + " uid=" + uid + ", recordsSeen=" + recordsSeen);
+    }
+
+    private static void printFinalQueryResultPreview(JsonNode result, int maxResults) throws Exception {
+
+        if (result == null || result.isNull()) {
+            throw new IllegalArgumentException("Final query result must not be null");
+        }
+
+        JsonNode samples = result.get("projectedCompletedSamples");
+        /*
+         * For benchmark-size samples the production synopsis intentionally does
+         * not put all K tuples into the Kafka response. Instead it provides the
+         * small projectedCompletedSamplesPreview array.
+         *
+         * For the current LIMIT 10000 test this is the path we expect.
+         */
+        if (samples == null || !samples.isArray() || samples.size() == 0) {
+            samples = result.get("projectedCompletedSamplesPreview");
+        }
+
+        if (samples == null || !samples.isArray() || samples.size() == 0) {
+            throw new IllegalStateException("Final OnePass result has no projected sample output. " + "Payload=" + result);
+        }
+
+        int count = Math.min(maxResults, samples.size());
+        System.out.println();
+        System.out.println("=======================================================");
+        System.out.println(" FINAL ONEPASS* QUERY RESULT PREVIEW");
+        System.out.println("=======================================================");
+        System.out.println("completedSampleCount = " + intField(result, "completedSampleCount", -1));
+        System.out.println("showing              = " + count);
+        System.out.println();
+
+        for (int i = 0; i < count; i++) {
+            System.out.println("Result " + (i + 1) + ":");
+            System.out.println(MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(samples.get(i)));
+            System.out.println();
+        }
+
+        System.out.println("=======================================================");
     }
 }
