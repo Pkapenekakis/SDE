@@ -177,9 +177,9 @@ public final class OnePassSamplerSynopsis implements Serializable {
     private void addPhaseThreeTuple(OnePassTuple tuple) {
         if (shardedPhaseThreeState != null) {
             throw new IllegalStateException("Generic lifecycle.add() must not be used for sharded Phase 3. "
-                            + "Use beginShardedPhaseThreeCandidate(), "
-                            + "lookupShardedPhaseThreeChildWeight(), and "
-                            + "acceptShardedPhaseThreeCandidate().");
+                    + "Use beginShardedPhaseThreeCandidate(), "
+                    + "lookupShardedPhaseThreeChildWeight(), and "
+                    + "acceptShardedPhaseThreeCandidate().");
         }
 
         if (phaseThreeState == null) {

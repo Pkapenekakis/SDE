@@ -24,36 +24,36 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
         int id = value.getSynopsisID();
         String key  = value.getEstimationkey();
 
-            if (t_rf == null){
+        if (t_rf == null){
 
-                t_rf = initReduceFunction(value, id);
+            t_rf = initReduceFunction(value, id);
 
-                if (t_rf == null) {
-                    System.out.println("[ReduceFlatMap] No reducer for synopsisID=" + id + ", requestID=" +
-                            value.getRequestID() + ", estimationkey=" + value.getEstimationkey());
-                    return;
-                }
+            if (t_rf == null) {
+                System.out.println("[ReduceFlatMap] No reducer for synopsisID=" + id + ", requestID=" +
+                        value.getRequestID() + ", estimationkey=" + value.getEstimationkey());
+                return;
+            }
 
-                rf.put("" + key, t_rf);
+            rf.put("" + key, t_rf);
 
-            }else{
+        }else{
 
-                if (t_rf.add(value)) {
-                    Object output = t_rf.reduce();
-                    if (output != null) {
-                        value.setEstimation(output);
-                        rf.remove("" + key);
-                        if(id == 28)
-                            value.setEstimationkey(value.getUID()+"");
-                        if(id == 30){
-                            decorateOnePassReducedEstimation(value);
-                        }
-                        out.collect(value);
+            if (t_rf.add(value)) {
+                Object output = t_rf.reduce();
+                if (output != null) {
+                    value.setEstimation(output);
+                    rf.remove("" + key);
+                    if(id == 28)
+                        value.setEstimationkey(value.getUID()+"");
+                    if(id == 30){
+                        decorateOnePassReducedEstimation(value);
                     }
-
+                    out.collect(value);
                 }
+
             }
         }
+    }
 
     private ReduceFunction initReduceFunction(Estimation value, int id) {
         ReduceFunction t_rf = null;

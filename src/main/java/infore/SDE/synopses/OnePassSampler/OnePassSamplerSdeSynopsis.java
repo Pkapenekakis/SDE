@@ -503,7 +503,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
                 int previewSize = Math.min(COMPLETED_SAMPLES_PREVIEW_LIMIT, sampleInstanceCount);
 
                 out.put("sampleInstancesPreview", new ArrayList(phaseTwoResult.getSampleInstances()
-                                        .subList(0, previewSize)));
+                        .subList(0, previewSize)));
             }
         } else {
             out.put("phaseTwoComplete", false);
@@ -664,7 +664,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
             if (dot <= 0 || dot == trimmed.length() - 1) {
                 throw new IllegalStateException("Invalid compiled projection item: " + trimmed
-                                + ". Expected alias.field");
+                        + ". Expected alias.field");
             }
 
             String alias = trimmed.substring(0, dot);
@@ -674,7 +674,7 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
 
             if (tuple == null) {
                 throw new IllegalStateException("Cannot project field " + trimmed + " because completed sample " +
-                                completedSample.getSampleInstanceId() + " has no tuple for alias " + alias);
+                        completedSample.getSampleInstanceId() + " has no tuple for alias " + alias);
             }
 
             JsonNode value = tuple.getField(field);
@@ -824,8 +824,8 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         }
 
         String[] param = new String[] {"LOCAL_PHASE1_RESULT", resultId, "PHASE1",
-                        normalizedActiveAlias, Integer.toString(workerId), Integer.toString(expectedWorkers),
-                        nextCommand == null ? "" : nextCommand.trim(), nextAlias == null ? "" : nextAlias.trim()};
+                normalizedActiveAlias, Integer.toString(workerId), Integer.toString(expectedWorkers),
+                nextCommand == null ? "" : nextCommand.trim(), nextAlias == null ? "" : nextAlias.trim()};
 
         String reduceKey = uid + "_PHASE1_" + resultId;
 
@@ -923,12 +923,12 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         }
 
         String[] param = new String[] {
-                        "LOCAL_PHASE2_ROOT_SUMMARY",
-                        resultId,
-                        "PHASE2",
-                        plan.getRootAlias(),
-                        Integer.toString(workerId),
-                        Integer.toString(expectedWorkers)};
+                "LOCAL_PHASE2_ROOT_SUMMARY",
+                resultId,
+                "PHASE2",
+                plan.getRootAlias(),
+                Integer.toString(workerId),
+                Integer.toString(expectedWorkers)};
 
         String reduceKey = uid + "_PHASE2_" + resultId;
 

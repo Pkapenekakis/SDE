@@ -31,7 +31,7 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Local integration / benchmark test for the SHARDED OnePass* Phase 1 + Phase 2 design.
+ * Local integration / benchmark test for the SHARDED OnePass* Phase 1 + Phase 2 + Phase 3 design.
  * <p>
  * Timing semantics:
  * <p>
@@ -56,11 +56,28 @@ import java.util.UUID;
  * global installation barrier: every worker has received and installed the
  * globally merged Phase-2 root sample.
  * <p>
+ * Phase 3:
+ * - request 86 automatically starts the first root-to-leaf replay alias.
+ * - every non-root relation is parsed + written into an open Kafka transaction
+ *   before phase3_algorithm_total starts.
+ * - each commitTransaction() releases exactly one replay alias and IS inside
+ *   the Phase-3 timer.
+ * - for non-final aliases, the measured alias ends when the next
+ *   START_PHASE_3_ALIAS transition is observed on RequestTopic.
+ * - the final alias ends when GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED with
+ *   phaseThreeComplete=true is observed on the SDE output topic.
+ * <p>
  * This keeps expensive local file parsing / JSON creation / producer.send()
- * outside both algorithm timers while preserving the actual Kafka visibility
+ * outside all algorithm timers while preserving the actual Kafka visibility
  * boundary (read_committed + transaction commit) inside each measured phase.
  * <p>
- * Phase 3 is intentionally not started by this test.
+ * The Phase-3 assertions validate the complete coordinator-free lifecycle:
+ * request 86 -> first replay, request 87/88 strict global selections,
+ * request 90/91 global installation, next-alias transitions, and the final
+ * all-worker installation barrier. The production protocol does not currently
+ * expose the completed sample tuples on OUTPUT_TOPIC, so this class validates
+ * Phase-3 transport/lifecycle metadata and selection cardinality rather than
+ * independently re-computing the selected sample contents.
  */
 public final class OnePassSamplerSdeCoordinatorTest {
 
@@ -143,11 +160,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
 //            "LIMIT 1000 " + "/* catalog='tpch-onepass-catalog.json', " + "seed='branch-test-123', scalefactor=1 */";
 
     //Use -1 for the full TPC-H relation.
-    private static final long TEST_ROW_LIMIT = Long.parseLong(System.getProperty("onepass.testRowLimit",
-            "100000"));
-
-    private static final int EXPECTED_WORKERS = Integer.parseInt(System.getProperty("onepass.workers",
-            "4"));
+    private static final long TEST_ROW_LIMIT = Long.parseLong(System.getProperty("onepass.testRowLimit", "100000"));
+    private static final int EXPECTED_WORKERS = Integer.parseInt(System.getProperty("onepass.workers", "4"));
 
     private static final long TIMEOUT_MS = Long.parseLong(System.getProperty("onepass.timeoutMs",
             Long.toString(30L * 60L * 1000L)));
@@ -166,8 +180,9 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     /*
      * Primary benchmark output.
-     * One completed Phase-1 + Phase-2 run appends exactly one row to the
-     * combined CSV. This is the file intended for P=2 / P=4 / P=8 comparisons.
+     * One completed Phase-1 + Phase-2 + optional Phase-3 run appends exactly
+     * one row to the combined CSV. This is the file intended for P=2 / P=4 /
+     * P=8 comparisons.
      */
     private static final boolean WRITE_COMBINED_BENCHMARK_CSV = true;
 
@@ -175,7 +190,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * false:
      *   Only the compact comparison fields are populated.
      * true:
-     *   The detailed Phase-1 / Phase-2 metrics used by the older graphing
+     *   The detailed Phase-1 / Phase-2 / Phase-3 metrics used by the graphing
      *   workflow are populated as extra columns in THE SAME combined CSV.
      * The CSV schema is stable in both modes; detailed columns are simply left
      * empty when this flag is false.
@@ -193,6 +208,14 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final boolean RUN_PHASE_2 = Boolean.parseBoolean(System.getProperty("onepass.runPhase2", "true"));
 
+    /*
+     * Phase 3 depends on the globally installed Phase-2 root sample.
+     * The production runtime automatically emits the first START_PHASE_3_ALIAS
+     * after request 86. This flag controls whether this test replays the
+     * non-root relations and waits for the final request-91 barrier.
+     */
+    private static final boolean RUN_PHASE_3 = Boolean.parseBoolean(System.getProperty("onepass.runPhase3", "true"));
+
     private static final int SYNOPSIS_ID = 30;
     private static final int REQUEST_ADD = 1;
     private static final int REQUEST_UPDATE = 7;
@@ -201,7 +224,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     /*
      * Timing maps deliberately contain only algorithm timings.
      * Kafka/TPC-H preload is tracked separately and never added to
-     * phase1_algorithm_total.
+     * phase1_algorithm_total, phase2_algorithm_total or phase3_algorithm_total.
      */
     private static final Map<String, Long> benchmarkNanos = new LinkedHashMap<String, Long>();
     private static final Map<String, Long> benchmarkCounts = new LinkedHashMap<String, Long>();
@@ -271,12 +294,17 @@ public final class OnePassSamplerSdeCoordinatorTest {
         benchmarkNanos.clear();
         benchmarkCounts.clear();
 
-        String streamId = "onepass-sharded-phase12-local-test";
+        if (RUN_PHASE_3 && !RUN_PHASE_2) {
+            throw new IllegalStateException(
+                    "RUN_PHASE_3=true requires RUN_PHASE_2=true because Phase 3 extends the installed Phase-2 root sample.");
+        }
 
-        String baseKey = "onepass-phase12-" + uid;
+        String streamId = "onepass-sharded-phase123-local-test";
+
+        String baseKey = "onepass-phase123-" + uid;
 
         System.out.println("=======================================================");
-        System.out.println(" OnePass* SHARDED PHASE 1 + PHASE 2 - LOCAL TEST");
+        System.out.println(" OnePass* SHARDED PHASE 1 + PHASE 2 + PHASE 3 - LOCAL TEST");
         System.out.println("=======================================================");
         System.out.println("uid              = " + uid);
         System.out.println("baseKey          = " + baseKey);
@@ -290,6 +318,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println("TEST_ROW_LIMIT   = " + TEST_ROW_LIMIT);
         System.out.println("transactionTimeoutMs = " + TRANSACTION_TIMEOUT_MS);
         System.out.println("RUN_PHASE_2      = " + RUN_PHASE_2);
+        System.out.println("RUN_PHASE_3      = " + RUN_PHASE_3);
         System.out.println("EXPORT_PHASE1_INDEXES = " + EXPORT_PHASE1_INDEXES);
         System.out.println("VALIDATE_PHASE2  = " + VALIDATE_PHASE2);
         System.out.println("combinedBenchmarkCsv = " + COMBINED_BENCHMARK_CSV_PATH);
@@ -308,6 +337,10 @@ public final class OnePassSamplerSdeCoordinatorTest {
             System.out.println("phase2ChecksumVersion= " + PHASE2_CHECKSUM_VERSION);
         }
 
+        if (WRITE_COMBINED_BENCHMARK_CSV) {
+            validateCombinedBenchmarkCsvSchema();
+        }
+
         System.out.println("SQL:");
         System.out.println(TEST_ONEPASS_SQL);
         System.out.println();
@@ -318,13 +351,15 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
         OnePassCatalog catalog = OnePassQueryCatalogLoader.load(params.getDataset().getDbConfig());
 
-        validatePlanForShardedPhaseOneV1(plan);
+        validatePlanForShardedOnePassV1(plan);
 
         System.out.println("Compiled plan:");
         System.out.println(plan);
         System.out.println("Root alias: " + plan.getRootAlias());
         System.out.println("Root child edges: " + plan.getChildEdges(plan.getRootAlias()));
         System.out.println("Leaf-to-root order: " + plan.getLeafToRootOrder());
+        System.out.println("Root-to-leaf order: " + plan.getRootToLeafOrder());
+        System.out.println("Phase-3 replay order: " + phaseThreeAliasOrder(plan));
         System.out.println("Required fields by alias: " + plan.getRequiredFieldsByAlias());
         System.out.println();
 
@@ -337,6 +372,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
         List<PreparedAliasTransaction> preparedPhaseOne = new ArrayList<PreparedAliasTransaction>();
 
         PreparedAliasTransaction preparedPhaseTwoRoot = null;
+
+        List<PreparedAliasTransaction> preparedPhaseThree = new ArrayList<PreparedAliasTransaction>();
 
         try {
 
@@ -613,21 +650,34 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     throw new IllegalStateException("Phase-2 installed worker count mismatch." + " expected=" + EXPECTED_WORKERS + ", actual=" + installedWorkerCount + ", installed=" + installed);
                 }
 
-                printPhaseTwoBenchmarkSummary(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed);
+                List<String> phaseThreeOrder = phaseThreeAliasOrder(plan);
 
-                /*
-                 * Primary benchmark output: exactly one row for the completed
-                 * Phase-1 + Phase-2 run.
-                 */
-                writeCombinedBenchmarkCsv(
-                        plan,
-                        phaseOnePreloadNanos,
-                        preparedPhaseTwoRoot.rows,
-                        phaseTwoPreloadNanos,
-                        ready,
-                        installed,
-                        "SDE_KAFKA_MULTIWORKER_SHARDED_ONEPASS"
-                );
+                int phaseThreeAliasCount = intField(installed, "phaseThreeAliasCount", -1);
+
+                String firstPhaseThreeAlias = textField(installed, "firstPhaseThreeAlias", "");
+
+                if (phaseThreeAliasCount != phaseThreeOrder.size()) {
+                    throw new IllegalStateException(
+                            "Phase-2 -> Phase-3 alias-count mismatch. planOrder=" + phaseThreeOrder
+                                    + ", payloadCount=" + phaseThreeAliasCount
+                                    + ", installed=" + installed);
+                }
+
+                if (phaseThreeOrder.isEmpty()) {
+                    if (!firstPhaseThreeAlias.isEmpty()) {
+                        throw new IllegalStateException(
+                                "Degenerate Phase-3 plan unexpectedly declares firstPhaseThreeAlias="
+                                        + firstPhaseThreeAlias + ". Installed=" + installed);
+                    }
+                } else if (!phaseThreeOrder.get(0).equals(firstPhaseThreeAlias)) {
+                    throw new IllegalStateException(
+                            "Phase-2 -> Phase-3 first-alias mismatch. expected="
+                                    + phaseThreeOrder.get(0)
+                                    + ", actual=" + firstPhaseThreeAlias
+                                    + ", installed=" + installed);
+                }
+
+                printPhaseTwoBenchmarkSummary(plan, preparedPhaseTwoRoot.rows, phaseTwoPreloadNanos, ready, installed);
 
                 /*
                  * Historical per-phase CSV writer. The method is retained, but
@@ -667,8 +717,276 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 System.out.println("=======================================================");
                 System.out.println(" SHARDED PHASE 2 COMPLETE");
                 System.out.println("=======================================================");
-                System.out.println("SUCCESS: Phase 1 + sharded Phase 2 completed locally.");
-                System.out.println("Global root sample is installed on all " + EXPECTED_WORKERS + " workers. Phase 3 is intentionally not started.");
+                System.out.println("Global root sample is installed on all " + EXPECTED_WORKERS + " workers.");
+
+                // =========================================================
+                // PHASE 3
+                // =========================================================
+
+                if (RUN_PHASE_3) {
+
+                    if (phaseThreeOrder.isEmpty()) {
+                        throw new IllegalStateException(
+                                "RUN_PHASE_3=true but the compiled plan has no non-root aliases.");
+                    }
+
+                    /*
+                     * request 86 is fed into the stateless Phase-3 transition
+                     * mapper. Before any replay data is released, prove that
+                     * the first START_PHASE_3_ALIAS request reached RequestTopic
+                     * with the same traversal metadata used by the workers.
+                     */
+                    JsonNode firstPhaseThreeStart = waitForShardedPhaseThreeStartTransition(
+                            phaseOneFeedbackConsumer,
+                            uid,
+                            baseKey,
+                            phaseThreeOrder.get(0),
+                            0,
+                            phaseThreeResultId(uid, phaseThreeOrder.get(0)),
+                            phaseThreeOrder.size(),
+                            TIMEOUT_MS
+                    );
+
+                    String phaseTwoStateRef = textField(installed, "stateRef", "");
+                    String firstTriggerStateRef = textField(firstPhaseThreeStart, "triggerStateRef", "");
+
+                    if (phaseTwoStateRef.isEmpty() || !phaseTwoStateRef.equals(firstTriggerStateRef)) {
+                        throw new IllegalStateException(
+                                "First Phase-3 transition does not reference the installed Phase-2 state."
+                                        + " phase2StateRef=" + phaseTwoStateRef
+                                        + ", triggerStateRef=" + firstTriggerStateRef
+                                        + ", transition=" + firstPhaseThreeStart);
+                    }
+
+                    /*
+                     * As in Phase 1, parse and producer.send() every Phase-3
+                     * replay relation before the measured algorithm starts.
+                     * The transactions remain open, so read_committed SDE
+                     * workers cannot observe any replay tuple yet.
+                     */
+                    System.out.println();
+                    System.out.println("=======================================================");
+                    System.out.println(" PREPARING PHASE-3 REPLAY TRANSACTIONS OUTSIDE TIMER");
+                    System.out.println(" replayOrder=" + phaseThreeOrder);
+                    System.out.println("=======================================================");
+
+                    long phaseThreePreloadStartNanos = tic();
+
+                    preparedPhaseThree = preparePhaseThreeTransactions(
+                            uid,
+                            baseKey,
+                            streamId,
+                            catalog,
+                            plan
+                    );
+
+                    long phaseThreePreloadNanos =
+                            System.nanoTime() - phaseThreePreloadStartNanos;
+
+                    long totalPreparedPhaseThreeRows = 0L;
+
+                    for (int i = 0; i < preparedPhaseThree.size(); i++) {
+                        PreparedAliasTransaction prepared = preparedPhaseThree.get(i);
+
+                        totalPreparedPhaseThreeRows += prepared.rows;
+
+                        System.out.println(
+                                "  PREPARED PHASE3 alias=" + prepared.alias
+                                        + ", aliasIndex=" + i
+                                        + ", epoch=" + prepared.epoch
+                                        + ", rows=" + prepared.rows
+                                        + ", committed=" + prepared.committed);
+                    }
+
+                    if (preparedPhaseThree.size() != phaseThreeOrder.size()) {
+                        throw new IllegalStateException(
+                                "Prepared Phase-3 transaction count mismatch. expected="
+                                        + phaseThreeOrder.size()
+                                        + ", actual=" + preparedPhaseThree.size());
+                    }
+
+                    if (totalPreparedPhaseThreeRows <= 0L) {
+                        throw new IllegalStateException("No Phase-3 replay rows were preloaded.");
+                    }
+
+                    System.out.printf(
+                            "Phase-3 Kafka preload completed OUTSIDE algorithm timer: %.3f s%n",
+                            phaseThreePreloadNanos / 1_000_000_000.0d
+                    );
+
+                    System.out.println();
+                    System.out.println("=======================================================");
+                    System.out.println(" STARTING MEASURED ONEPASS* SHARDED PHASE 3");
+                    System.out.println(" replayOrder=" + phaseThreeOrder);
+                    System.out.println("=======================================================");
+
+                    long phaseThreeTotalStartNanos = tic();
+
+                    JsonNode finalPhaseThreeCompletion = null;
+
+                    for (int aliasIndex = 0; aliasIndex < preparedPhaseThree.size(); aliasIndex++) {
+
+                        PreparedAliasTransaction prepared = preparedPhaseThree.get(aliasIndex);
+
+                        String alias = prepared.alias;
+
+                        String expectedAlias = phaseThreeOrder.get(aliasIndex);
+
+                        if (!expectedAlias.equals(alias)) {
+                            throw new IllegalStateException(
+                                    "Prepared Phase-3 order mismatch. aliasIndex=" + aliasIndex
+                                            + ", expected=" + expectedAlias
+                                            + ", actual=" + alias);
+                        }
+
+                        String resultId = phaseThreeResultId(uid, alias);
+
+                        boolean last = aliasIndex == phaseThreeOrder.size() - 1;
+
+                        long aliasStartNanos = tic();
+
+                        System.out.println();
+                        System.out.println("-------------------------------------------------------");
+                        System.out.println(
+                                "Releasing Phase-3 alias=" + alias
+                                        + ", aliasIndex=" + aliasIndex
+                                        + ", rows=" + prepared.rows
+                                        + ", resultId=" + resultId);
+                        System.out.println("-------------------------------------------------------");
+
+                        /*
+                         * The transaction commit is the Phase-3 replay release
+                         * signal and is intentionally inside the algorithm timer.
+                         */
+                        prepared.producer.commitTransaction();
+                        prepared.committed = true;
+
+                        System.out.println(
+                                "Kafka transaction committed. Phase-3 replay alias "
+                                        + alias
+                                        + " is now visible to the read_committed SDE source.");
+
+                        if (last) {
+
+                            finalPhaseThreeCompletion = waitForShardedPhaseThreeCompletion(
+                                    phaseTwoOutputConsumer,
+                                    uid,
+                                    baseKey,
+                                    alias,
+                                    aliasIndex,
+                                    resultId,
+                                    phaseThreeOrder.size(),
+                                    plan.getSampleSize(),
+                                    TIMEOUT_MS
+                            );
+
+                        } else {
+
+                            String nextAlias = phaseThreeOrder.get(aliasIndex + 1);
+
+                            JsonNode nextTransition = waitForShardedPhaseThreeStartTransition(
+                                    phaseOneFeedbackConsumer,
+                                    uid,
+                                    baseKey,
+                                    nextAlias,
+                                    aliasIndex + 1,
+                                    phaseThreeResultId(uid, nextAlias),
+                                    phaseThreeOrder.size(),
+                                    TIMEOUT_MS
+                            );
+
+                            String triggerStateRef = textField(nextTransition, "triggerStateRef", "");
+
+                            if (triggerStateRef.isEmpty()) {
+                                throw new IllegalStateException(
+                                        "Non-final Phase-3 transition has no triggerStateRef."
+                                                + " completedAlias=" + alias
+                                                + ", nextAlias=" + nextAlias
+                                                + ", transition=" + nextTransition);
+                            }
+                        }
+
+                        recordCount("phase3_rows_replayed", prepared.rows);
+
+                        recordCount(
+                                "phase3_alias_" + alias + "_rows_replayed",
+                                prepared.rows
+                        );
+
+                        recordDuration(
+                                "phase3_alias_" + alias + "_algorithm",
+                                aliasStartNanos
+                        );
+
+                        System.out.println(
+                                "Phase-3 alias complete: alias=" + alias
+                                        + ", aliasIndex=" + aliasIndex
+                                        + ", rows=" + prepared.rows
+                                        + ", finalAlias=" + last);
+                    }
+
+                    recordDuration("phase3_algorithm_total", phaseThreeTotalStartNanos);
+
+                    if (finalPhaseThreeCompletion == null) {
+                        throw new IllegalStateException(
+                                "Phase-3 loop completed without the final GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED barrier.");
+                    }
+
+                    printPhaseThreeBenchmarkSummary(
+                            plan,
+                            phaseThreeOrder,
+                            phaseThreePreloadNanos,
+                            finalPhaseThreeCompletion
+                    );
+
+                    writeCombinedBenchmarkCsv(
+                            plan,
+                            phaseOnePreloadNanos,
+                            preparedPhaseTwoRoot.rows,
+                            phaseTwoPreloadNanos,
+                            ready,
+                            installed,
+                            phaseThreePreloadNanos,
+                            finalPhaseThreeCompletion,
+                            "SDE_KAFKA_MULTIWORKER_SHARDED_ONEPASS_PHASE123"
+                    );
+
+                    System.out.println();
+                    System.out.println("=======================================================");
+                    System.out.println(" SHARDED PHASE 3 COMPLETE");
+                    System.out.println("=======================================================");
+                    System.out.println(
+                            "SUCCESS: Phase 1 + Phase 2 + Phase 3 completed locally.");
+                    System.out.println(
+                            "Final global Phase-3 selections were installed on all "
+                                    + EXPECTED_WORKERS
+                                    + " workers.");
+
+                } else {
+
+                    /*
+                     * Production request 86 still activates the first Phase-3
+                     * alias automatically. RUN_PHASE_3=false simply means this
+                     * integration test does not replay its tuples and stops its
+                     * assertions at the Phase-2 barrier.
+                     */
+                    writeCombinedBenchmarkCsv(
+                            plan,
+                            phaseOnePreloadNanos,
+                            preparedPhaseTwoRoot.rows,
+                            phaseTwoPreloadNanos,
+                            ready,
+                            installed,
+                            0L,
+                            null,
+                            "SDE_KAFKA_MULTIWORKER_SHARDED_ONEPASS_PHASE12_ONLY"
+                    );
+
+                    System.out.println();
+                    System.out.println(
+                            "SUCCESS: Phase 1 + sharded Phase 2 completed locally. "
+                                    + "RUN_PHASE_3=false, so Phase-3 replay data was not released.");
+                }
 
             } else {
 
@@ -714,6 +1032,14 @@ public final class OnePassSamplerSdeCoordinatorTest {
              * succeeded but its release/completion failed.
              */
             closePreparedTransaction(preparedPhaseTwoRoot, "Phase-2 root");
+
+            /*
+             * Abort any Phase-3 replay transaction that did not reach its
+             * release point, then close every transactional producer.
+             */
+            for (PreparedAliasTransaction prepared : preparedPhaseThree) {
+                closePreparedTransaction(prepared, "Phase-3 replay");
+            }
 
             try {
 
@@ -929,6 +1255,200 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 }
             }
         }
+    }
+
+
+
+    // =====================================================================
+    // PHASE-3 REPLAY PRELOAD
+    // =====================================================================
+
+    /**
+     * Prepares one read_committed Kafka transaction per Phase-3 replay alias.
+     *
+     * The replay order deliberately mirrors the production
+     * SDEcoFlatMap.phaseThreeAliasOrder(...): plan.getRootToLeafOrder() with
+     * the root itself removed.
+     */
+    private static List<PreparedAliasTransaction> preparePhaseThreeTransactions(
+            int uid,
+            String baseKey,
+            String streamId,
+            OnePassCatalog catalog,
+            CompiledOnePassPlan plan) throws Exception {
+
+        List<String> order = phaseThreeAliasOrder(plan);
+
+        List<PreparedAliasTransaction> prepared =
+                new ArrayList<PreparedAliasTransaction>();
+
+        for (int aliasIndex = 0; aliasIndex < order.size(); aliasIndex++) {
+
+            String alias = order.get(aliasIndex);
+
+            /*
+             * Epoch is diagnostic only for PHASE3 END_ALIAS today, but keeping
+             * it monotonic makes Kafka traces easier to read.
+             */
+            int epoch =
+                    plan.getLeafToRootOrder().size()
+                            + 2
+                            + aliasIndex;
+
+            String resultId =
+                    phaseThreeResultId(
+                            uid,
+                            alias
+                    );
+
+            String transactionalId =
+                    "onepass-p3-"
+                            + uid
+                            + "-"
+                            + aliasIndex
+                            + "-"
+                            + alias
+                            + "-"
+                            + Long.toHexString(
+                            System.nanoTime()
+                    );
+
+            KafkaProducer<String, String> aliasProducer =
+                    createTransactionalProducer(
+                            transactionalId
+                    );
+
+            boolean success =
+                    false;
+
+            try {
+
+                System.out.println(
+                        "Preparing Kafka transaction for Phase-3 replay alias="
+                                + alias
+                                + ", aliasIndex="
+                                + aliasIndex
+                                + ", epoch="
+                                + epoch
+                                + "..."
+                );
+
+                long rows =
+                        streamAlias(
+                                aliasProducer,
+                                DATA_TOPIC,
+                                baseKey,
+                                streamId,
+                                catalog,
+                                plan,
+                                alias,
+                                TEST_ROW_LIMIT,
+                                plan.getRequiredFieldsByAlias()
+                        );
+
+                if (rows <= 0L) {
+
+                    throw new IllegalStateException(
+                            "No rows were read for Phase-3 replay alias "
+                                    + alias
+                    );
+                }
+
+                ObjectNode endAlias =
+                        buildPhaseThreeEndAliasDatapoint(
+                                baseKey,
+                                streamId,
+                                uid,
+                                alias,
+                                epoch,
+                                aliasIndex,
+                                order.size(),
+                                resultId,
+                                EXPECTED_WORKERS,
+                                aliasIndex == order.size() - 1
+                                        ? ""
+                                        : order.get(aliasIndex + 1)
+                        );
+
+                /*
+                 * END_ALIAS is in the same transaction and uses the same base
+                 * Kafka key as every replay tuple. The OnePass router broadcasts
+                 * the marker to all logical workers after commit.
+                 */
+                sendJsonAsync(
+                        aliasProducer,
+                        DATA_TOPIC,
+                        baseKey,
+                        endAlias
+                );
+
+                aliasProducer.flush();
+
+                prepared.add(
+                        new PreparedAliasTransaction(
+                                alias,
+                                epoch,
+                                rows,
+                                aliasProducer
+                        )
+                );
+
+                success =
+                        true;
+
+            } finally {
+
+                if (!success) {
+
+                    try {
+                        aliasProducer.abortTransaction();
+                    } catch (Exception ignored) {
+                    }
+
+                    try {
+                        aliasProducer.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+
+        return prepared;
+    }
+
+
+    private static String phaseThreeResultId(
+            int uid,
+            String alias) {
+
+        return "PHASE3_"
+                + alias
+                + "_"
+                + uid;
+    }
+
+
+    /**
+     * Exact production Phase-3 traversal order.
+     *
+     * CompiledOnePassPlan.rootToLeafOrder includes the root relation, while
+     * Phase 3 replays only non-root relations.
+     */
+    private static List<String> phaseThreeAliasOrder(
+            CompiledOnePassPlan plan) {
+
+        List<String> order =
+                new ArrayList<String>();
+
+        for (String alias : plan.getRootToLeafOrder()) {
+
+            if (!plan.isRoot(alias)) {
+
+                order.add(alias);
+            }
+        }
+
+        return order;
     }
 
 
@@ -1393,6 +1913,696 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
             this.installedPayload = installedPayload;
         }
+    }
+
+
+    // =====================================================================
+    // SHARDED PHASE-3 REQUEST/OUTPUT OBSERVERS
+    // =====================================================================
+
+    /**
+     * Waits for one stateless request-7 START_PHASE_3_ALIAS transition.
+     *
+     * request 86 produces aliasIndex 0. Every non-final request 91 produces
+     * the next alias. Observing this request is therefore an end-to-end proof
+     * that the previous alias reached the all-worker installation barrier.
+     */
+    private static JsonNode waitForShardedPhaseThreeStartTransition(
+            KafkaConsumer<String, String> consumer,
+            int uid,
+            String expectedBaseKey,
+            String expectedAlias,
+            int expectedAliasIndex,
+            String expectedResultId,
+            int expectedAliasCount,
+            long timeoutMs) throws Exception {
+
+        long deadline =
+                System.currentTimeMillis()
+                        + timeoutMs;
+
+        int recordsSeen =
+                0;
+
+        while (System.currentTimeMillis()
+                < deadline) {
+
+            ConsumerRecords<String, String> records =
+                    consumer.poll(
+                            1000L
+                    );
+
+            for (ConsumerRecord<String, String> record
+                    : records) {
+
+                recordsSeen++;
+
+                String value =
+                        record.value();
+
+                if (value == null
+                        || value.trim().isEmpty()) {
+
+                    continue;
+                }
+
+                JsonNode request;
+
+                try {
+
+                    request =
+                            MAPPER.readTree(
+                                    value
+                            );
+
+                } catch (Exception ignored) {
+
+                    continue;
+                }
+
+                if (intField(
+                        request,
+                        "uid",
+                        -1
+                ) != uid) {
+
+                    continue;
+                }
+
+                if (intField(
+                        request,
+                        "synopsisID",
+                        -1
+                ) != SYNOPSIS_ID) {
+
+                    continue;
+                }
+
+                if (intField(
+                        request,
+                        "requestID",
+                        -1
+                ) != REQUEST_UPDATE) {
+
+                    continue;
+                }
+
+                JsonNode payload =
+                        request.get(
+                                "parameters"
+                        );
+
+                if (payload == null
+                        || !payload.isObject()) {
+
+                    continue;
+                }
+
+                if (!"SHARDED_PHASE3_V1".equals(
+                        textField(
+                                payload,
+                                "protocol",
+                                ""
+                        )
+                )) {
+
+                    continue;
+                }
+
+                if (!"START_PHASE_3_ALIAS".equals(
+                        textField(
+                                payload,
+                                "type",
+                                ""
+                        )
+                )) {
+
+                    continue;
+                }
+
+                String alias =
+                        textField(
+                                payload,
+                                "phaseThreeAlias",
+                                textField(
+                                        payload,
+                                        "alias",
+                                        ""
+                                )
+                        );
+
+                int aliasIndex =
+                        intField(
+                                payload,
+                                "aliasIndex",
+                                -1
+                        );
+
+                /*
+                 * Skip an older Phase-3 transition if the observer happens to
+                 * encounter one while waiting for a later alias.
+                 */
+                if (!expectedAlias.equals(alias)
+                        || aliasIndex != expectedAliasIndex) {
+
+                    continue;
+                }
+
+                if (!"START_PHASE_3_ALIAS".equals(
+                        textField(
+                                payload,
+                                "onePassCommand",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Phase-3 transition has invalid onePassCommand. Payload="
+                                    + payload
+                    );
+                }
+
+                if (!"PHASE3".equalsIgnoreCase(
+                        textField(
+                                payload,
+                                "phase",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Phase-3 transition has invalid phase. Payload="
+                                    + payload
+                    );
+                }
+
+                if (!expectedResultId.equals(
+                        textField(
+                                payload,
+                                "resultId",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Phase-3 transition resultId mismatch."
+                                    + " expected="
+                                    + expectedResultId
+                                    + ", actual="
+                                    + textField(
+                                    payload,
+                                    "resultId",
+                                    ""
+                            )
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                if (!expectedBaseKey.equals(
+                        textField(
+                                payload,
+                                "baseKey",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Phase-3 transition baseKey mismatch."
+                                    + " expected="
+                                    + expectedBaseKey
+                                    + ", actual="
+                                    + textField(
+                                    payload,
+                                    "baseKey",
+                                    ""
+                            )
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int expectedWorkers =
+                        intField(
+                                payload,
+                                "expectedWorkers",
+                                -1
+                        );
+
+                if (expectedWorkers
+                        != EXPECTED_WORKERS) {
+
+                    throw new IllegalStateException(
+                            "Phase-3 transition expectedWorkers mismatch."
+                                    + " configured="
+                                    + EXPECTED_WORKERS
+                                    + ", payload="
+                                    + expectedWorkers
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int aliasCount =
+                        intField(
+                                payload,
+                                "phaseThreeAliasCount",
+                                -1
+                        );
+
+                if (aliasCount
+                        != expectedAliasCount) {
+
+                    throw new IllegalStateException(
+                            "Phase-3 transition alias-count mismatch."
+                                    + " expected="
+                                    + expectedAliasCount
+                                    + ", actual="
+                                    + aliasCount
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                System.out.println(
+                        "Observed START_PHASE_3_ALIAS:"
+                                + " alias="
+                                + alias
+                                + ", aliasIndex="
+                                + aliasIndex
+                                + ", resultId="
+                                + expectedResultId
+                                + ", triggerStateRef="
+                                + textField(
+                                payload,
+                                "triggerStateRef",
+                                ""
+                        )
+                );
+
+                return payload.deepCopy();
+            }
+        }
+
+        throw new IllegalStateException(
+                "Timed out waiting for START_PHASE_3_ALIAS."
+                        + " uid="
+                        + uid
+                        + ", alias="
+                        + expectedAlias
+                        + ", aliasIndex="
+                        + expectedAliasIndex
+                        + ", resultId="
+                        + expectedResultId
+                        + ", recordsSeen="
+                        + recordsSeen
+        );
+    }
+
+
+    /**
+     * Waits for the final request-91 Phase-3 installation barrier exposed on
+     * OUTPUT_TOPIC by RunOnepass.
+     *
+     * Non-final request-91 records remain internal and are observed indirectly
+     * through the next START_PHASE_3_ALIAS transition above. The final record
+     * is external only when phaseThreeComplete=true.
+     */
+    private static JsonNode waitForShardedPhaseThreeCompletion(
+            KafkaConsumer<String, String> consumer,
+            int uid,
+            String expectedBaseKey,
+            String expectedAlias,
+            int expectedAliasIndex,
+            String expectedResultId,
+            int expectedAliasCount,
+            int expectedSampleSize,
+            long timeoutMs) throws Exception {
+
+        long deadline =
+                System.currentTimeMillis()
+                        + timeoutMs;
+
+        int recordsSeen =
+                0;
+
+        while (System.currentTimeMillis()
+                < deadline) {
+
+            ConsumerRecords<String, String> records =
+                    consumer.poll(
+                            1000L
+                    );
+
+            for (ConsumerRecord<String, String> record
+                    : records) {
+
+                recordsSeen++;
+
+                JsonNode envelope;
+
+                try {
+
+                    envelope =
+                            MAPPER.readTree(
+                                    record.value()
+                            );
+
+                } catch (Exception ignored) {
+
+                    continue;
+                }
+
+                JsonNode payload =
+                        unwrapEstimationPayload(
+                                envelope
+                        );
+
+                if (payload == null
+                        || payload.isNull()
+                        || !payload.isObject()) {
+
+                    continue;
+                }
+
+                if (intField(
+                        payload,
+                        "uid",
+                        -1
+                ) != uid) {
+
+                    continue;
+                }
+
+                if (!"GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED".equals(
+                        textField(
+                                payload,
+                                "type",
+                                ""
+                        )
+                )) {
+
+                    continue;
+                }
+
+                if (!expectedResultId.equals(
+                        textField(
+                                payload,
+                                "resultId",
+                                ""
+                        )
+                )) {
+
+                    continue;
+                }
+
+                if (!"SHARDED_PHASE3_V1".equals(
+                        textField(
+                                payload,
+                                "protocol",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 completion has unexpected protocol. Payload="
+                                    + payload
+                    );
+                }
+
+                if (!"PHASE3".equalsIgnoreCase(
+                        textField(
+                                payload,
+                                "phase",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 completion has unexpected phase. Payload="
+                                    + payload
+                    );
+                }
+
+                String alias =
+                        textField(
+                                payload,
+                                "phaseThreeAlias",
+                                textField(
+                                        payload,
+                                        "alias",
+                                        ""
+                                )
+                        );
+
+                if (!expectedAlias.equals(
+                        alias
+                )) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 alias mismatch."
+                                    + " expected="
+                                    + expectedAlias
+                                    + ", actual="
+                                    + alias
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                if (!expectedBaseKey.equals(
+                        textField(
+                                payload,
+                                "baseKey",
+                                ""
+                        )
+                )) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 baseKey mismatch."
+                                    + " expected="
+                                    + expectedBaseKey
+                                    + ", actual="
+                                    + textField(
+                                    payload,
+                                    "baseKey",
+                                    ""
+                            )
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int aliasIndex =
+                        intField(
+                                payload,
+                                "aliasIndex",
+                                -1
+                        );
+
+                if (aliasIndex
+                        != expectedAliasIndex) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 aliasIndex mismatch."
+                                    + " expected="
+                                    + expectedAliasIndex
+                                    + ", actual="
+                                    + aliasIndex
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int aliasCount =
+                        intField(
+                                payload,
+                                "phaseThreeAliasCount",
+                                -1
+                        );
+
+                if (aliasCount
+                        != expectedAliasCount) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 alias-count mismatch."
+                                    + " expected="
+                                    + expectedAliasCount
+                                    + ", actual="
+                                    + aliasCount
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int sampleSize =
+                        intField(
+                                payload,
+                                "sampleSize",
+                                -1
+                        );
+
+                int selectionCount =
+                        intField(
+                                payload,
+                                "selectionCount",
+                                -1
+                        );
+
+                if (sampleSize != expectedSampleSize
+                        || selectionCount != expectedSampleSize) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 selection cardinality mismatch."
+                                    + " expectedSampleSize="
+                                    + expectedSampleSize
+                                    + ", sampleSize="
+                                    + sampleSize
+                                    + ", selectionCount="
+                                    + selectionCount
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                if (!booleanField(
+                        payload,
+                        "isLastAlias",
+                        false
+                )) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 completion is not marked isLastAlias=true. Payload="
+                                    + payload
+                    );
+                }
+
+                if (!booleanField(
+                        payload,
+                        "phaseThreeComplete",
+                        false
+                )) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 completion is not marked phaseThreeComplete=true. Payload="
+                                    + payload
+                    );
+                }
+
+                String nextAlias =
+                        textField(
+                                payload,
+                                "nextAlias",
+                                ""
+                        );
+
+                if (!nextAlias.isEmpty()) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 completion unexpectedly declares nextAlias="
+                                    + nextAlias
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                int expectedWorkers =
+                        intField(
+                                payload,
+                                "expectedWorkers",
+                                -1
+                        );
+
+                int installedWorkerCount =
+                        intField(
+                                payload,
+                                "installedWorkerCount",
+                                -1
+                        );
+
+                if (expectedWorkers != EXPECTED_WORKERS
+                        || installedWorkerCount != EXPECTED_WORKERS) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 installation barrier worker-count mismatch."
+                                    + " configured="
+                                    + EXPECTED_WORKERS
+                                    + ", expectedWorkers="
+                                    + expectedWorkers
+                                    + ", installedWorkerCount="
+                                    + installedWorkerCount
+                                    + ". Payload="
+                                    + payload
+                    );
+                }
+
+                String stateRef =
+                        textField(
+                                payload,
+                                "stateRef",
+                                ""
+                        );
+
+                if (stateRef.isEmpty()) {
+
+                    throw new IllegalStateException(
+                            "Final Phase-3 completion has no stateRef. Payload="
+                                    + payload
+                    );
+                }
+
+                JsonNode receivedWorkers =
+                        payload.get(
+                                "receivedWorkers"
+                        );
+
+                if (receivedWorkers != null
+                        && !receivedWorkers.isNull()) {
+
+                    if (!receivedWorkers.isArray()
+                            || receivedWorkers.size() != EXPECTED_WORKERS) {
+
+                        throw new IllegalStateException(
+                                "Final Phase-3 receivedWorkers metadata is incomplete. Payload="
+                                        + payload
+                        );
+                    }
+                }
+
+                System.out.println(
+                        "Observed GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED:"
+                                + " alias="
+                                + alias
+                                + ", aliasIndex="
+                                + aliasIndex
+                                + ", resultId="
+                                + expectedResultId
+                                + ", stateRef="
+                                + stateRef
+                                + ", selectionCount="
+                                + selectionCount
+                                + ", installedWorkerCount="
+                                + installedWorkerCount
+                                + ", phaseThreeComplete=true"
+                );
+
+                return payload.deepCopy();
+            }
+        }
+
+        throw new IllegalStateException(
+                "Timed out waiting for final GLOBAL_PHASE3_ALIAS_SELECTIONS_INSTALLED."
+                        + " uid="
+                        + uid
+                        + ", alias="
+                        + expectedAlias
+                        + ", aliasIndex="
+                        + expectedAliasIndex
+                        + ", resultId="
+                        + expectedResultId
+                        + ", recordsSeen="
+                        + recordsSeen
+        );
     }
 
 
@@ -2158,6 +3368,122 @@ public final class OnePassSamplerSdeCoordinatorTest {
     }
 
 
+    /**
+     * Phase-3 END_ALIAS marker.
+     *
+     * The production handler requires phase, alias, uid, resultId and
+     * expectedWorkers. The traversal metadata below is also included so the
+     * Kafka trace is self-describing and can be inspected independently.
+     */
+    private static ObjectNode buildPhaseThreeEndAliasDatapoint(
+            String datasetKey,
+            String streamId,
+            int uid,
+            String alias,
+            int epoch,
+            int aliasIndex,
+            int phaseThreeAliasCount,
+            String resultId,
+            int expectedWorkers,
+            String nextAlias) {
+
+        ObjectNode marker =
+                MAPPER.createObjectNode();
+
+        marker.put(
+                "type",
+                "END_ALIAS"
+        );
+
+        marker.put(
+                "synopsisID",
+                SYNOPSIS_ID
+        );
+
+        marker.put(
+                "uid",
+                uid
+        );
+
+        marker.put(
+                "phase",
+                "PHASE3"
+        );
+
+        marker.put(
+                "protocol",
+                "SHARDED_PHASE3_V1"
+        );
+
+        marker.put(
+                "alias",
+                alias
+        );
+
+        marker.put(
+                "phaseThreeAlias",
+                alias
+        );
+
+        marker.put(
+                "epoch",
+                epoch
+        );
+
+        marker.put(
+                "aliasIndex",
+                aliasIndex
+        );
+
+        marker.put(
+                "phaseThreeAliasCount",
+                phaseThreeAliasCount
+        );
+
+        marker.put(
+                "isLastAlias",
+                aliasIndex == phaseThreeAliasCount - 1
+        );
+
+        marker.put(
+                "nextAlias",
+                nextAlias == null
+                        ? ""
+                        : nextAlias
+        );
+
+        marker.put(
+                "resultId",
+                resultId
+        );
+
+        marker.put(
+                "expectedWorkers",
+                expectedWorkers
+        );
+
+        ObjectNode datapoint =
+                MAPPER.createObjectNode();
+
+        datapoint.put(
+                "dataSetkey",
+                datasetKey
+        );
+
+        datapoint.put(
+                "streamID",
+                streamId
+        );
+
+        datapoint.set(
+                "values",
+                marker
+        );
+
+        return datapoint;
+    }
+
+
     // =====================================================================
     // TPC-H -> DATAPOINT PRELOAD
     // =====================================================================
@@ -2486,7 +3812,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // PLAN VALIDATION
     // =====================================================================
 
-    private static void validatePlanForShardedPhaseOneV1(CompiledOnePassPlan plan) {
+    private static void validatePlanForShardedOnePassV1(CompiledOnePassPlan plan) {
 
         if (plan == null) {
             throw new IllegalArgumentException("Compiled plan must not be null");
@@ -2497,18 +3823,65 @@ public final class OnePassSamplerSdeCoordinatorTest {
             throw new IllegalStateException("Compiled plan has empty leafToRootOrder: " + plan);
         }
 
+        if (plan.getRootToLeafOrder() == null || plan.getRootToLeafOrder().isEmpty()) {
+
+            throw new IllegalStateException("Compiled plan has empty rootToLeafOrder: " + plan);
+        }
+
         /*
-         * Every alias processed during Phase 1 is non-root and must therefore
-         * have exactly one parent edge in the rooted join tree.
+         * Every alias processed during Phase 1 and replayed during Phase 3 is
+         * non-root and must therefore have exactly one parent edge in the
+         * rooted join tree.
          *
-         * Multiple CHILD edges are supported by the sharded enrichment path.
+         * Multiple CHILD edges are supported by both sharded enrichment paths.
          */
         for (String alias : plan.getLeafToRootOrder()) {
 
             if (plan.getParentEdge(alias) == null) {
 
-                throw new IllegalStateException("Phase-1 alias has no parent edge: " + alias);
+                throw new IllegalStateException(
+                        "Non-root alias has no parent edge: "
+                                + alias
+                );
             }
+        }
+
+        List<String> phaseThreeOrder =
+                phaseThreeAliasOrder(
+                        plan
+                );
+
+        if (phaseThreeOrder.size() != plan.getLeafToRootOrder().size()) {
+
+            throw new IllegalStateException(
+                    "Phase-1/Phase-3 non-root alias-count mismatch."
+                            + " leafToRoot="
+                            + plan.getLeafToRootOrder()
+                            + ", phaseThreeOrder="
+                            + phaseThreeOrder
+            );
+        }
+
+        for (String alias : plan.getLeafToRootOrder()) {
+
+            if (!phaseThreeOrder.contains(alias)) {
+
+                throw new IllegalStateException(
+                        "Phase-3 replay order does not contain Phase-1 alias "
+                                + alias
+                                + ". phaseThreeOrder="
+                                + phaseThreeOrder
+                );
+            }
+        }
+
+        if (RUN_PHASE_3 && EXPECTED_WORKERS <= 1) {
+
+            throw new IllegalStateException(
+                    "The production SHARDED_PHASE3_V1 path requires expectedWorkers > 1."
+                            + " Configured workers="
+                            + EXPECTED_WORKERS
+            );
         }
     }
 
@@ -2710,6 +4083,185 @@ public final class OnePassSamplerSdeCoordinatorTest {
     }
 
 
+    private static void printPhaseThreeBenchmarkSummary(
+            CompiledOnePassPlan plan,
+            List<String> phaseThreeOrder,
+            long preloadNanos,
+            JsonNode finalCompletion) {
+
+        double preloadSeconds =
+                preloadNanos / 1_000_000_000.0d;
+
+        double algorithmSeconds =
+                secondsFor(
+                        "phase3_algorithm_total"
+                );
+
+        long rows =
+                countFor(
+                        "phase3_rows_replayed"
+                );
+
+        int selectionCount =
+                intField(
+                        finalCompletion,
+                        "selectionCount",
+                        -1
+                );
+
+        int installedWorkerCount =
+                intField(
+                        finalCompletion,
+                        "installedWorkerCount",
+                        -1
+                );
+
+        System.out.println();
+        System.out.println("=== Sharded OnePass* Phase 3 benchmark ===");
+
+        System.out.printf(
+                "%-42s %12.3f s  [OUTSIDE TIMER]%n",
+                "phase3_kafka_preload",
+                preloadSeconds
+        );
+
+        System.out.printf(
+                "%-42s %12.3f s%n",
+                "phase3_algorithm_total",
+                algorithmSeconds
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase3_rows_replayed",
+                rows
+        );
+
+        System.out.printf(
+                "%-42s %12.3f rows/s%n",
+                "phase3_algorithm_rows_per_sec",
+                rowsPerSecond(
+                        rows,
+                        algorithmSeconds
+                )
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase3_selection_count",
+                selectionCount
+        );
+
+        System.out.printf(
+                "%-42s %12d%n",
+                "phase3_installed_worker_count",
+                installedWorkerCount
+        );
+
+        System.out.println();
+        System.out.println("Per-alias Phase-3 algorithm timings:");
+
+        for (String alias : phaseThreeOrder) {
+
+            long aliasRows =
+                    countFor(
+                            "phase3_alias_"
+                                    + alias
+                                    + "_rows_replayed"
+                    );
+
+            double aliasAlgorithm =
+                    secondsFor(
+                            "phase3_alias_"
+                                    + alias
+                                    + "_algorithm"
+                    );
+
+            System.out.println(
+                    "  alias="
+                            + alias
+                            + ", rows="
+                            + aliasRows
+                            + ", algorithm_s="
+                            + aliasAlgorithm
+                            + ", rows_per_s="
+                            + rowsPerSecond(
+                            aliasRows,
+                            aliasAlgorithm
+                    )
+            );
+        }
+
+        System.out.println(
+                "finalAlias="
+                        + textField(
+                        finalCompletion,
+                        "alias",
+                        ""
+                )
+                        + ", stateRef="
+                        + textField(
+                        finalCompletion,
+                        "stateRef",
+                        ""
+                )
+                        + ", phaseThreeComplete="
+                        + booleanField(
+                        finalCompletion,
+                        "phaseThreeComplete",
+                        false
+                )
+        );
+
+        System.out.println("===========================================");
+        System.out.println();
+    }
+
+
+    private static Map<String, Long> phaseThreeAliasRowsMap(
+            CompiledOnePassPlan plan) {
+
+        Map<String, Long> out =
+                new LinkedHashMap<String, Long>();
+
+        for (String alias : phaseThreeAliasOrder(plan)) {
+
+            out.put(
+                    alias,
+                    countFor(
+                            "phase3_alias_"
+                                    + alias
+                                    + "_rows_replayed"
+                    )
+            );
+        }
+
+        return out;
+    }
+
+
+    private static Map<String, Double> phaseThreeAliasAlgorithmSecondsMap(
+            CompiledOnePassPlan plan) {
+
+        Map<String, Double> out =
+                new LinkedHashMap<String, Double>();
+
+        for (String alias : phaseThreeAliasOrder(plan)) {
+
+            out.put(
+                    alias,
+                    secondsFor(
+                            "phase3_alias_"
+                                    + alias
+                                    + "_algorithm"
+                    )
+            );
+        }
+
+        return out;
+    }
+
+
     private static void writePhaseTwoBenchmarkCsv(CompiledOnePassPlan plan, long rootRows, long preloadNanos, JsonNode ready, JsonNode installed, String implementation) throws Exception {
 
         if (!WRITE_LEGACY_SEPARATE_BENCHMARK_CSV) {
@@ -2765,8 +4317,103 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
 
 
+    private static String combinedBenchmarkHeader() {
+
+        return "workers,"
+                + "query,"
+                + "test_row_limit,"
+                + "sample_size,"
+                + "phase1_algorithm_total_s,"
+                + "phase1_alias_algorithm_s,"
+                + "phase2_algorithm_total_s,"
+                + "phase3_algorithm_total_s,"
+                + "phase3_alias_algorithm_s,"
+                + "full_algorithm_time_s,"
+                + "timestamp_ms,"
+                + "implementation,"
+                + "seed,"
+                + "root_alias,"
+                + "leaf_to_root_order,"
+                + "phase3_root_to_leaf_order,"
+                + "phase1_rows_processed,"
+                + "phase1_kafka_preload_s,"
+                + "phase1_algorithm_rows_per_sec,"
+                + "phase1_alias_rows_processed,"
+                + "root_child_edge_count,"
+                + "phase2_root_rows_processed,"
+                + "phase2_root_tuples_seen,"
+                + "phase2_positive_root_candidates_seen,"
+                + "phase2_total_root_group_weight,"
+                + "phase2_sample_instance_count,"
+                + "phase2_installed_worker_count,"
+                + "phase2_root_kafka_preload_s,"
+                + "phase2_algorithm_rows_per_sec,"
+                + "phase2_state_ref,"
+                + "phase3_rows_replayed,"
+                + "phase3_kafka_preload_s,"
+                + "phase3_algorithm_rows_per_sec,"
+                + "phase3_alias_rows_replayed,"
+                + "phase3_final_alias,"
+                + "phase3_final_state_ref,"
+                + "phase3_selection_count,"
+                + "phase3_installed_worker_count";
+    }
+
+
     /**
-     * Writes exactly one row for a completed Phase-1 + Phase-2 run.
+     * Prevents silently appending the new Phase-3 benchmark row shape below an
+     * older Phase-1 + Phase-2-only CSV header.
+     */
+    private static void validateCombinedBenchmarkCsvSchema() throws Exception {
+
+        File csvFile =
+                new File(
+                        COMBINED_BENCHMARK_CSV_PATH
+                );
+
+        if (!csvFile.isFile()
+                || csvFile.length() == 0L) {
+
+            return;
+        }
+
+        BufferedReader reader =
+                new BufferedReader(
+                        new FileReader(
+                                csvFile
+                        )
+                );
+
+        String existingHeader;
+
+        try {
+
+            existingHeader =
+                    reader.readLine();
+
+        } finally {
+
+            reader.close();
+        }
+
+        String expectedHeader =
+                combinedBenchmarkHeader();
+
+        if (!expectedHeader.equals(existingHeader)) {
+
+            throw new IllegalStateException(
+                    "Existing combined benchmark CSV has a different schema: "
+                            + csvFile.getAbsolutePath()
+                            + ". The Phase-3-enabled test adds Phase-3 timing and "
+                            + "completion columns. Move/delete the old CSV or use "
+                            + "-Donepass.combinedCsv=<new-path> before running."
+            );
+        }
+    }
+
+
+    /**
+     * Writes exactly one row for a completed OnePass run.
      *
      * Main comparison fields are always populated:
      *
@@ -2777,14 +4424,15 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * phase1_algorithm_total_s
      * phase1_alias_algorithm_s
      * phase2_algorithm_total_s
+     * phase3_algorithm_total_s
+     * phase3_alias_algorithm_s
      * full_algorithm_time_s
      *
-     * full_algorithm_time_s is deliberately the sum of the measured algorithm
-     * phases only. Kafka/TPC-H preload work remains excluded, matching the
-     * existing timing semantics.
+     * full_algorithm_time_s is deliberately the sum of measured algorithm
+     * phases only. Kafka/TPC-H preload work remains excluded.
      *
-     * If WRITE_DETAILED_BENCHMARK_DATA=true, the old detailed graphing metrics
-     * are populated as additional columns in the same row/file.
+     * When RUN_PHASE_3=false the Phase-3 timings are zero / empty and the row
+     * represents a Phase-1 + Phase-2-only run.
      */
     private static void writeCombinedBenchmarkCsv(
             CompiledOnePassPlan plan,
@@ -2793,128 +4441,246 @@ public final class OnePassSamplerSdeCoordinatorTest {
             long phaseTwoPreloadNanos,
             JsonNode ready,
             JsonNode installed,
+            long phaseThreePreloadNanos,
+            JsonNode finalPhaseThreeCompletion,
             String implementation) throws Exception {
 
         if (!WRITE_COMBINED_BENCHMARK_CSV) {
             return;
         }
 
-        File csvFile = new File(COMBINED_BENCHMARK_CSV_PATH);
+        File csvFile =
+                new File(
+                        COMBINED_BENCHMARK_CSV_PATH
+                );
 
-        File parent = csvFile.getParentFile();
+        File parent =
+                csvFile.getParentFile();
 
-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+        if (parent != null
+                && !parent.exists()
+                && !parent.mkdirs()) {
+
             throw new IllegalStateException(
                     "Could not create combined benchmark directory: "
                             + parent.getAbsolutePath()
             );
         }
 
-        boolean writeHeader = !csvFile.exists() || csvFile.length() == 0L;
+        boolean writeHeader =
+                !csvFile.exists()
+                        || csvFile.length() == 0L;
 
         // -----------------------------------------------------------------
         // Main comparison metrics.
         // -----------------------------------------------------------------
 
         double phaseOneAlgorithmSeconds =
-                secondsFor("phase1_algorithm_total");
+                secondsFor(
+                        "phase1_algorithm_total"
+                );
 
         double phaseTwoAlgorithmSeconds =
-                secondsFor("phase2_algorithm_total");
+                secondsFor(
+                        "phase2_algorithm_total"
+                );
+
+        boolean phaseThreeCompleted =
+                finalPhaseThreeCompletion != null
+                        && !finalPhaseThreeCompletion.isNull();
+
+        double phaseThreeAlgorithmSeconds =
+                phaseThreeCompleted
+                        ? secondsFor(
+                        "phase3_algorithm_total"
+                )
+                        : 0.0d;
 
         double fullAlgorithmSeconds =
-                phaseOneAlgorithmSeconds + phaseTwoAlgorithmSeconds;
+                phaseOneAlgorithmSeconds
+                        + phaseTwoAlgorithmSeconds
+                        + phaseThreeAlgorithmSeconds;
 
         String phaseOneAliasAlgorithmSeconds =
-                String.valueOf(phaseOneAliasAlgorithmSecondsMap(plan));
+                String.valueOf(
+                        phaseOneAliasAlgorithmSecondsMap(
+                                plan
+                        )
+                );
+
+        String phaseThreeAliasAlgorithmSeconds =
+                phaseThreeCompleted
+                        ? String.valueOf(
+                        phaseThreeAliasAlgorithmSecondsMap(
+                                plan
+                        )
+                )
+                        : "{}";
 
         // -----------------------------------------------------------------
         // Detailed Phase-1 metrics.
         // -----------------------------------------------------------------
 
         double phaseOnePreloadSeconds =
-                phaseOnePreloadNanos / 1_000_000_000.0d;
+                phaseOnePreloadNanos
+                        / 1_000_000_000.0d;
 
         long phaseOneRows =
-                countFor("phase1_rows_processed");
+                countFor(
+                        "phase1_rows_processed"
+                );
 
         double phaseOneRowsPerSecond =
-                rowsPerSecond(phaseOneRows, phaseOneAlgorithmSeconds);
+                rowsPerSecond(
+                        phaseOneRows,
+                        phaseOneAlgorithmSeconds
+                );
 
         String phaseOneAliasRows =
-                String.valueOf(phaseOneAliasRowsMap(plan));
+                String.valueOf(
+                        phaseOneAliasRowsMap(
+                                plan
+                        )
+                );
 
         // -----------------------------------------------------------------
         // Detailed Phase-2 metrics.
         // -----------------------------------------------------------------
 
         double phaseTwoPreloadSeconds =
-                phaseTwoPreloadNanos / 1_000_000_000.0d;
+                phaseTwoPreloadNanos
+                        / 1_000_000_000.0d;
 
         long rootTuplesSeen =
-                longField(ready, "rootTuplesSeen", -1L);
+                longField(
+                        ready,
+                        "rootTuplesSeen",
+                        -1L
+                );
 
         long positiveRootCandidatesSeen =
-                longField(ready, "positiveRootCandidatesSeen", -1L);
+                longField(
+                        ready,
+                        "positiveRootCandidatesSeen",
+                        -1L
+                );
 
         double totalRootGroupWeight =
-                doubleField(ready, "totalRootGroupWeight", 0.0d);
+                doubleField(
+                        ready,
+                        "totalRootGroupWeight",
+                        0.0d
+                );
 
         int sampleInstanceCount =
-                intField(ready, "sampleInstanceCount", -1);
+                intField(
+                        ready,
+                        "sampleInstanceCount",
+                        -1
+                );
 
-        int installedWorkerCount =
-                intField(installed, "installedWorkerCount", -1);
+        int phaseTwoInstalledWorkerCount =
+                intField(
+                        installed,
+                        "installedWorkerCount",
+                        -1
+                );
 
-        String stateRef =
-                textField(ready, "stateRef", "");
+        String phaseTwoStateRef =
+                textField(
+                        ready,
+                        "stateRef",
+                        ""
+                );
 
         double phaseTwoRowsPerSecond =
-                rowsPerSecond(phaseTwoRootRows, phaseTwoAlgorithmSeconds);
+                rowsPerSecond(
+                        phaseTwoRootRows,
+                        phaseTwoAlgorithmSeconds
+                );
+
+        // -----------------------------------------------------------------
+        // Detailed Phase-3 metrics.
+        // -----------------------------------------------------------------
+
+        double phaseThreePreloadSeconds =
+                phaseThreeCompleted
+                        ? phaseThreePreloadNanos
+                        / 1_000_000_000.0d
+                        : 0.0d;
+
+        long phaseThreeRows =
+                phaseThreeCompleted
+                        ? countFor(
+                        "phase3_rows_replayed"
+                )
+                        : 0L;
+
+        double phaseThreeRowsPerSecond =
+                phaseThreeCompleted
+                        ? rowsPerSecond(
+                        phaseThreeRows,
+                        phaseThreeAlgorithmSeconds
+                )
+                        : 0.0d;
+
+        String phaseThreeAliasRows =
+                phaseThreeCompleted
+                        ? String.valueOf(
+                        phaseThreeAliasRowsMap(
+                                plan
+                        )
+                )
+                        : "{}";
+
+        String finalPhaseThreeAlias =
+                phaseThreeCompleted
+                        ? textField(
+                        finalPhaseThreeCompletion,
+                        "alias",
+                        ""
+                )
+                        : "";
+
+        String finalPhaseThreeStateRef =
+                phaseThreeCompleted
+                        ? textField(
+                        finalPhaseThreeCompletion,
+                        "stateRef",
+                        ""
+                )
+                        : "";
+
+        int finalPhaseThreeSelectionCount =
+                phaseThreeCompleted
+                        ? intField(
+                        finalPhaseThreeCompletion,
+                        "selectionCount",
+                        -1
+                )
+                        : -1;
+
+        int finalPhaseThreeInstalledWorkerCount =
+                phaseThreeCompleted
+                        ? intField(
+                        finalPhaseThreeCompletion,
+                        "installedWorkerCount",
+                        -1
+                )
+                        : -1;
 
         FileWriter writer =
-                new FileWriter(csvFile, true);
+                new FileWriter(
+                        csvFile,
+                        true
+                );
 
         try {
 
             if (writeHeader) {
 
-                /*
-                 * Keep the compact comparison columns first.
-                 *
-                 * Detailed columns always remain in the schema so switching
-                 * WRITE_DETAILED_BENCHMARK_DATA between runs cannot corrupt
-                 * the shape of an existing CSV.
-                 */
                 writer.write(
-                        "workers,"
-                                + "query,"
-                                + "test_row_limit,"
-                                + "sample_size,"
-                                + "phase1_algorithm_total_s,"
-                                + "phase1_alias_algorithm_s,"
-                                + "phase2_algorithm_total_s,"
-                                + "full_algorithm_time_s,"
-                                // Optional detailed columns:
-                                + "timestamp_ms,"
-                                + "implementation,"
-                                + "seed,"
-                                + "root_alias,"
-                                + "leaf_to_root_order,"
-                                + "phase1_rows_processed,"
-                                + "phase1_kafka_preload_s,"
-                                + "phase1_algorithm_rows_per_sec,"
-                                + "phase1_alias_rows_processed,"
-                                + "root_child_edge_count,"
-                                + "phase2_root_rows_processed,"
-                                + "phase2_root_tuples_seen,"
-                                + "phase2_positive_root_candidates_seen,"
-                                + "phase2_total_root_group_weight,"
-                                + "phase2_sample_instance_count,"
-                                + "phase2_installed_worker_count,"
-                                + "phase2_root_kafka_preload_s,"
-                                + "phase2_algorithm_rows_per_sec,"
-                                + "state_ref"
+                        combinedBenchmarkHeader()
                                 + System.lineSeparator()
                 );
             }
@@ -2926,14 +4692,67 @@ public final class OnePassSamplerSdeCoordinatorTest {
             // Main fields - always populated.
             // -------------------------------------------------------------
 
-            fields.add(Integer.toString(EXPECTED_WORKERS));
-            fields.add(csv(plan.getQueryName()));
-            fields.add(csv(formatRowLimit(TEST_ROW_LIMIT)));
-            fields.add(Integer.toString(plan.getSampleSize()));
-            fields.add(Double.toString(phaseOneAlgorithmSeconds));
-            fields.add(csv(phaseOneAliasAlgorithmSeconds));
-            fields.add(Double.toString(phaseTwoAlgorithmSeconds));
-            fields.add(Double.toString(fullAlgorithmSeconds));
+            fields.add(
+                    Integer.toString(
+                            EXPECTED_WORKERS
+                    )
+            );
+
+            fields.add(
+                    csv(
+                            plan.getQueryName()
+                    )
+            );
+
+            fields.add(
+                    csv(
+                            formatRowLimit(
+                                    TEST_ROW_LIMIT
+                            )
+                    )
+            );
+
+            fields.add(
+                    Integer.toString(
+                            plan.getSampleSize()
+                    )
+            );
+
+            fields.add(
+                    Double.toString(
+                            phaseOneAlgorithmSeconds
+                    )
+            );
+
+            fields.add(
+                    csv(
+                            phaseOneAliasAlgorithmSeconds
+                    )
+            );
+
+            fields.add(
+                    Double.toString(
+                            phaseTwoAlgorithmSeconds
+                    )
+            );
+
+            fields.add(
+                    Double.toString(
+                            phaseThreeAlgorithmSeconds
+                    )
+            );
+
+            fields.add(
+                    csv(
+                            phaseThreeAliasAlgorithmSeconds
+                    )
+            );
+
+            fields.add(
+                    Double.toString(
+                            fullAlgorithmSeconds
+                    )
+            );
 
             // -------------------------------------------------------------
             // Optional detailed fields - always present in the schema.
@@ -2941,40 +4760,206 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
             if (WRITE_DETAILED_BENCHMARK_DATA) {
 
-                fields.add(Long.toString(System.currentTimeMillis()));
-                fields.add(csv(implementation));
-                fields.add(csv(plan.getDatasetSeed()));
-                fields.add(csv(plan.getRootAlias()));
-                fields.add(csv(String.valueOf(plan.getLeafToRootOrder())));
-                fields.add(Long.toString(phaseOneRows));
-                fields.add(Double.toString(phaseOnePreloadSeconds));
-                fields.add(Double.toString(phaseOneRowsPerSecond));
-                fields.add(csv(phaseOneAliasRows));
-                fields.add(Integer.toString(
-                        plan.getChildEdges(plan.getRootAlias()).size()
-                ));
-                fields.add(Long.toString(phaseTwoRootRows));
-                fields.add(Long.toString(rootTuplesSeen));
-                fields.add(Long.toString(positiveRootCandidatesSeen));
-                fields.add(Double.toString(totalRootGroupWeight));
-                fields.add(Integer.toString(sampleInstanceCount));
-                fields.add(Integer.toString(installedWorkerCount));
-                fields.add(Double.toString(phaseTwoPreloadSeconds));
-                fields.add(Double.toString(phaseTwoRowsPerSecond));
-                fields.add(csv(stateRef));
+                fields.add(
+                        Long.toString(
+                                System.currentTimeMillis()
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                implementation
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                plan.getDatasetSeed()
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                plan.getRootAlias()
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                String.valueOf(
+                                        plan.getLeafToRootOrder()
+                                )
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                String.valueOf(
+                                        phaseThreeAliasOrder(
+                                                plan
+                                        )
+                                )
+                        )
+                );
+
+                fields.add(
+                        Long.toString(
+                                phaseOneRows
+                        )
+                );
+
+                fields.add(
+                        Double.toString(
+                                phaseOnePreloadSeconds
+                        )
+                );
+
+                fields.add(
+                        Double.toString(
+                                phaseOneRowsPerSecond
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                phaseOneAliasRows
+                        )
+                );
+
+                fields.add(
+                        Integer.toString(
+                                plan.getChildEdges(
+                                        plan.getRootAlias()
+                                ).size()
+                        )
+                );
+
+                fields.add(
+                        Long.toString(
+                                phaseTwoRootRows
+                        )
+                );
+
+                fields.add(
+                        Long.toString(
+                                rootTuplesSeen
+                        )
+                );
+
+                fields.add(
+                        Long.toString(
+                                positiveRootCandidatesSeen
+                        )
+                );
+
+                fields.add(
+                        Double.toString(
+                                totalRootGroupWeight
+                        )
+                );
+
+                fields.add(
+                        Integer.toString(
+                                sampleInstanceCount
+                        )
+                );
+
+                fields.add(
+                        Integer.toString(
+                                phaseTwoInstalledWorkerCount
+                        )
+                );
+
+                fields.add(
+                        Double.toString(
+                                phaseTwoPreloadSeconds
+                        )
+                );
+
+                fields.add(
+                        Double.toString(
+                                phaseTwoRowsPerSecond
+                        )
+                );
+
+                fields.add(
+                        csv(
+                                phaseTwoStateRef
+                        )
+                );
+
+                if (phaseThreeCompleted) {
+
+                    fields.add(
+                            Long.toString(
+                                    phaseThreeRows
+                            )
+                    );
+
+                    fields.add(
+                            Double.toString(
+                                    phaseThreePreloadSeconds
+                            )
+                    );
+
+                    fields.add(
+                            Double.toString(
+                                    phaseThreeRowsPerSecond
+                            )
+                    );
+
+                    fields.add(
+                            csv(
+                                    phaseThreeAliasRows
+                            )
+                    );
+
+                    fields.add(
+                            csv(
+                                    finalPhaseThreeAlias
+                            )
+                    );
+
+                    fields.add(
+                            csv(
+                                    finalPhaseThreeStateRef
+                            )
+                    );
+
+                    fields.add(
+                            Integer.toString(
+                                    finalPhaseThreeSelectionCount
+                            )
+                    );
+
+                    fields.add(
+                            Integer.toString(
+                                    finalPhaseThreeInstalledWorkerCount
+                            )
+                    );
+
+                } else {
+
+                    for (int i = 0; i < 8; i++) {
+                        fields.add("");
+                    }
+                }
 
             } else {
 
                 /*
-                 * 19 optional detailed columns.
+                 * 28 optional detailed columns.
                  */
-                for (int i = 0; i < 19; i++) {
+                for (int i = 0; i < 28; i++) {
                     fields.add("");
                 }
             }
 
             writer.write(
-                    String.join(",", fields)
+                    String.join(
+                            ",",
+                            fields
+                    )
                             + System.lineSeparator()
             );
 
@@ -2996,6 +4981,11 @@ public final class OnePassSamplerSdeCoordinatorTest {
         System.out.println(
                 "  phase2_algorithm_total_s = "
                         + phaseTwoAlgorithmSeconds
+        );
+
+        System.out.println(
+                "  phase3_algorithm_total_s = "
+                        + phaseThreeAlgorithmSeconds
         );
 
         System.out.println(
@@ -3089,6 +5079,21 @@ public final class OnePassSamplerSdeCoordinatorTest {
         }
 
         return field.asDouble(defaultValue);
+    }
+
+    private static boolean booleanField(JsonNode node, String fieldName, boolean defaultValue) {
+
+        if (node == null || node.isNull()) {
+            return defaultValue;
+        }
+
+        JsonNode field = node.get(fieldName);
+
+        if (field == null || field.isNull()) {
+            return defaultValue;
+        }
+
+        return field.asBoolean(defaultValue);
     }
 
     private static void configureRuntimeArguments(String[] args) {

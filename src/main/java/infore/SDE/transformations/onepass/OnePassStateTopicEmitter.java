@@ -150,12 +150,12 @@ public final class OnePassStateTopicEmitter
         }
 
         System.out.println("[OnePassStateTopicEmitter] GLOBAL_PHASE2_ROOT_SAMPLE emitted. "
-                        + "uid=" + uid
-                        + ", resultId=" + resultId
-                        + ", stateRef=" + stateRef
-                        + ", sampleInstances=" + sampleInstances.size()
-                        + ", kafkaChunks=" + chunkCount
-                        + ", logicalWorkers=" + expectedWorkers);
+                + "uid=" + uid
+                + ", resultId=" + resultId
+                + ", stateRef=" + stateRef
+                + ", sampleInstances=" + sampleInstances.size()
+                + ", kafkaChunks=" + chunkCount
+                + ", logicalWorkers=" + expectedWorkers);
     }
 
     private void emitPhaseThreeAliasSelections(Estimation value, JsonNode payload, Collector<String> out) throws Exception {
@@ -191,8 +191,8 @@ public final class OnePassStateTopicEmitter
         int selectionCount = intField(payload, "selectionCount", selections.size());
         if (sampleSize <= 0 || selectionCount != sampleSize || selections.size() != selectionCount) {
             throw new IllegalStateException("Invalid global Phase-3 selection metadata. sampleSize="
-                            + sampleSize + ", selectionCount=" + selectionCount
-                            + ", entries=" + selections.size());
+                    + sampleSize + ", selectionCount=" + selectionCount
+                    + ", entries=" + selections.size());
         }
 
         List<ChunkRange> ranges = buildChunkRanges(selections);
@@ -234,13 +234,13 @@ public final class OnePassStateTopicEmitter
         }
 
         System.out.println("[OnePassStateTopicEmitter] GLOBAL_PHASE3_ALIAS_SELECTIONS emitted. "
-                        + "uid=" + uid
-                        + ", alias=" + alias
-                        + ", resultId=" + resultId
-                        + ", stateRef=" + stateRef
-                        + ", selections=" + selectionCount
-                        + ", kafkaChunks=" + chunkCount
-                        + ", logicalWorkers=" + expectedWorkers);
+                + "uid=" + uid
+                + ", alias=" + alias
+                + ", resultId=" + resultId
+                + ", stateRef=" + stateRef
+                + ", selections=" + selectionCount
+                + ", kafkaChunks=" + chunkCount
+                + ", logicalWorkers=" + expectedWorkers);
     }
 
     private List<ChunkRange> buildChunkRanges(JsonNode entries) {

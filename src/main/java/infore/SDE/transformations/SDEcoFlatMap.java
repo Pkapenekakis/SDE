@@ -169,7 +169,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				//Radius_Grid rg = (Radius_Grid)c_ski;
 				//rg.add_and_provide_estimates(node);
 			}
-		MC_Synopses.put(node.getKey(),C_Synopses);
+			MC_Synopses.put(node.getKey(),C_Synopses);
 		}
 		//System.out.println("[SDEcoFlatMap] flatMap1 got datapoint key=" + node.getKey());
 	}
@@ -221,201 +221,201 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				C_Synopses = new ArrayList<>();
 			}
 
-		Synopsis sketch = null;
-		switch (rq.getSynopsisID()) {
-			// countMin
-			case 1:
-				if (rq.getParam().length > 4)
-					sketch = new CountMin(rq.getUID(), rq.getParam());
-				//{ "1", "2", "0.0002", "0.99", "4" };
-				Synopses.add(sketch);
-			break;
-			// BloomFliter
-			case 2:
-				if (rq.getParam().length > 3)
+			Synopsis sketch = null;
+			switch (rq.getSynopsisID()) {
+				// countMin
+				case 1:
+					if (rq.getParam().length > 4)
+						sketch = new CountMin(rq.getUID(), rq.getParam());
+					//{ "1", "2", "0.0002", "0.99", "4" };
+					Synopses.add(sketch);
+					break;
+				// BloomFliter
+				case 2:
+					if (rq.getParam().length > 3)
+						sketch = new Bloomfilter(rq.getUID(), rq.getParam());
+					//	String[] _tmp = { "1", "1", "100000", "0.0002" };
+					Synopses.add(sketch);
+					break;
+				// AMS sketch
+				case 3:
+					if (rq.getParam().length > 3)
+						sketch = new AMSsynopsis(rq.getUID(), rq.getParam());
+					//	String[] _tmp = { "1", "2", "1000", "10" };
+					Synopses.add(sketch);
+					break;
+				// DFT
+				case 4:
+					if (rq.getParam().length > 3)
+						sketch = new MultySynopsisDFT(rq.getUID(), rq.getParam());
+					//String[] _tmp = {"1", "2", "5", "30", "8"};
+					Synopses.add(sketch);
+					break;
+				//LSH - unfinished
+				case 5:
 					sketch = new Bloomfilter(rq.getUID(), rq.getParam());
-				//	String[] _tmp = { "1", "1", "100000", "0.0002" };
-				Synopses.add(sketch);
-			break;
-			// AMS sketch
-			case 3:
-				if (rq.getParam().length > 3)
-					sketch = new AMSsynopsis(rq.getUID(), rq.getParam());
-				//	String[] _tmp = { "1", "2", "1000", "10" };
-				Synopses.add(sketch);
-			break;
-			// DFT
-			case 4:
-				if (rq.getParam().length > 3)
-					sketch = new MultySynopsisDFT(rq.getUID(), rq.getParam());
-				//String[] _tmp = {"1", "2", "5", "30", "8"};
-				Synopses.add(sketch);
-			break;
-			//LSH - unfinished
-			case 5:
-				sketch = new Bloomfilter(rq.getUID(), rq.getParam());
-				Synopses.add(sketch);
+					Synopses.add(sketch);
 
-			break;
-			// lib.Coresets
-			case 6:
-				if (rq.getParam().length > 10)
-					sketch = new FinJoinCoresets(rq.getUID(), rq.getParam());
-				//	String[] _tmp = { "1","2", "5", "10" };
-				Synopses.add(sketch);
-			break;
-			// HyperLogLog
-			case 7:
-				if (rq.getParam().length > 2)
-					sketch = new HyperLogLogSynopsis(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "1", "1", "0.001" };
-				Synopses.add(sketch);
-			break;
-			// StickySampling
-			case 8:
+					break;
+				// lib.Coresets
+				case 6:
+					if (rq.getParam().length > 10)
+						sketch = new FinJoinCoresets(rq.getUID(), rq.getParam());
+					//	String[] _tmp = { "1","2", "5", "10" };
+					Synopses.add(sketch);
+					break;
+				// HyperLogLog
+				case 7:
+					if (rq.getParam().length > 2)
+						sketch = new HyperLogLogSynopsis(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "1", "1", "0.001" };
+					Synopses.add(sketch);
+					break;
+				// StickySampling
+				case 8:
 
-				if (rq.getParam().length > 4)
-					sketch = new StickySamplingSynopsis(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "1", "2", "0.01", "0.01", "0.0001"};
-				Synopses.add(sketch);
-			break;
-			// LossyCounting
-			case 9:
+					if (rq.getParam().length > 4)
+						sketch = new StickySamplingSynopsis(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "1", "2", "0.01", "0.01", "0.0001"};
+					Synopses.add(sketch);
+					break;
+				// LossyCounting
+				case 9:
 
-				if (rq.getParam().length > 2)
-					sketch = new LossyCountingSynopsis(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "1", "2", "0.0001" };
+					if (rq.getParam().length > 2)
+						sketch = new LossyCountingSynopsis(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "1", "2", "0.0001" };
 
-				Synopses.add(sketch);
-			break;
-			// ChainSampler
-			case 10:
+					Synopses.add(sketch);
+					break;
+				// ChainSampler
+				case 10:
 
-				if (rq.getParam().length > 3)
-					sketch = new ChainSamplerSynopsis(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "2", "2", "1000", "100000" };
-				Synopses.add(sketch);
-			break;
-			// GKQuantiles
-			case 11:
+					if (rq.getParam().length > 3)
+						sketch = new ChainSamplerSynopsis(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "2", "2", "1000", "100000" };
+					Synopses.add(sketch);
+					break;
+				// GKQuantiles
+				case 11:
 
-				if (rq.getParam().length > 3)
-					sketch = new GKsynopsis(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "2", "2", "0.01"};
-				Synopses.add(sketch);
-			break;
-			// lib.TopK
-			case 13:
-				if (rq.getParam().length > 3)
-					sketch = new SynopsisTopK(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "2", "2", "0.01"};
-				Synopses.add(sketch);
-				System.out.println("Synopses Added");
-			break;
-			// windowQuantiles
-			case 16:
-				if (rq.getParam().length > 3)
-					sketch = new windowQuantiles(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "2", "2", "0.01"};
-				Synopses.add(sketch);
-			break;
-			// 6-> dynamic load sketch
-			case 25:
+					if (rq.getParam().length > 3)
+						sketch = new GKsynopsis(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "2", "2", "0.01"};
+					Synopses.add(sketch);
+					break;
+				// lib.TopK
+				case 13:
+					if (rq.getParam().length > 3)
+						sketch = new SynopsisTopK(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "2", "2", "0.01"};
+					Synopses.add(sketch);
+					System.out.println("Synopses Added");
+					break;
+				// windowQuantiles
+				case 16:
+					if (rq.getParam().length > 3)
+						sketch = new windowQuantiles(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "2", "2", "0.01"};
+					Synopses.add(sketch);
+					break;
+				// 6-> dynamic load sketch
+				case 25:
 
-				Object instance;
+					Object instance;
 
-				if (rq.getParam().length == 4) {
+					if (rq.getParam().length == 4) {
 
-					File myJar = new File(rq.getParam()[2]);
-					URLClassLoader child = new URLClassLoader(new URL[]{myJar.toURI().toURL()},
-					this.getClass().getClassLoader());
-					Class<?> classToLoad = Class.forName(rq.getParam()[3], true, child);
-					instance = classToLoad.getConstructor().newInstance();
-					Synopses.add((Synopsis) instance);
+						File myJar = new File(rq.getParam()[2]);
+						URLClassLoader child = new URLClassLoader(new URL[]{myJar.toURI().toURL()},
+								this.getClass().getClassLoader());
+						Class<?> classToLoad = Class.forName(rq.getParam()[3], true, child);
+						instance = classToLoad.getConstructor().newInstance();
+						Synopses.add((Synopsis) instance);
 
-				} else {
+					} else {
 
-					File myJar = new File("C:\\Users\\ado.kontax\\Desktop\\flinkSketches.jar");
-					URLClassLoader child = new URLClassLoader(new URL[]{myJar.toURI().toURL()},
-					this.getClass().getClassLoader());
-					Class<?> classToLoad = Class.forName("com.yahoo.sketches.sampling.NewSketch", true, child);
-					instance = classToLoad.getConstructor().newInstance();
-					Synopses.add((Synopsis) instance);
+						File myJar = new File("C:\\Users\\ado.kontax\\Desktop\\flinkSketches.jar");
+						URLClassLoader child = new URLClassLoader(new URL[]{myJar.toURI().toURL()},
+								this.getClass().getClassLoader());
+						Class<?> classToLoad = Class.forName("com.yahoo.sketches.sampling.NewSketch", true, child);
+						instance = classToLoad.getConstructor().newInstance();
+						Synopses.add((Synopsis) instance);
 
-				}
-			break;
-			// FINJOIN
-			case 26:
+					}
+					break;
+				// FINJOIN
+				case 26:
 
-				if (rq.getParam().length > 3)
-					sketch = new FinJoinSynopsis(rq.getUID(), rq.getParam());
-				//String[] _tmp = { "0", "0", "10", "100", "8", "3" };
-				Synopses.add(sketch);
+					if (rq.getParam().length > 3)
+						sketch = new FinJoinSynopsis(rq.getUID(), rq.getParam());
+					//String[] _tmp = { "0", "0", "10", "100", "8", "3" };
+					Synopses.add(sketch);
 
-			break;
-			// COUNT
-			case 27:
+					break;
+				// COUNT
+				case 27:
 
-				if (rq.getParam().length > 3)
-					sketch = new Counters(rq.getUID(), rq.getParam());
-				else {
-					String[] _tmp = {"0", "0", "10", "100", "8", "3"};
-					sketch = new Counters(rq.getUID(), _tmp);
-				}
-				Synopses.add(sketch);
-			break;
-			//window lsh
-			case 28:
-				System.out.println("ADD-> _ " +rq.toString());
-				if (rq.getParam().length > 3)
-					sketch = new WLSHSynopses(rq.getUID(), rq.getParam());
+					if (rq.getParam().length > 3)
+						sketch = new Counters(rq.getUID(), rq.getParam());
+					else {
+						String[] _tmp = {"0", "0", "10", "100", "8", "3"};
+						sketch = new Counters(rq.getUID(), _tmp);
+					}
+					Synopses.add(sketch);
+					break;
+				//window lsh
+				case 28:
+					System.out.println("ADD-> _ " +rq.toString());
+					if (rq.getParam().length > 3)
+						sketch = new WLSHSynopses(rq.getUID(), rq.getParam());
 
-				Synopses.add(sketch);
-			break;
-			//window pastDFT
-			case 29:
-				System.out.println("ADD-> _ " +rq.toString());
-				if (rq.getParam().length > 3)
-					sketch = new PastDFTSynopsis(rq.getUID(), rq.getParam());
-				Synopses.add(sketch);
-				break;
-			//One-Pass
-			case 30:
-				System.out.println("ADD -> OnePassSamplerSdeSynopsis " + rq.toString());
-				sketch = new OnePassSamplerSdeSynopsis(rq.getUID(), rq);
-				Synopses.add(sketch);
+					Synopses.add(sketch);
+					break;
+				//window pastDFT
+				case 29:
+					System.out.println("ADD-> _ " +rq.toString());
+					if (rq.getParam().length > 3)
+						sketch = new PastDFTSynopsis(rq.getUID(), rq.getParam());
+					Synopses.add(sketch);
+					break;
+				//One-Pass
+				case 30:
+					System.out.println("ADD -> OnePassSamplerSdeSynopsis " + rq.toString());
+					sketch = new OnePassSamplerSdeSynopsis(rq.getUID(), rq);
+					Synopses.add(sketch);
 
-				registerOnePassTupleGate((OnePassSamplerSdeSynopsis) sketch);
+					registerOnePassTupleGate((OnePassSamplerSdeSynopsis) sketch);
 
-				int expectedWorkers = rq.getNoOfP() > 0 ? rq.getNoOfP() : 1;
-				String baseKey = OnePassShardOwnership.baseKeyFromWorkerKey(rq.getKey(), expectedWorkers, pId);
+					int expectedWorkers = rq.getNoOfP() > 0 ? rq.getNoOfP() : 1;
+					String baseKey = OnePassShardOwnership.baseKeyFromWorkerKey(rq.getKey(), expectedWorkers, pId);
 
-				onePassExpectedWorkersByUid.put(rq.getUID(), expectedWorkers);
-				onePassBaseKeyByUid.put(rq.getUID(), baseKey);
-				onePassPhaseOneEpochByUid.put(rq.getUID(), 1);
+					onePassExpectedWorkersByUid.put(rq.getUID(), expectedWorkers);
+					onePassBaseKeyByUid.put(rq.getUID(), baseKey);
+					onePassPhaseOneEpochByUid.put(rq.getUID(), 1);
 
-				System.out.println("OnePassSamplerSdeSynopsis added for uid=" + rq.getUID() + ", key=" +
-						rq.getKey() + ", initialAllowedAlias=" + onePassTupleBufferGate.getAllowedAlias(rq.getUID()));
+					System.out.println("OnePassSamplerSdeSynopsis added for uid=" + rq.getUID() + ", key=" +
+							rq.getKey() + ", initialAllowedAlias=" + onePassTupleBufferGate.getAllowedAlias(rq.getUID()));
 
-				break;
-			case 31:
-				System.out.println("ADD -> OnePassPhaseOne " + rq.toString());
+					break;
+				case 31:
+					System.out.println("ADD -> OnePassPhaseOne " + rq.toString());
 
-				OnePassParams params = OnePassRequestParser.parse(rq);
-				CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
+					OnePassParams params = OnePassRequestParser.parse(rq);
+					CompiledOnePassPlan plan = CompiledOnePassPlan.from(params);
 
-				sketch = new OnePassPhaseOne(rq.getUID(), plan, params.getWeight());
-				Synopses.add(sketch);
+					sketch = new OnePassPhaseOne(rq.getUID(), plan, params.getWeight());
+					Synopses.add(sketch);
 
-				System.out.println("OnePassPhaseOne added for uid=" + rq.getUID() + ", key=" + rq.getKey() +
-						", queryName=" + params.getQueryName());
+					System.out.println("OnePassPhaseOne added for uid=" + rq.getUID() + ", key=" + rq.getKey() +
+							", queryName=" + params.getQueryName());
 
-				break;
-		}
+					break;
+			}
 			M_Synopses.put(rq.getKey(),Synopses);
 		}
-	//Continuous Synopsis
-	else if(rq.getRequestID() == 5) {
+		//Continuous Synopsis
+		else if(rq.getRequestID() == 5) {
 
 			if (C_Synopses == null){
 				C_Synopses = new ArrayList<>();
@@ -427,8 +427,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				case 1:
 					if (rq.getParam().length > 4)
 						sketch = new ContinuousCM(rq.getUID(), rq, rq.getParam());
-						//String[] _tmp = { "StockID", "Volume", "0.0002", "0.99", "4" };
-						C_Synopses.add(sketch);
+					//String[] _tmp = { "StockID", "Volume", "0.0002", "0.99", "4" };
+					C_Synopses.add(sketch);
 					MC_Synopses.put(rq.getKey(), C_Synopses);
 					break;
 				// RadiusSketch
@@ -665,7 +665,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 	}
 	public void open(Configuration config)  {
-	 	pId = getRuntimeContext().getIndexOfThisSubtask();
+		pId = getRuntimeContext().getIndexOfThisSubtask();
 	}
 
 	private static String textField(JsonNode node, String fieldName, String defaultValue) {
@@ -1260,10 +1260,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				}
 
 				System.out.println("[OnePass PHASE3 END_ALIAS DEFERRED] uid=" + uid
-								+ ", alias=" + alias
-								+ ", active="
-								+ onePass.getShardedPhaseThreeActiveAlias()
-								+ ", worker=" + pId);
+						+ ", alias=" + alias
+						+ ", active="
+						+ onePass.getShardedPhaseThreeActiveAlias()
+						+ ", worker=" + pId);
 				return;
 			}
 
@@ -1399,7 +1399,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		//1. Remove the actual OnePass synopsis.
 		if (synopses != null) {
-            synopses.removeIf(synopsis -> synopsis instanceof OnePassSamplerSdeSynopsis
+			synopses.removeIf(synopsis -> synopsis instanceof OnePassSamplerSdeSynopsis
 					&& synopsis.getSynopsisID() == uid);
 
 			if (synopses.isEmpty()) {
@@ -1414,10 +1414,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		//4. Remove deferred END_ALIAS.
 		String pendingPrefix = uid + "|";
-        pendingOnePassEndAliasByUidAlias.keySet().removeIf(key -> key.startsWith(pendingPrefix));
+		pendingOnePassEndAliasByUidAlias.keySet().removeIf(key -> key.startsWith(pendingPrefix));
 
 		//5. Remove END_ALIAS deduplication state.
-        processedOnePassEndAliasMarkers.removeIf(key -> key.startsWith(pendingPrefix));
+		processedOnePassEndAliasMarkers.removeIf(key -> key.startsWith(pendingPrefix));
 
 		onePassPhaseOneTransferBuffer.clearUid(uid);
 		onePassPhaseOneCompletionTracker.clearUid(uid);
@@ -1706,7 +1706,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 						Integer.toString(ready.epoch),
 						Integer.toString(pId),
 						Integer.toString(ready.expectedWorkers)},
-						ready.expectedWorkers));
+				ready.expectedWorkers));
 	}
 
 	private boolean isOnePassShardedPhaseOneTransitionRequest(Request request) {
@@ -1897,7 +1897,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		CompiledOnePassPlan.DirectedJoinEdge childEdge = childEdges.get(childIndex);
 		JoinValue lookupKey = JoinValue.fromTuple(tuple, childEdge.getParentFields()
-				);
+		);
 		int targetWorker = OnePassShardOwnership.ownerForEdgeKey(childEdge.getEdgeId(), lookupKey, expectedWorkers);
 
 		if (targetWorker == pId) {
@@ -2247,8 +2247,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		 * has consumed START_PHASE_2.
 		 */
 		if (!onePass.isShardedPhaseTwoActive()) {
-            List<JsonNode> pending = pendingOnePassPhaseTwoStateByUid.computeIfAbsent(uid, k -> new ArrayList<JsonNode>());
-            pending.add(payload.deepCopy());
+			List<JsonNode> pending = pendingOnePassPhaseTwoStateByUid.computeIfAbsent(uid, k -> new ArrayList<JsonNode>());
+			pending.add(payload.deepCopy());
 			System.out.println("[OnePass PHASE2 STATE DEFERRED]" + " uid=" + uid + ", type=" +
 					textField(payload, "type", "") + ", worker=" + pId + ", pending=" + pending.size());
 
@@ -2798,7 +2798,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		processPendingOnePassEndAlias(uid, alias, synopses, collector);
 
 		System.out.println("[OnePass SHARDED PHASE3 START] uid=" + uid + ", worker=" + pId + ", alias=" + alias +
-						", aliasIndex=" + aliasIndex + ", released=" + released.size());
+				", aliasIndex=" + aliasIndex + ", released=" + released.size());
 	}
 
 	private void processShardedPhaseThreeTuple(OnePassSamplerSdeSynopsis onePass, JsonNode payload, Collector<Estimation> collector) {
@@ -2959,14 +2959,14 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		if (!onePass.isShardedPhaseThreeActive() || !alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
 
-            List<JsonNode> pending = pendingOnePassPhaseThreeStateByUid.computeIfAbsent(uid, k -> new ArrayList<JsonNode>());
-            pending.add(payload.deepCopy());
+			List<JsonNode> pending = pendingOnePassPhaseThreeStateByUid.computeIfAbsent(uid, k -> new ArrayList<JsonNode>());
+			pending.add(payload.deepCopy());
 
 			System.out.println("[OnePass PHASE3 STATE DEFERRED] uid=" + uid
-							+ ", alias=" + alias
-							+ ", type=" + textField(payload, "type", "")
-							+ ", worker=" + pId
-							+ ", pending=" + pending.size());
+					+ ", alias=" + alias
+					+ ", type=" + textField(payload, "type", "")
+					+ ", worker=" + pId
+					+ ", pending=" + pending.size());
 			return;
 		}
 
@@ -3159,7 +3159,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		collector.collect(local);
 
 		System.out.println("[OnePass LOCAL_PHASE3_ALIAS_SELECTIONS] uid=" + uid + ", worker=" + pId + ", alias=" + alias +
-						", resultId=" + resultId + ", aliasIndex=" + aliasIndex + ", isLastAlias=" + isLastAlias);
+				", resultId=" + resultId + ", aliasIndex=" + aliasIndex + ", isLastAlias=" + isLastAlias);
 	}
 
 	private boolean isOnePassPhaseThreeAliasSelectionsChunk(Datapoint node) {
@@ -3194,10 +3194,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			return;
 		}
 
-        Map<Integer, JsonNode> chunks = onePassStateChunksByRef.
+		Map<Integer, JsonNode> chunks = onePassStateChunksByRef.
 				computeIfAbsent(stateRef, k -> new HashMap<Integer, JsonNode>());
 
-        for (JsonNode existingChunk : chunks.values()) {
+		for (JsonNode existingChunk : chunks.values()) {
 			if (intField(existingChunk, "chunkCount", -1) != chunkCount) {
 				throw new IllegalStateException("Conflicting Phase-3 chunkCount for stateRef=" + stateRef);
 			}
@@ -3347,7 +3347,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		if (sampleSize <= 0 || selectionCount != sampleSize) {
 			throw new IllegalStateException("Invalid Phase-3 global selection metadata. sampleSize="
-							+ sampleSize + ", selectionCount=" + selectionCount);
+					+ sampleSize + ", selectionCount=" + selectionCount);
 		}
 
 		List<String> order = phaseThreeAliasOrder(onePass.getPlan());
@@ -3414,12 +3414,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				expectedWorkers));
 
 		System.out.println("[OnePass PHASE3 ALIAS SELECTIONS INSTALLED] uid=" + uid
-						+ ", worker=" + pId
-						+ ", alias=" + alias
-						+ ", stateRef=" + stateRef
-						+ ", selectionCount=" + selectionCount
-						+ ", phaseThreeComplete=" + isLastAlias
-						+ ", lifecycle=" + installSummary.get("phase"));
+				+ ", worker=" + pId
+				+ ", alias=" + alias
+				+ ", stateRef=" + stateRef
+				+ ", selectionCount=" + selectionCount
+				+ ", phaseThreeComplete=" + isLastAlias
+				+ ", lifecycle=" + installSummary.get("phase"));
 	}
 
 	private static List<String> phaseThreeAliasOrder(CompiledOnePassPlan plan) {

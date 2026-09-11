@@ -45,7 +45,7 @@ public final class OnePassPhaseThreeEnrichmentBuffer implements Serializable {
             new HashMap<String, Integer>();
 
     public OnePassPhaseThreeEnrichmentBuffer() {this(Integer.getInteger("sde.onepass.phase3.enrichBatchEntries", 256),
-                Integer.getInteger("sde.onepass.phase3.enrichBatchBytes", 256 * 1024));
+            Integer.getInteger("sde.onepass.phase3.enrichBatchBytes", 256 * 1024));
     }
 
     public OnePassPhaseThreeEnrichmentBuffer(int maxEntriesPerBatch, int maxApproxBytesPerBatch) {
