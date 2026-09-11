@@ -113,6 +113,10 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			handleOnePassPhaseThreeAliasSelectionsChunk(node, Synopses, collector);
 			return;
 		}
+		if (isOnePassPhaseThreeStateTransfer(node)) {
+			handleOnePassPhaseThreeStateTransfer(node, Synopses, collector);
+			return;
+		}
 
 		if (isOnePassPhaseTwoStateTransfer(node)) {
 			handleOnePassPhaseTwoStateTransfer(node, Synopses, collector);
@@ -2665,13 +2669,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 	private void installCompletedOnePassPhaseTwoRootSample(String workerKey, JsonNode state, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
 		int uid = intField(state, "uid", -1);
-
 		if (uid < 0) {
 			throw new IllegalStateException("Assembled Phase-2 sample has invalid uid: " + state);
 		}
 
 		String stateRef = textField(state, "stateRef", "");
-
 		if (stateRef.isEmpty()) {
 			throw new IllegalStateException("Assembled Phase-2 sample has no stateRef." + " uid=" + uid);
 		}
@@ -2681,13 +2683,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
-
 		if (onePass == null) {
 			throw new IllegalStateException("Phase-2 sample reached worker without OnePass synopsis." + " uid=" + uid + ", worker=" + pId);
 		}
 
 		int expectedWorkers = intField(state, "expectedWorkers", getRuntimeContext().getNumberOfParallelSubtasks());
-
 		if (expectedWorkers <= 0) {
 			throw new IllegalStateException("Assembled Phase-2 sample has invalid expectedWorkers=" + expectedWorkers);
 		}
@@ -2700,6 +2700,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		Map<String, Object> installSummary = onePass.installGlobalPhaseTwoRootSample(state);
 
 		List<String> phaseThreeOrder = phaseThreeAliasOrder(onePass.getPlan());
+		//clear old Phase-1 seals.
+		for (String phaseThreeAlias : phaseThreeOrder) {
+			onePassTupleBufferGate.reopenAlias(uid, phaseThreeAlias);
+		}
+
 		String firstPhaseThreeAlias = phaseThreeOrder.isEmpty() ? "" : phaseThreeOrder.get(0);
 
 		installedOnePassPhaseTwoStateRefs.add(stateRef);

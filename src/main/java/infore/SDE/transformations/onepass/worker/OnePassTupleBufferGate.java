@@ -226,4 +226,24 @@ public final class OnePassTupleBufferGate implements Serializable {
         bufferedCountByUid.remove(uid);
         sealedAliasesByUid.remove(uid);
     }
+
+    /**
+     * Reopens an alias for a new lifecycle activation.
+     * Phase 3 intentionally replays non-root aliases that were already sealed
+     * after their Phase-1 END_ALIAS. The old seal belongs to the completed
+     * Phase-1 activation and must not prevent the explicit Phase-3 activation.
+     */
+    public void reopenAlias(int uid, String alias) {
+        requireAlias(alias);
+        Set<String> sealed = sealedAliasesByUid.get(uid);
+
+        if (sealed == null) {
+            return;
+        }
+
+        sealed.remove(alias.trim());
+        if (sealed.isEmpty()) {
+            sealedAliasesByUid.remove(uid);
+        }
+    }
 }
