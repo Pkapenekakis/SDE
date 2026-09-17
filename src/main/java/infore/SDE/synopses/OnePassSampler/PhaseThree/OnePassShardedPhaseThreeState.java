@@ -49,6 +49,13 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
 
     private String activeAlias;
     private CompiledOnePassPlan.DirectedJoinEdge activeParentEdge;
+
+    /*
+     * Replicated O(K) filter for the currently active Phase-3 alias.
+     * Every worker has the complete Phase-2 sample, so every worker builds
+     * the same set of parent-edge keys required by at least one partial sample.
+     */
+    private Set<JoinValue> requiredParentKeys;
     private Map<JoinValue, List<Long>> ownedSampleIdsByParentKey;
     private Map<Long, OnePassExtensionChoice> ownedChoicesBySampleId;
     private Map<Long, Random> randomBySampleId;
@@ -95,6 +102,7 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
 
         this.activeAlias = null;
         this.activeParentEdge = null;
+        this.requiredParentKeys = null;
         this.ownedSampleIdsByParentKey = null;
         this.ownedChoicesBySampleId = null;
         this.randomBySampleId = null;
@@ -163,10 +171,13 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
                     "Non-root Phase-3 alias has no parent edge: " + alias);
         }
 
-        Map<JoinValue, List<Long>> byParentKey =
-                new LinkedHashMap<JoinValue, List<Long>>();
-        Map<Long, OnePassExtensionChoice> choices =
-                new LinkedHashMap<Long, OnePassExtensionChoice>();
+        /*
+         * requiredKeys contains keys required by the complete replicated sample.
+         * byParentKey still contains only sample IDs whose parent key is physically owned by this worker.
+         */
+        Set<JoinValue> requiredKeys = new HashSet<JoinValue>();
+        Map<JoinValue, List<Long>> byParentKey = new LinkedHashMap<JoinValue, List<Long>>();
+        Map<Long, OnePassExtensionChoice> choices = new LinkedHashMap<Long, OnePassExtensionChoice>();
         Map<Long, Random> randoms = new LinkedHashMap<Long, Random>();
 
         for (OnePassPartialSample partial : partialSamplesById.values()) {
@@ -185,15 +196,16 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
                                 + " before starting child alias " + alias);
             }
 
-            JoinValue parentKey = JoinValue.fromTuple(
-                    parentTuple,
-                    parentEdge.getParentFields());
+            JoinValue parentKey = JoinValue.fromTuple(parentTuple, parentEdge.getParentFields());
 
-            int owner = OnePassShardOwnership.ownerForEdgeKey(
-                    parentEdge.getEdgeId(),
-                    parentKey,
-                    expectedWorkers);
+            /*
+             * Add before the ownership check.
+             * The filter must know ALL keys needed by the global sample, not only
+             * those whose final selection state is owned by this worker.
+             */
+            requiredKeys.add(parentKey);
 
+            int owner = OnePassShardOwnership.ownerForEdgeKey(parentEdge.getEdgeId(), parentKey, expectedWorkers);
             if (owner != workerId) {
                 continue;
             }
@@ -209,6 +221,7 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
 
         this.activeAlias = alias;
         this.activeParentEdge = parentEdge;
+        this.requiredParentKeys = requiredKeys;
         this.ownedSampleIdsByParentKey = byParentKey;
         this.ownedChoicesBySampleId = choices;
         this.randomBySampleId = randoms;
@@ -222,6 +235,23 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
         double ownWeight = weightEvaluator.evaluate(tuple);
         validateNonNegativeFinite(ownWeight, "Phase-3 ownWeight");
         return ownWeight;
+    }
+
+    /**
+     * Returns true only if this replay candidate can possibly extend at least
+     * one current partial sample.
+     */
+    public boolean isCandidateRelevant(OnePassTuple tuple) {
+        requireActiveAlias();
+        requireActiveTuple(tuple);
+
+        if (requiredParentKeys == null) {
+            throw new IllegalStateException("Required Phase-3 parent-key filter is not initialized." +
+                    " alias=" + activeAlias + ", worker=" + workerId);
+        }
+
+        JoinValue candidateParentKey = JoinValue.fromTuple(tuple, activeParentEdge.getChildFields());
+        return requiredParentKeys.contains(candidateParentKey);
     }
 
     /**
@@ -527,6 +557,7 @@ public final class OnePassShardedPhaseThreeState implements Serializable {
     private void clearActiveAlias() {
         this.activeAlias = null;
         this.activeParentEdge = null;
+        this.requiredParentKeys = null;
         this.ownedSampleIdsByParentKey = null;
         this.ownedChoicesBySampleId = null;
         this.randomBySampleId = null;

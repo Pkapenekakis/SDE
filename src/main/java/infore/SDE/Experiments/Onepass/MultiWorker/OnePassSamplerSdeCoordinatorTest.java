@@ -90,7 +90,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // LOCAL TEST SETTINGS
     // ---------------------------------------------------------------------
 
-    /*
+
     private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
             "dataTopic");
@@ -113,13 +113,13 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
-    */
+
     // =========================
     // SOFTNET
     // Uncomment these and comment the LOCAL definitions above.
     // =========================
 
-
+/*
     private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
     private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
@@ -137,7 +137,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/pkapenekakis/onepass/results/onepass_all_phases_softnet.csv";
-
+ */
     // ---------------------------------------------------------------------
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------

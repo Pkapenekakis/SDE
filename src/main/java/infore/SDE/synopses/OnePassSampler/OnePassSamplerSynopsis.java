@@ -432,6 +432,21 @@ public final class OnePassSamplerSynopsis implements Serializable {
         this.phase = Phase.PHASE_3;
     }
 
+    /**
+     * Fast Phase-3 replay filter.
+     * <p>
+     * Returns false when this tuple's parent-edge key is not required by any
+     * current partial sample.
+     */
+    public boolean isShardedPhaseThreeCandidateRelevant(OnePassTuple tuple) {
+        requireShardedPhaseThreeActive();
+        if (tuple == null) {
+            throw new IllegalArgumentException("Phase-3 candidate tuple must not be null");
+        }
+
+        return shardedPhaseThreeState.isCandidateRelevant(tuple);
+    }
+
     public double beginShardedPhaseThreeCandidate(Object payload) {
         requireShardedPhaseThreeActive();
         return shardedPhaseThreeState.beginCandidate(

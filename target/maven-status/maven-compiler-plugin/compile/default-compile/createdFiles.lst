@@ -1,7 +1,6 @@
 infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentCompletionTracker.class
 infore/SDE/reduceFunctions/ReduceFunction.class
 infore/SDE/experiments/RunTests$3.class
-infore/SDE/transformations/onepass/worker/PhaseOne/OnePassPhaseOneTransferBuffer$PendingBatch.class
 infore/SDE/synopses/OnePassSampler/OnePassSamplerSynopsis.class
 infore/SDE/Experiments/Onepass/SingleWorker/PhaseOneDirectTest.class
 lib/WDFT/correlatedPairs.class
@@ -66,6 +65,7 @@ infore/SDE/synopses/OnePassSampler/TupleWeightExpressionEvaluator$Parser.class
 infore/SDE/Experiments/Onepass/MultiWorker/OnePassSamplerSdeCoordinatorTest$PhaseTwoValidationResult.class
 lib/Coresets/Bucket.class
 infore/SDE/Experiments/Onepass/SingleWorker/OnePassPhaseOneTest.class
+infore/SDE/transformations/onepass/worker/PhaseOne/OnePassPhaseOneTransferBuffer$PendingAggregate.class
 infore/SDE/synopses/OnePassSampler/TupleWeightExpressionEvaluator$1.class
 infore/SDE/RunOnepass$7.class
 infore/SDE/Experiments/Onepass/TupleExtractorTest.class

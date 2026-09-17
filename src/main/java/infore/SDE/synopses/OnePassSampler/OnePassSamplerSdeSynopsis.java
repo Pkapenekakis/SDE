@@ -1242,6 +1242,14 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         lifecycle.startShardedPhaseThreeAlias(alias);
     }
 
+    /**
+     * Returns false when a replayed Phase-3 tuple cannot extend any currently
+     * active partial sample.
+     */
+    public boolean isShardedPhaseThreeCandidateRelevant(OnePassTuple tuple) {
+        return lifecycle.isShardedPhaseThreeCandidateRelevant(tuple);
+    }
+
     public double beginShardedPhaseThreeCandidate(Object payload) {
         return lifecycle.beginShardedPhaseThreeCandidate(payload);
     }

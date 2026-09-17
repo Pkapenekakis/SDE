@@ -1872,12 +1872,14 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		/*
-		 * Remote final-index path. Existing combine/batch logic remains unchanged.
+		 * Remote final-index path.
+		 * Accumulate the complete alias-level contribution for each remote join key.
+		 * finishFinalPhaseOneSourceGeneration(...) will serialize the final aggregate
+		 * into bounded SHARD_BATCH messages only after this worker can no longer
+		 * generate any final contribution for the alias.
 		 */
-		for (Estimation stateMessage : onePassPhaseOneTransferBuffer.addRemoteContribution(uid, baseKey,
-				expectedWorkers, pId, targetWorker, epoch, alias, contribution)) {
-			collector.collect(stateMessage);
-		}
+		onePassPhaseOneTransferBuffer.addRemoteContribution(uid, baseKey, expectedWorkers, pId, targetWorker,
+				epoch, alias, contribution);
 	}
 
 	private void routePhaseOneEnrichmentWork(OnePassSamplerSdeSynopsis onePass, JsonNode tuplePayload,
@@ -2051,8 +2053,11 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		String baseKey = onePassBaseKeyByUid.get(uid);
 
 		/*
-		 * Every remaining remote final contribution must be emitted before
-		 * SOURCE_DONE.
+		 * The complete remote join-key aggregate has been retained until this point.
+		 * For branching aliases, reaching this method means END_ALIAS has already
+		 * been observed AND every enrichment stage that can create another final
+		 * parent contribution has completed.
+		 * Only now split the complete aggregate into bounded SHARD_BATCH messages.
 		 */
 		for (Estimation batch : onePassPhaseOneTransferBuffer.flushAlias(uid, epoch, alias)) {
 			collector.collect(batch);
@@ -2815,12 +2820,16 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		String resultId = shardedPhaseThreeResultId(uid, alias);
 
 		OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+
 		if (alias == null || !alias.equals(tuple.getTable())) {
 			throw new IllegalStateException("Phase-3 tuple alias mismatch. active=" + alias + ", received=" + tuple.getTable());
 		}
 
-		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges =
-				onePass.getPlan().getChildEdges(alias);
+		if (!onePass.isShardedPhaseThreeCandidateRelevant(tuple)) {
+			return;
+		}
+
+		List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = onePass.getPlan().getChildEdges(alias);
 
 		double partialWeight = onePass.beginShardedPhaseThreeCandidate(payload);
 		if (partialWeight == 0.0d) {
@@ -2828,12 +2837,13 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		if (childEdges.isEmpty()) {
-			// Router placed a leaf directly on the parent-edge selection owner.
+
+			// Leaf: router already placed the tuple on the parent-edge owner.
 			onePass.acceptShardedPhaseThreeCandidate(payload, partialWeight);
 			return;
 		}
 
-		// Router placed an internal tuple on child-edge-0 owner.
+		// Internal alias: router placed the tuple on child-edge-0 owner.
 		double childWeight = onePass.lookupShardedPhaseThreeChildWeight(payload, 0);
 		double enriched = OnePassShardedPhaseTwoState.checkedMultiply(partialWeight, childWeight, "phase3Candidate.child0");
 
@@ -2841,10 +2851,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			return;
 		}
 
-		// Stage 1 is either child-edge-1 or, for a one-child alias, the final
-		// parent-edge selection owner.
-		routeShardedPhaseThreeWork(onePass, payload, enriched, 1, uid, resultId, baseKey, expectedWorkers,
-				alias, collector);
+		//Stage 1 is either child-edge-1 or, for a one-child alias, the final parent-edge selection owner.
+		routeShardedPhaseThreeWork(onePass, payload, enriched, 1, uid, resultId, baseKey, expectedWorkers, alias, collector);
 	}
 
 	private int phaseThreeTargetWorker(OnePassSamplerSdeSynopsis onePass, OnePassTuple tuple, String alias,
