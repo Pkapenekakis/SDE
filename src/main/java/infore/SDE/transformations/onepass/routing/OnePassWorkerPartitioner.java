@@ -1,4 +1,4 @@
-package infore.SDE.transformations.onepass.coordinator;
+package infore.SDE.transformations.onepass.routing;
 
 import org.apache.flink.api.common.functions.Partitioner;
 

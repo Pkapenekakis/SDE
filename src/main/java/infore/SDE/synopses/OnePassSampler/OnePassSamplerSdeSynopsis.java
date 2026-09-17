@@ -13,10 +13,7 @@ import infore.SDE.transformations.onepass.OnePassRequestParser;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassPhaseThreeResult;
 import infore.SDE.synopses.OnePassSampler.PhaseThree.OnePassCompletedSample;
 import com.fasterxml.jackson.databind.JsonNode;
-import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneContribution;
-import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
-
 import java.util.*;
 
 /**

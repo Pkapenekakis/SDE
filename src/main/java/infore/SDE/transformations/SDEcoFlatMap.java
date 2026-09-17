@@ -151,11 +151,6 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				}
 			}
 			M_Synopses.put(node.getKey(), Synopses);
-			/*
-			for (Synopsis ski : Synopses) {
-				ski.add(node.getValues());
-			}
-		M_Synopses.put(node.getKey(),Synopses); */
 		} else{
 			System.out.println("[SDEcoFlatMap DATA] No synopsis found for datapoint key=" + node.getKey() +
 					", known keys=" + M_Synopses.keySet());
@@ -981,24 +976,25 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 
 		int expectedWorkers = onePassExpectedWorkersByUid.getOrDefault(uid, 1);
 
-		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_1 && expectedWorkers > 1) {
+		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_1) {
 			processShardedPhaseOneTuple(onePass, payload, collector);
 			return;
 		}
 
-		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_2 && expectedWorkers > 1 &&
-				onePass.isShardedPhaseTwoActive()) {
+		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_2 && onePass.isShardedPhaseTwoActive()) {
 			processShardedPhaseTwoRootTuple(onePass, payload, collector);
 			return;
 		}
 
-		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_3 && expectedWorkers > 1 &&
-				onePass.isShardedPhaseThreeActive()) {
+		if (onePass.getLifecycle().getPhase() == OnePassSamplerSynopsis.Phase.PHASE_3 && onePass.isShardedPhaseThreeActive()) {
 			processShardedPhaseThreeTuple(onePass, payload, collector);
 			return;
 		}
 
-		// Single-worker / legacy paths remain unchanged.
+		/*
+		 * Keep this fallback temporarily for old direct/legacy callers.
+		 * RunOnepass should no longer reach it during the normal sharded lifecycle.
+		 */
 		onePass.add(payload);
 	}
 
@@ -1197,12 +1193,6 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		// SHARDED PHASE 2 END_ALIAS
 		// =============================================================
 		if (phaseTwo) {
-			if (expectedWorkers <= 1) {
-				throw new IllegalStateException("PHASE2 END_ALIAS currently belongs to the sharded " +
-						"Phase-2 path and requires expectedWorkers > 1." + " uid=" + uid +
-						", expectedWorkers=" + expectedWorkers);
-			}
-
 			/*
 			 * Usually, if rootAlias is active in the tuple gate, START_PHASE_2
 			 * has already initialized the sharded Phase-2 state.
@@ -1250,11 +1240,6 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		// SHARDED PHASE 3 END_ALIAS
 		// =============================================================
 		if (phaseThree) {
-			if (expectedWorkers <= 1) {
-				throw new IllegalStateException("PHASE3 END_ALIAS belongs to the sharded Phase-3 path " +
-						"and requires expectedWorkers > 1. uid=" + uid);
-			}
-
 			if (!onePass.isShardedPhaseThreeActive() || !alias.equals(onePass.getShardedPhaseThreeActiveAlias())) {
 
 				String pendingKey = onePassEndAliasPendingKey(uid, alias);
@@ -1295,21 +1280,20 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		 */
 		onePassTupleBufferGate.sealAlias(uid, alias);
 
-		if (expectedWorkers > 1) {
-			handleShardedPhaseOneEndAlias(node, onePass, uid, alias, resultId, nextCommand, nextAlias, expectedWorkers, collector);
-			processedOnePassEndAliasMarkers.add(markerKey);
-			pendingOnePassEndAliasByUidAlias.remove(onePassEndAliasPendingKey(uid, alias));
-			return;
-		}
-
-		//Existing single-worker / legacy Phase-1 path.
-		Estimation localPhaseOneResult = onePass.buildLocalPhaseOneResultEstimation(node.getKey(), uid, pId,
-				expectedWorkers, actualParallelism, resultId, alias, nextCommand, nextAlias);
-
-		collector.collect(localPhaseOneResult);
+		/*
+		 * Use the distributed/sharded completion protocol even for P=1.
+		 *
+		 * With one worker:
+		 *   - every final Phase-1 contribution is local;
+		 *   - no remote SHARD_BATCH is required;
+		 *   - local SOURCE_DONE is enough for the completion tracker;
+		 *   - request 76 reduces immediately to request 77.
+		 */
+		handleShardedPhaseOneEndAlias(node, onePass, uid, alias, resultId, nextCommand, nextAlias, expectedWorkers, collector);
 		processedOnePassEndAliasMarkers.add(markerKey);
-		System.out.println("[OnePass END_ALIAS] LOCAL_PHASE1_RESULT emitted." + " uid=" + uid + ", alias=" + alias + ", resultId=" + resultId + ", nextCommand=" + nextCommand + ", nextAlias=" + nextAlias + ", workerId=" + pId + ", expectedWorkers=" + expectedWorkers + ", key=" + node.getKey());
-		completeOnePassEndAlias(node, synopses, collector);
+		pendingOnePassEndAliasByUidAlias.remove(onePassEndAliasPendingKey(uid, alias));
+
+		return;
 	}
 
 	private static String onePassEndAliasPendingKey(int uid, String alias) {
@@ -2785,7 +2769,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		int expectedWorkers = intField(payload, "expectedWorkers", onePassExpectedWorkersByUid.getOrDefault(uid, 1));
 		int aliasIndex = intField(payload, "aliasIndex", -1);
 
-		if (alias.isEmpty() || expectedWorkers <= 1) {
+		if (alias.isEmpty() || expectedWorkers <= 0) {
 			throw new IllegalStateException("Invalid sharded START_PHASE_3_ALIAS: " + payload);
 		}
 

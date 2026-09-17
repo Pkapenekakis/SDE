@@ -18,7 +18,7 @@ import infore.SDE.transformations.ReduceFlatMap;
 import infore.SDE.transformations.RqRouterFlatMap;
 import infore.SDE.transformations.SDEcoFlatMap;
 import infore.SDE.transformations.onepass.*;
-import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
+import infore.SDE.transformations.onepass.routing.OnePassWorkerPartitioner;
 import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneEnrichmentBuffer;
 import infore.SDE.transformations.onepass.worker.PhaseThree.OnePassPhaseThreeEnrichmentBuffer;
 import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentBuffer;
@@ -294,9 +294,7 @@ public class RunOnepass {
 
         /*
          * request 78: targeted sharded computation/state work.
-         *
          * request 83: bounded global root sample.
-         *
          * OnePassStateTopicEmitter understands both.
          */
         DataStream<Estimation> onePassStateTopicFeedback = onePassStateTransferStream.
@@ -317,15 +315,6 @@ public class RunOnepass {
         // ================================================================
         // REQUEST TOPIC LIFECYCLE FEEDBACK
         // ================================================================
-
-        /*
-         * For the current Phase-1 + Phase-2 implementation the automatic
-         * RequestTopic feedback is only:
-         *
-         * request 77 -> START_NEXT_ALIAS / START_PHASE_2
-         *
-         * When sharded Phase 3 is implemented, its transition should begin from request 86.
-         */
         onePassPhaseOneTransitions.union(onePassPhaseThreeTransitions).addSink(requestFeedbackProducer.getProducer()).
                 name("ONEPASS_REQUEST_TOPIC_FEEDBACK").setParallelism(1);
 
@@ -537,7 +526,7 @@ public class RunOnepass {
             kafkaRequestInputTopic = "requestTopic";
             kafkaOutputTopic = "estimationTopic";
             kafkaBrokersList = "localhost:9092";
-            parallelism = 4;
+            parallelism = 1;
             kafkaOnePassStateTopic = "onepassStateTopic";
             onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
         }

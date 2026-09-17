@@ -79,7 +79,7 @@ import java.util.UUID;
  * Phase-3 transport/lifecycle metadata and selection cardinality rather than
  * independently re-computing the selected sample contents.
  */
-public final class OnePassSamplerSdeCoordinatorTest {
+public final class OnepassSamplerSdeMultiworkerTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String LOCAL_BOOTSTRAP_SERVERS = "localhost:9092";
@@ -168,7 +168,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
             Long.parseLong(System.getProperty("onepass.testRowLimit", "100000"));
 
     private static int EXPECTED_WORKERS =
-            Integer.parseInt(System.getProperty("onepass.workers", "4"));
+            Integer.parseInt(System.getProperty("onepass.workers", "1"));
 
     private static final long TIMEOUT_MS = Long.parseLong(System.getProperty("onepass.timeoutMs",
             Long.toString(30L * 60L * 1000L)));
@@ -242,7 +242,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
      * so enabling this flag does not pollute the benchmark timing.
      */
     private static final int REQUEST_DEBUG_EXPORT_PHASE1 = 79;
-    private static final boolean EXPORT_PHASE1_INDEXES = false;
+    private static final boolean EXPORT_PHASE1_INDEXES = true;
 
     private static final String PHASE1_INDEX_EXPORT_DIR = System.getProperty("onepass.phase1IndexExportDir",
             "/tmp/onepass-phase1-validator");
@@ -269,7 +269,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
      *   - normal/benchmark execution is unaffected.
      */
     private static final int REQUEST_DEBUG_VALIDATE_PHASE2 = 89;
-    private static final boolean VALIDATE_PHASE2 = false;
+    private static final boolean VALIDATE_PHASE2 = true;
 
     private static final String PHASE2_VALIDATION_DIR =
             System.getProperty("onepass.phase2ValidationDir", "/tmp/onepass-phase2-validator");
@@ -289,7 +289,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static final boolean PRINT_FINAL_RESULTS = Boolean.
             parseBoolean(System.getProperty("onepass.printFinalResults", "false"));
 
-    private OnePassSamplerSdeCoordinatorTest() {}
+    private OnepassSamplerSdeMultiworkerTest() {}
 
     public static void main(String[] args) throws Exception {
 

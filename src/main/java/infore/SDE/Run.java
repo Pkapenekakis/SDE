@@ -13,7 +13,7 @@ import infore.SDE.sources.kafkaStringConsumer;
 import infore.SDE.sources.kafkaStringProducer;
 import infore.SDE.transformations.*;
 import infore.SDE.transformations.onepass.OnePassDataRouterCoFlatMap;
-import infore.SDE.transformations.onepass.coordinator.OnePassWorkerPartitioner;
+import infore.SDE.transformations.onepass.routing.OnePassWorkerPartitioner;
 import infore.SDE.transformations.onepass.worker.PhaseOne.OnePassPhaseOneEnrichmentBuffer;
 import infore.SDE.transformations.onepass.worker.PhaseTwo.OnePassPhaseTwoEnrichmentBuffer;
 import org.apache.flink.api.common.functions.FilterFunction;
