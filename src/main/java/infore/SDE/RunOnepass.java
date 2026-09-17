@@ -173,8 +173,16 @@ public class RunOnepass {
             @Override
             public Iterable<String> select(Estimation value) {
                 List<String> output = new ArrayList<String>();
-                output.add(value.getNoOfP() == 1 ? "single" : "multy");
-
+                /*
+                 * OnePass lifecycle reductions are required even for P=1.
+                 * With one worker the "global" result is simply the single local
+                 * result, but it still has to pass through ReduceFlatMap so the
+                 * normal request transitions remain: */
+                if (value.getNoOfP() == 1 && !isOnePassLocalReductionMessage(value)) {
+                    output.add("single");
+                } else {
+                    output.add("multy");
+                }
                 return output;
             }
         });
@@ -484,6 +492,26 @@ public class RunOnepass {
         }
 
         return param[0].trim();
+    }
+
+    private static boolean isOnePassLocalReductionMessage(Estimation value) {
+        if (value == null || value.getSynopsisID() != ONEPASS_SYNOPSIS_ID) {
+            return false;
+        }
+
+        switch (value.getRequestID()) {
+
+            case 72: // LOCAL_PHASE1_RESULT
+            case 76: // LOCAL_PHASE1_SHARD_READY
+            case 82: // LOCAL_PHASE2_ROOT_SUMMARY
+            case 85: // LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED
+            case 87: // LOCAL_PHASE3_ALIAS_SELECTIONS
+            case 90: // LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED
+            case 92: // legacy LOCAL_PHASE3_ALIAS_RESULT
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static void initializeParameters(String[] args) {

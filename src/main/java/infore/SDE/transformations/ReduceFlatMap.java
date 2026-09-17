@@ -36,6 +36,17 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
 
             rf.put("" + key, t_rf);
 
+            //Special case for onepass with single worker
+            if (id == 30 && value.getNoOfP() == 1) {
+                Object output = t_rf.reduce();
+                if (output != null) {
+                    value.setEstimation(output);
+                    rf.remove("" + key);
+                    decorateOnePassReducedEstimation(value);
+                    out.collect(value);
+                }
+            }
+
         }else{
 
             if (t_rf.add(value)) {

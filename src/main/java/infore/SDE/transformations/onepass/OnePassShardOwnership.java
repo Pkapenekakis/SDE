@@ -114,6 +114,9 @@ public final class OnePassShardOwnership {
     }
 
     public static String workerKey(String baseKey, int parallelism, int workerId) {
+        if (parallelism <= 1) {
+            return baseKey;
+        }
         return baseKey + "_" + parallelism + "_KEYED_" + workerId;
     }
 

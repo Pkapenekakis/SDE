@@ -17,6 +17,7 @@ infore/SDE/transformations/onepass/OnePassDataRouterCoFlatMap.class
 infore/SDE/synopses/Bloomfilter.class
 infore/SDE/MultySDE$4.class
 infore/SDE/synopses/OnePassSampler/PhaseTwo/OnePassRootSampleResult.class
+infore/SDE/RunOnepass$12.class
 infore/SDE/experiments/RUNKafkaReadS$1.class
 infore/SDE/reduceFunctions/ContinuousReduce.class
 infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassPhaseThreeState.class
@@ -45,6 +46,7 @@ lib/TimeSeries/MyTimeSeries.class
 infore/SDE/Run$5.class
 infore/SDE/Experiments/RUNSketchWC$1.class
 infore/SDE/Experiments/Onepass/SingleWorker/PhaseOneSdeIntegrationTest.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentBuffer$BatchKey.class
 lib/TopK/TopK.class
 infore/SDE/synopses/OnePassSampler/PhaseOne/Phase1LinkWeightIndex.class
 infore/SDE/sources/kafkaProducerEstimation.class
@@ -78,6 +80,7 @@ infore/SDE/sources/kafkaProducer$AverageSerializer3.class
 infore/SDE/sources/kafkaProducer4$AverageSerializer.class
 infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentCompletionTracker$StageState.class
 lib/WDFT/PAIR.class
+infore/SDE/RunOnepass$11.class
 lib/Onepass/PhaseTwo/Phase2Sampler.class
 infore/SDE/experiments/RUNNaiveWC.class
 infore/SDE/sources/JsonStringKeyedSerializer.class
@@ -97,6 +100,7 @@ infore/SDE/experiments/RunTests$2.class
 infore/SDE/synopses/OnePassSampler/PhaseOne/OnePassPhaseOneContribution.class
 infore/SDE/synopses/OnePassSampler/PhaseTwo/OnePassRootSampler.class
 lib/WLSH/WLSH.class
+infore/SDE/transformations/onepass/OnePassPhaseThreeTransitionMapper.class
 lib/WLSH/Bucket.class
 infore/SDE/synopses/ChainSamplerSynopsis.class
 infore/SDE/transformations/onepass/CompiledOnePassPlan$LogicalJoinEdgeBuilder.class
@@ -119,6 +123,7 @@ infore/SDE/synopses/OnePassSampler/PhaseTwo/OnlineMultinomialSampler$2.class
 infore/SDE/sources/kafkaProducer.class
 infore/SDE/synopses/Coresets.class
 lib/WDFT/correlationPastDFT.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentBuffer$PendingBatch.class
 infore/SDE/synopses/StickySamplingSynopsis.class
 infore/SDE/producersForTesting/sendSpringTest.class
 infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentCompletionTracker$StageKey.class
@@ -141,6 +146,8 @@ infore/SDE/sources/kafkaStringProducer.class
 infore/SDE/reduceFunctions/TopKReduce.class
 infore/SDE/transformations/oldSDEcoFlatMap$2.class
 infore/SDE/transformations/onepass/worker/PhaseOne/OnePassPhaseOneEnrichmentCompletionTracker$1.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentCompletionTracker$StageState.class
+infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassShardedPhaseThreeState.class
 infore/SDE/synopses/windowQuantiles.class
 infore/SDE/transformations/onepass/worker/PhaseOne/OnePassPhaseOneCompletionTracker.class
 infore/SDE/experiments/RunTests.class
@@ -190,6 +197,7 @@ infore/SDE/experiments/RUNRadiusAsPartitioner_Test$1.class
 infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentBuffer$BatchKey.class
 infore/SDE/synopses/Radius_Grid.class
 infore/SDE/experiments/RunSIMTest$1.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentCompletionTracker$StageKey.class
 lib/Coresets/BucketManager$1.class
 lib/WDFT/COEF.class
 infore/SDE/synopses/CountMin.class
@@ -198,6 +206,7 @@ infore/SDE/reduceFunctions/onepass/OnePassAliasReduceFunction$1.class
 infore/SDE/RunOnepass$5.class
 infore/SDE/reduceFunctions/JoinEstimationFunction.class
 lib/Coresets/TreeCoreset$1.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentBuffer$1.class
 infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentBuffer.class
 infore/SDE/MultySDE$2.class
 infore/SDE/Experiments/Onepass/Deprecated/GenericOnePassTestDriver.class
@@ -218,12 +227,16 @@ infore/SDE/Experiments/RUNSketchWC.class
 infore/SDE/synopses/OnePassSampler/PhaseTwo/OnlineMultinomialSampler$1.class
 infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentBuffer$1.class
 infore/SDE/transformations/onepass/worker/PhaseOne/OnePassPhaseOneEnrichmentBuffer$BatchKey.class
+infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassShardedPhaseThreeState$1.class
 infore/SDE/synopses/GKsynopsis.class
 infore/SDE/transformations/onepass/sql/OnePassSqlRequest.class
 infore/SDE/messages/Onepass/WeightSpec.class
 infore/SDE/reduceFunctions/SimpleORFunction.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentBuffer$WorkItem.class
 infore/SDE/transformations/onepass/CompiledOnePassPlan$1.class
 infore/SDE/transformations/onepass/CompiledOnePassPlan$FieldPair.class
+infore/SDE/RunOnepass$10.class
+infore/SDE/reduceFunctions/onepass/OnePassShardedAliasReduceFunction.class
 infore/SDE/Experiments/Onepass/MultiWorker/OnePassSamplerSdeCoordinatorTest.class
 infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassPartialSample.class
 infore/SDE/synopses/AMSsynopsis.class
@@ -239,6 +252,7 @@ infore/SDE/RunOnepass$6.class
 infore/SDE/experiments/RUNParallelWC$1.class
 infore/SDE/transformations/SDEcoFlatMap.class
 infore/SDE/synopses/Synopsis.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentCompletionTracker.class
 infore/SDE/Run$11.class
 infore/SDE/transformations/onepass/OnePassStateTopicEmitter$1.class
 infore/SDE/sources/kafkaProducer4.class
@@ -270,6 +284,7 @@ infore/SDE/messages/Request.class
 infore/SDE/transformations/oldSDEcoFlatMap.class
 infore/SDE/transformations/dataRouterCoFlatMap$1.class
 infore/SDE/messages/Onepass/OnePassRequestValidator.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentCompletionTracker$1.class
 infore/SDE/transformations/onepass/sql/OnePassCatalog$CatalogQuery.class
 infore/SDE/RunOnepass$4.class
 lib/Onepass/PhaseTwo/Phase2Sampler$SampleEntry.class
@@ -293,6 +308,7 @@ lib/Coresets/Point.class
 infore/SDE/transformations/onepass/sql/OnePassSqlCompiler.class
 infore/SDE/experiments/SketchFlatMap.class
 infore/SDE/reduceFunctions/SimpleMaxFunction.class
+infore/SDE/transformations/onepass/worker/PhaseThree/OnePassPhaseThreeEnrichmentBuffer.class
 infore/SDE/messages/Onepass/OutputSpec.class
 lib/Coresets/KmeansPP.class
 infore/SDE/RunOnepass$3.class

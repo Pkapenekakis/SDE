@@ -90,6 +90,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
     // LOCAL TEST SETTINGS
     // ---------------------------------------------------------------------
 
+    /*
     private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
             "dataTopic");
@@ -112,13 +113,13 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
-
+    */
     // =========================
     // SOFTNET
     // Uncomment these and comment the LOCAL definitions above.
     // =========================
 
-    /*
+
     private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
     private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
@@ -136,7 +137,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
 
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/pkapenekakis/onepass/results/onepass_all_phases_softnet.csv";
-*/
+
     // ---------------------------------------------------------------------
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------
@@ -160,8 +161,14 @@ public final class OnePassSamplerSdeCoordinatorTest {
 //            "LIMIT 1000 " + "/* catalog='tpch-onepass-catalog.json', " + "seed='branch-test-123', scalefactor=1 */";
 
     //Use -1 for the full TPC-H relation.
-    private static final long TEST_ROW_LIMIT = Long.parseLong(System.getProperty("onepass.testRowLimit", "100000"));
-    private static final int EXPECTED_WORKERS = Integer.parseInt(System.getProperty("onepass.workers", "4"));
+    //
+    // The JVM properties still work, but these are intentionally not final so
+    // configureRuntimeArguments(args) can override them from the terminal.
+    private static long TEST_ROW_LIMIT =
+            Long.parseLong(System.getProperty("onepass.testRowLimit", "100000"));
+
+    private static int EXPECTED_WORKERS =
+            Integer.parseInt(System.getProperty("onepass.workers", "4"));
 
     private static final long TIMEOUT_MS = Long.parseLong(System.getProperty("onepass.timeoutMs",
             Long.toString(30L * 60L * 1000L)));
@@ -3870,15 +3877,6 @@ public final class OnePassSamplerSdeCoordinatorTest {
                 );
             }
         }
-
-        if (RUN_PHASE_3 && EXPECTED_WORKERS <= 1) {
-
-            throw new IllegalStateException(
-                    "The production SHARDED_PHASE3_V1 path requires expectedWorkers > 1."
-                            + " Configured workers="
-                            + EXPECTED_WORKERS
-            );
-        }
     }
 
     // =====================================================================
@@ -5095,23 +5093,122 @@ public final class OnePassSamplerSdeCoordinatorTest {
     private static void configureRuntimeArguments(String[] args) {
 
         /*
-         * Priority:
-         * 1. Command-line broker list
-         * 2. -Donepass.kafka JVM property
-         * 3. The LOCAL / SOFTNET default selected above
+         * Supported command-line forms:
+         *
+         *   <testRowLimit> <expectedWorkers>
+         *
+         * or, if Kafka brokers must also be overridden:
+         *
+         *   <kafkaBrokers> <testRowLimit> <expectedWorkers>
+         *
+         * Backward compatibility:
+         *
+         *   <kafkaBrokers>
+         *
+         * still behaves exactly as before.
+         *
+         * If no command-line value is supplied, the existing -Donepass.*
+         * properties and class defaults are used.
          */
 
-        if (args != null && args.length > 0 && args[0] != null && !args[0].trim().isEmpty()) {
-            BOOTSTRAP_SERVERS = args[0].trim();
+        String kafkaArgument = null;
 
-        } else {
-            String propertyValue = System.getProperty("onepass.kafka", "");
-            if (propertyValue != null && !propertyValue.trim().isEmpty()) {
-                BOOTSTRAP_SERVERS = propertyValue.trim();
+        if (args != null) {
+
+            if (args.length == 1) {
+
+                kafkaArgument = args[0];
+
+            } else if (args.length == 2) {
+
+                TEST_ROW_LIMIT = parseTestRowLimitArgument(args[0]);
+
+                EXPECTED_WORKERS = parseExpectedWorkersArgument(args[1]);
+
+            } else if (args.length == 3) {
+
+                kafkaArgument = args[0];
+
+                TEST_ROW_LIMIT = parseTestRowLimitArgument(args[1]);
+
+                EXPECTED_WORKERS = parseExpectedWorkersArgument(args[2]);
+
+            } else if (args.length > 3) {
+
+                throw new IllegalArgumentException(
+                        "Usage: [<kafkaBrokers>] <testRowLimit> <expectedWorkers> "
+                                + "or the legacy single <kafkaBrokers> argument."
+                );
             }
         }
 
-        System.out.println("[OnePass TEST CONFIG]" + " kafka=" + BOOTSTRAP_SERVERS);
+        if (kafkaArgument != null
+                && !kafkaArgument.trim().isEmpty()) {
+
+            BOOTSTRAP_SERVERS = kafkaArgument.trim();
+
+        } else {
+
+            String propertyValue =
+                    System.getProperty(
+                            "onepass.kafka",
+                            ""
+                    );
+
+            if (propertyValue != null
+                    && !propertyValue.trim().isEmpty()) {
+
+                BOOTSTRAP_SERVERS =
+                        propertyValue.trim();
+            }
+        }
+
+        /*
+         * Validate values coming either from the command line or from the
+         * existing -Donepass.testRowLimit / -Donepass.workers properties.
+         */
+        if (TEST_ROW_LIMIT < -1L) {
+            throw new IllegalArgumentException("testRowLimit must be -1 (full relation) or >= 0. Actual=" + TEST_ROW_LIMIT
+            );
+        }
+
+        if (EXPECTED_WORKERS <= 0) {
+            throw new IllegalArgumentException(
+                    "expectedWorkers must be > 0. Actual=" + EXPECTED_WORKERS
+            );
+        }
+
+        System.out.println("[OnePass TEST CONFIG]" + " kafka=" + BOOTSTRAP_SERVERS + ", testRowLimit=" +
+                TEST_ROW_LIMIT + ", expectedWorkers=" + EXPECTED_WORKERS
+        );
+    }
+
+
+    private static long parseTestRowLimitArgument(String value) {
+        try {
+            long parsed = Long.parseLong(value.trim());
+            if (parsed < -1L) {
+                throw new IllegalArgumentException("testRowLimit must be -1 (full relation) or >= 0. Actual=" + parsed);
+            }
+            return parsed;
+
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid testRowLimit '" + value + "'. Expected -1 or a non-negative integer.", e);
+        }
+    }
+
+
+    private static int parseExpectedWorkersArgument(String value) {
+        try {
+            int parsed = Integer.parseInt(value.trim());
+            if (parsed <= 0) {
+                throw new IllegalArgumentException("expectedWorkers must be > 0. Actual=" + parsed);
+            }
+            return parsed;
+
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid expectedWorkers '" + value + "'. Expected a positive integer.", e);
+        }
     }
 
     private static ObjectNode buildOnePassFinalResultRequest(String baseKey, String streamId, int uid) {
@@ -5124,7 +5221,7 @@ public final class OnePassSamplerSdeCoordinatorTest {
          * single-worker Estimation and therefore sends it directly to OUTPUT_TOPIC
          * instead of trying to run another distributed OnePass reduction.
          */
-        String workerKey = baseKey + "_" + EXPECTED_WORKERS + "_KEYED_0";
+        String workerKey = EXPECTED_WORKERS <= 1 ? baseKey : baseKey + "_" + EXPECTED_WORKERS + "_KEYED_0";
         ObjectNode request = MAPPER.createObjectNode();
 
         request.put("dataSetkey", workerKey);
@@ -5184,8 +5281,8 @@ public final class OnePassSamplerSdeCoordinatorTest {
                     continue;
                 }
 
-              //This is a normal Estimation response to requestID=3.
-                 int envelopeUid = intField(envelope, "UID", intField(envelope, "uid", -1));
+                //This is a normal Estimation response to requestID=3.
+                int envelopeUid = intField(envelope, "UID", intField(envelope, "uid", -1));
 
                 if (envelopeUid != uid) {
                     continue;
