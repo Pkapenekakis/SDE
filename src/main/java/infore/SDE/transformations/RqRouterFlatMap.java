@@ -3,6 +3,7 @@ package infore.SDE.transformations;
 import java.io.Serializable;
 import java.util.ArrayList;
 
+import infore.SDE.transformations.onepass.OnePassShardOwnership;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.util.Collector;
 
@@ -16,14 +17,20 @@ public class RqRouterFlatMap extends RichFlatMapFunction<Request, Request> imple
 	@Override
 	public void flatMap(Request rq, Collector<Request> out) throws Exception {
 
-		//OnePass router
-		if (rq.getSynopsisID() == 30 && rq.getNoOfP() > 1) {
+		/*
+		 * OnePass router.
+		 * OnePassShardOwnership.workerKey(...) deliberately returns:
+		 *   P=1  -> baseKey
+		 *   P>1  -> baseKey_P_KEYED_workerId
+		 */
+		if (rq.getSynopsisID() == 30 && rq.getNoOfP() > 0) {
+
 			String baseKey = rq.getKey();
+			int expectedWorkers = rq.getNoOfP();
 
-			for (int i = 0; i < rq.getNoOfP(); i++) {
+			for (int workerId = 0; workerId < expectedWorkers; workerId++) {
 				Request routed = copyRequest(rq);
-				routed.setDataSetkey(baseKey + "_" + rq.getNoOfP() + "_KEYED_" + i);
-
+				routed.setDataSetkey(OnePassShardOwnership.workerKey(baseKey, expectedWorkers, workerId));
 				out.collect(routed);
 			}
 
