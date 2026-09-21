@@ -25,10 +25,15 @@ public final class OnePassWorkerReadyReduceFunction extends ReduceFunction imple
     private static final String TYPE_PHASE2_LOCAL_INSTALLED = "LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED";
     private static final String TYPE_PHASE3_LOCAL_INSTALLED = "LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED";
 
+
+    private static final String TYPE_PHASE1_REPLICATED_INSTALLED = "LOCAL_PHASE1_INDEX_INSTALLED";
+
     private final Set<Integer> workers = new LinkedHashSet<Integer>();
 
     private String mode = "";
     private int uid = -1;
+    private String protocol = "";
+
 
     // Phase 1 metadata.
     private int epoch = -1;
@@ -68,8 +73,10 @@ public final class OnePassWorkerReadyReduceFunction extends ReduceFunction imple
             JsonNode node = asJson(estimation.getEstimation());
             String type = text(node, "type");
 
-            if (!TYPE_PHASE1_LOCAL_READY.equals(type) && !TYPE_PHASE2_LOCAL_INSTALLED.equals(type) &&
-                    !TYPE_PHASE3_LOCAL_INSTALLED.equals(type)) {
+            if (!TYPE_PHASE1_LOCAL_READY.equals(type) &&
+                    !TYPE_PHASE2_LOCAL_INSTALLED.equals(type) &&
+                    !TYPE_PHASE3_LOCAL_INSTALLED.equals(type) &&
+                    !TYPE_PHASE1_REPLICATED_INSTALLED.equals(type)){
                 throw new IllegalStateException("Unsupported OnePass worker-ready type: " + type);
             }
 
@@ -98,6 +105,8 @@ public final class OnePassWorkerReadyReduceFunction extends ReduceFunction imple
 
             if (TYPE_PHASE1_LOCAL_READY.equals(mode)) {
                 acceptPhaseOne(node);
+            }else if (TYPE_PHASE1_REPLICATED_INSTALLED.equals(mode)) {
+                acceptReplicatedPhaseOneInstall(node);
             } else if (TYPE_PHASE2_LOCAL_INSTALLED.equals(mode)) {
                 acceptPhaseTwoInstall(node);
             } else {
@@ -258,7 +267,27 @@ public final class OnePassWorkerReadyReduceFunction extends ReduceFunction imple
             out.put("globalSeenTuples", globalSeenTuples);
             out.put("globalKeyCount", globalKeyCount);
             out.put("globalTotalWeight", globalTotalWeight);
-        } else if (TYPE_PHASE2_LOCAL_INSTALLED.equals(mode)) {
+        } else if (TYPE_PHASE1_REPLICATED_INSTALLED.equals(mode)) {
+            out.put("type", "GLOBAL_PHASE1_INDEX_INSTALLED");
+            out.put("protocol", "REPLICATED_PHASE1_V1");
+            out.put("phase", "PHASE1");
+            out.put("uid", uid);
+            out.put("epoch", epoch);
+            out.put("activeAlias", alias);
+            out.put("alias", alias);
+            out.put("resultId", resultId);
+            out.put("stateRef", stateRef);
+            out.put("nextCommand", nextCommand);
+            out.put("nextAlias", nextAlias);
+            out.put("baseKey", baseKey);
+            out.put("activeEdgeId", activeEdgeId);
+            out.put("globalSeenTuples", globalSeenTuples);
+            out.put("globalKeyCount", globalKeyCount);
+            out.put("globalTotalWeight", globalTotalWeight);
+            out.put("expectedWorkers", nOfP);
+            out.put("installedWorkerCount", workers.size());
+            out.put("receivedWorkers", new ArrayList<Integer>(workers));
+        }else if (TYPE_PHASE2_LOCAL_INSTALLED.equals(mode)) {
             out.put("type", "GLOBAL_PHASE2_ROOT_SAMPLE_INSTALLED");
             out.put("protocol", "SHARDED_PHASE2_V1");
             out.put("phase", "PHASE2");
@@ -308,6 +337,48 @@ public final class OnePassWorkerReadyReduceFunction extends ReduceFunction imple
         } catch (Exception e) {
             throw new IllegalStateException(
                     "Could not serialize OnePass global readiness", e);
+        }
+    }
+
+    private void acceptReplicatedPhaseOneInstall(JsonNode node) {
+
+        if (uid < 0) {
+
+            uid = intField(node, "uid", -1);
+            protocol = text(node, "protocol");
+            epoch = intField(node, "epoch", -1);
+            alias = text(node, "activeAlias");
+            resultId = text(node, "resultId");
+            stateRef = text(node, "stateRef");
+            nextCommand = text(node, "nextCommand");
+            nextAlias = text(node, "nextAlias");
+            baseKey = text(node, "baseKey");
+            activeEdgeId = text(node, "activeEdgeId");
+            globalSeenTuples = longField(node, "globalSeenTuples", -1L);
+            globalKeyCount = longField(node, "globalKeyCount", -1L);
+            globalTotalWeight = doubleField(node, "globalTotalWeight", Double.NaN);
+
+            if (!"REPLICATED_PHASE1_V1".equals(protocol)) {
+                throw new IllegalStateException("Unexpected replicated Phase-1 protocol: " + protocol);
+            }
+
+            if (epoch <= 0 || alias.isEmpty() || resultId.isEmpty() || stateRef.isEmpty() || baseKey.isEmpty() ||
+                    activeEdgeId.isEmpty()) {
+                throw new IllegalStateException("Incomplete replicated Phase-1 install metadata: " + node);
+            }
+        } else {
+            requireSameInt(node, "uid", uid);
+            requireSameInt(node, "epoch", epoch);
+            requireSameText(node, "activeAlias", alias);
+            requireSameText(node, "resultId", resultId);
+            requireSameText(node, "stateRef", stateRef);
+            requireSameText(node, "nextCommand", nextCommand);
+            requireSameText(node, "nextAlias", nextAlias);
+            requireSameText(node, "baseKey", baseKey);
+            requireSameText(node, "activeEdgeId", activeEdgeId);
+            requireSameLong(node, "globalSeenTuples", globalSeenTuples);
+            requireSameLong(node, "globalKeyCount", globalKeyCount);
+            requireSameDoubleBits(node, "globalTotalWeight", globalTotalWeight);
         }
     }
 

@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
+import infore.SDE.transformations.onepass.OnePassExecutionMode;
 import infore.SDE.transformations.onepass.sql.OnePassCatalog;
 import infore.SDE.transformations.onepass.sql.OnePassQueryCatalogLoader;
 import infore.SDE.transformations.onepass.sql.OnePassSqlCompiler;
@@ -31,7 +32,8 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Local integration / benchmark test for the SHARDED OnePass* Phase 1 + Phase 2 + Phase 3 design.
+ * Local integration / benchmark test for both OnePass* execution architectures:
+ * SHARDED and REPLICATED level-synchronous Phase 1 + Phase 2 + Phase 3.
  * <p>
  * Timing semantics:
  * <p>
@@ -90,7 +92,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // LOCAL TEST SETTINGS
     // ---------------------------------------------------------------------
 
-
+/*
     private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
             "dataTopic");
@@ -114,12 +116,12 @@ public final class OnepassSamplerSdeMultiworkerTest {
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
 
+    */
     // =========================
     // SOFTNET
     // Uncomment these and comment the LOCAL definitions above.
     // =========================
 
-/*
     private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
     private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
     private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
@@ -137,7 +139,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/pkapenekakis/onepass/results/onepass_all_phases_softnet.csv";
- */
+
     // ---------------------------------------------------------------------
     // TEST CONFIGURATION
     // ---------------------------------------------------------------------
@@ -165,10 +167,22 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // The JVM properties still work, but these are intentionally not final so
     // configureRuntimeArguments(args) can override them from the terminal.
     private static long TEST_ROW_LIMIT =
-            Long.parseLong(System.getProperty("onepass.testRowLimit", "100000"));
+            Long.parseLong(System.getProperty("onepass.testRowLimit", "1000000"));
 
     private static int EXPECTED_WORKERS =
-            Integer.parseInt(System.getProperty("onepass.workers", "1"));
+            Integer.parseInt(System.getProperty("onepass.workers", "4"));
+
+    /*
+     * SHARDED:
+     *   Existing production sharded/coordinator-free implementation.
+     *
+     * REPLICATED:
+     *   Level-synchronous replicated Phase-1 indexes. Phase 2 and Phase 3 keep
+     *   the existing deterministic hash distribution, but continuation lookups
+     *   are local because every worker owns the complete Phase-1 index set.
+     */
+    private static OnePassExecutionMode EXECUTION_MODE =
+            OnePassExecutionMode.fromString(System.getProperty("onepass.executionMode", "REPLICATED"));
 
     private static final long TIMEOUT_MS = Long.parseLong(System.getProperty("onepass.timeoutMs",
             Long.toString(30L * 60L * 1000L)));
@@ -242,7 +256,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
      * so enabling this flag does not pollute the benchmark timing.
      */
     private static final int REQUEST_DEBUG_EXPORT_PHASE1 = 79;
-    private static final boolean EXPORT_PHASE1_INDEXES = true;
+    private static final boolean EXPORT_PHASE1_INDEXES = false;
 
     private static final String PHASE1_INDEX_EXPORT_DIR = System.getProperty("onepass.phase1IndexExportDir",
             "/tmp/onepass-phase1-validator");
@@ -269,7 +283,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
      *   - normal/benchmark execution is unaffected.
      */
     private static final int REQUEST_DEBUG_VALIDATE_PHASE2 = 89;
-    private static final boolean VALIDATE_PHASE2 = true;
+    private static final boolean VALIDATE_PHASE2 = false;
 
     private static final String PHASE2_VALIDATION_DIR =
             System.getProperty("onepass.phase2ValidationDir", "/tmp/onepass-phase2-validator");
@@ -305,16 +319,20 @@ public final class OnepassSamplerSdeMultiworkerTest {
                     "RUN_PHASE_3=true requires RUN_PHASE_2=true because Phase 3 extends the installed Phase-2 root sample.");
         }
 
-        String streamId = "onepass-sharded-phase123-local-test";
+        String streamId = "onepass-" + EXECUTION_MODE.name().toLowerCase()
+                + "-phase123-local-test";
 
         String baseKey = "onepass-phase123-" + uid;
 
         System.out.println("=======================================================");
-        System.out.println(" OnePass* SHARDED PHASE 1 + PHASE 2 + PHASE 3 - LOCAL TEST");
+        System.out.println(" OnePass* " + EXECUTION_MODE
+                + " PHASE 1 + PHASE 2 + PHASE 3 - LOCAL TEST");
         System.out.println("=======================================================");
         System.out.println("uid              = " + uid);
         System.out.println("baseKey          = " + baseKey);
         System.out.println("workers          = " + EXPECTED_WORKERS);
+        System.out.println("executionMode    = " + EXECUTION_MODE);
+        System.out.println("phase1Protocol   = " + EXECUTION_MODE.phaseOneProtocol());
         System.out.println("bootstrap        = " + BOOTSTRAP_SERVERS);
         System.out.println("dataTopic        = " + DATA_TOPIC);
         System.out.println("requestTopic     = " + REQUEST_TOPIC);
@@ -357,7 +375,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         OnePassCatalog catalog = OnePassQueryCatalogLoader.load(params.getDataset().getDbConfig());
 
-        validatePlanForShardedOnePassV1(plan);
+        validatePlanForOnePass(plan);
 
         System.out.println("Compiled plan:");
         System.out.println(plan);
@@ -439,7 +457,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             System.out.println();
             System.out.println("=======================================================");
-            System.out.println(" STARTING MEASURED ONEPASS* SHARDED PHASE 1");
+            System.out.println(" STARTING MEASURED ONEPASS* " + EXECUTION_MODE + " PHASE 1");
             System.out.println(" TPC-H parsing + Kafka sends are already complete.");
             System.out.println("=======================================================");
             System.out.println();
@@ -478,7 +496,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 System.out.println("Kafka transaction committed. " + alias + " is now visible to the read_committed SDE source.");
 
-                JsonNode transition = waitForShardedPhaseOneTransition(phaseOneFeedbackConsumer, uid, epoch, alias, resultId, expectedNextCommand, expectedNextAlias, TIMEOUT_MS);
+                JsonNode transition = waitForPhaseOneTransition(phaseOneFeedbackConsumer, uid, epoch, alias, resultId, expectedNextCommand, expectedNextAlias, TIMEOUT_MS);
 
                 long globalSeen = longField(transition, "globalSeenTuples", -1L);
 
@@ -514,7 +532,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             System.out.println();
             System.out.println("=======================================================");
-            System.out.println(" SHARDED PHASE 1 COMPLETE");
+            System.out.println(" " + EXECUTION_MODE + " PHASE 1 COMPLETE");
             System.out.println(" START_PHASE_2 has been observed.");
             System.out.println("=======================================================");
 
@@ -539,7 +557,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
             writePhaseOneBenchmarkCsv(
                     plan,
                     phaseOnePreloadNanos,
-                    "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE1_LOCAL"
+                    implementationLabel() + "_PHASE1_LOCAL"
             );
 
             // =============================================================
@@ -586,7 +604,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 System.out.println();
                 System.out.println("=======================================================");
-                System.out.println(" STARTING MEASURED ONEPASS* SHARDED PHASE 2");
+                System.out.println(" STARTING MEASURED ONEPASS* " + EXECUTION_MODE + " PHASE 2");
                 System.out.println(" rootAlias=" + plan.getRootAlias());
                 System.out.println(" rootRows=" + preparedPhaseTwoRoot.rows);
                 System.out.println(" resultId=" + phaseTwoResultId);
@@ -599,7 +617,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 System.out.println("Kafka transaction committed. Phase-2 root " + preparedPhaseTwoRoot.alias + " is now visible to the read_committed SDE source.");
 
-                PhaseTwoCompletion phaseTwoCompletion = waitForShardedPhaseTwoCompletion(phaseTwoOutputConsumer, uid, phaseTwoResultId, TIMEOUT_MS);
+                PhaseTwoCompletion phaseTwoCompletion = waitForPhaseTwoCompletion(phaseTwoOutputConsumer, uid, phaseTwoResultId, TIMEOUT_MS);
 
                 recordDuration("phase2_algorithm_total", phaseTwoStartNanos);
 
@@ -690,7 +708,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
                         phaseTwoPreloadNanos,
                         ready,
                         installed,
-                        "SDE_KAFKA_MULTIWORKER_SHARDED_PHASE2_LOCAL"
+                        implementationLabel() + "_PHASE2_LOCAL"
                 );
 
                 /*
@@ -716,7 +734,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 System.out.println();
                 System.out.println("=======================================================");
-                System.out.println(" SHARDED PHASE 2 COMPLETE");
+                System.out.println(" " + EXECUTION_MODE + " PHASE 2 COMPLETE");
                 System.out.println("=======================================================");
                 System.out.println("Global root sample is installed on all " + EXPECTED_WORKERS + " workers.");
 
@@ -737,7 +755,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
                      * the first START_PHASE_3_ALIAS request reached RequestTopic
                      * with the same traversal metadata used by the workers.
                      */
-                    JsonNode firstPhaseThreeStart = waitForShardedPhaseThreeStartTransition(
+                    JsonNode firstPhaseThreeStart = waitForPhaseThreeStartTransition(
                             phaseOneFeedbackConsumer,
                             uid,
                             baseKey,
@@ -817,7 +835,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                     System.out.println();
                     System.out.println("=======================================================");
-                    System.out.println(" STARTING MEASURED ONEPASS* SHARDED PHASE 3");
+                    System.out.println(" STARTING MEASURED ONEPASS* " + EXECUTION_MODE + " PHASE 3");
                     System.out.println(" replayOrder=" + phaseThreeOrder);
                     System.out.println("=======================================================");
 
@@ -869,7 +887,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                         if (last) {
 
-                            finalPhaseThreeCompletion = waitForShardedPhaseThreeCompletion(
+                            finalPhaseThreeCompletion = waitForPhaseThreeCompletion(
                                     phaseTwoOutputConsumer,
                                     uid,
                                     baseKey,
@@ -885,7 +903,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                             String nextAlias = phaseThreeOrder.get(aliasIndex + 1);
 
-                            JsonNode nextTransition = waitForShardedPhaseThreeStartTransition(
+                            JsonNode nextTransition = waitForPhaseThreeStartTransition(
                                     phaseOneFeedbackConsumer,
                                     uid,
                                     baseKey,
@@ -951,12 +969,12 @@ public final class OnepassSamplerSdeMultiworkerTest {
                             installed,
                             phaseThreePreloadNanos,
                             finalPhaseThreeCompletion,
-                            "SDE_KAFKA_MULTIWORKER_SHARDED_ONEPASS_PHASE123"
+                            implementationLabel() + "_ONEPASS_PHASE123"
                     );
 
                     System.out.println();
                     System.out.println("=======================================================");
-                    System.out.println(" SHARDED PHASE 3 COMPLETE");
+                    System.out.println(" " + EXECUTION_MODE + " PHASE 3 COMPLETE");
                     System.out.println("=======================================================");
                     System.out.println(
                             "SUCCESS: Phase 1 + Phase 2 + Phase 3 completed locally.");
@@ -982,19 +1000,21 @@ public final class OnepassSamplerSdeMultiworkerTest {
                             installed,
                             0L,
                             null,
-                            "SDE_KAFKA_MULTIWORKER_SHARDED_ONEPASS_PHASE12_ONLY"
+                            implementationLabel() + "_ONEPASS_PHASE12_ONLY"
                     );
 
                     System.out.println();
                     System.out.println(
-                            "SUCCESS: Phase 1 + sharded Phase 2 completed locally. "
-                                    + "RUN_PHASE_3=false, so Phase-3 replay data was not released.");
+                            "SUCCESS: Phase 1 + Phase 2 completed locally in "
+                                    + EXECUTION_MODE
+                                    + " mode. RUN_PHASE_3=false, so Phase-3 replay data was not released.");
                 }
 
             } else {
 
                 System.out.println();
-                System.out.println("SUCCESS: sharded Phase 1 completed locally. " + "RUN_PHASE_2=false, so the test stops at START_PHASE_2.");
+                System.out.println("SUCCESS: " + EXECUTION_MODE
+                        + " Phase 1 completed locally. RUN_PHASE_2=false, so the test stops at START_PHASE_2.");
             }
 
         } finally {
@@ -1507,10 +1527,10 @@ public final class OnepassSamplerSdeMultiworkerTest {
     }
 
     // =====================================================================
-    // SHARDED PHASE-1 REQUEST-TOPIC OBSERVER
+    // PHASE-1 REQUEST-TOPIC OBSERVER (SHARDED OR REPLICATED)
     // =====================================================================
 
-    private static JsonNode waitForShardedPhaseOneTransition(KafkaConsumer<String, String> consumer, int uid, int completedEpoch, String completedAlias, String expectedResultId, String expectedType, String expectedNextAlias, long timeoutMs) throws Exception {
+    private static JsonNode waitForPhaseOneTransition(KafkaConsumer<String, String> consumer, int uid, int completedEpoch, String completedAlias, String expectedResultId, String expectedType, String expectedNextAlias, long timeoutMs) throws Exception {
 
         long deadline = System.currentTimeMillis() + timeoutMs;
 
@@ -1556,7 +1576,8 @@ public final class OnepassSamplerSdeMultiworkerTest {
                     continue;
                 }
 
-                if (!"SHARDED_PHASE1_V1".equals(textField(payload, "protocol", ""))) {
+                if (!EXECUTION_MODE.phaseOneProtocol().equals(
+                        textField(payload, "protocol", ""))) {
                     continue;
                 }
 
@@ -1592,18 +1613,30 @@ public final class OnepassSamplerSdeMultiworkerTest {
                     throw new IllegalStateException("Transition expectedWorkers mismatch. configured=" + EXPECTED_WORKERS + ", payload=" + expectedWorkers + ". Payload=" + payload);
                 }
 
-                System.out.println("Observed sharded Phase-1 transition: " + expectedType + ", completedAlias=" + completedAlias + ", completedEpoch=" + completedEpoch + ", nextAlias=" + expectedNextAlias + ", globalSeenTuples=" + longField(payload, "globalSeenTuples", -1L) + ", globalKeyCount=" + longField(payload, "globalKeyCount", -1L));
+                System.out.println("Observed " + EXECUTION_MODE + " Phase-1 transition: "
+                        + expectedType + ", completedAlias=" + completedAlias
+                        + ", completedEpoch=" + completedEpoch
+                        + ", nextAlias=" + expectedNextAlias
+                        + ", globalSeenTuples=" + longField(payload, "globalSeenTuples", -1L)
+                        + ", globalKeyCount=" + longField(payload, "globalKeyCount", -1L));
 
                 return payload;
             }
         }
 
-        throw new IllegalStateException("Timed out waiting for sharded Phase-1 transition. " + "uid=" + uid + ", epoch=" + completedEpoch + ", alias=" + completedAlias + ", resultId=" + expectedResultId + ", expectedType=" + expectedType + ", nextAlias=" + expectedNextAlias + ", recordsSeen=" + recordsSeen);
+        throw new IllegalStateException("Timed out waiting for " + EXECUTION_MODE
+                + " Phase-1 transition. uid=" + uid
+                + ", epoch=" + completedEpoch
+                + ", alias=" + completedAlias
+                + ", resultId=" + expectedResultId
+                + ", expectedType=" + expectedType
+                + ", nextAlias=" + expectedNextAlias
+                + ", recordsSeen=" + recordsSeen);
     }
 
 
     // =====================================================================
-    // SHARDED PHASE-2 OUTPUT-TOPIC OBSERVER
+    // PHASE-2 OUTPUT-TOPIC OBSERVER
     // =====================================================================
 
     /**
@@ -1618,7 +1651,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
      * The payload also carries the global Phase-2 counters and sample metadata
      * used by the benchmark and correctness validator.
      */
-    private static PhaseTwoCompletion waitForShardedPhaseTwoCompletion(
+    private static PhaseTwoCompletion waitForPhaseTwoCompletion(
             KafkaConsumer<String, String> consumer,
             int uid,
             String expectedResultId,
@@ -1920,7 +1953,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
 
     // =====================================================================
-    // SHARDED PHASE-3 REQUEST/OUTPUT OBSERVERS
+    // PHASE-3 REQUEST/OUTPUT OBSERVERS
     // =====================================================================
 
     /**
@@ -1930,7 +1963,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
      * the next alias. Observing this request is therefore an end-to-end proof
      * that the previous alias reached the all-worker installation barrier.
      */
-    private static JsonNode waitForShardedPhaseThreeStartTransition(
+    private static JsonNode waitForPhaseThreeStartTransition(
             KafkaConsumer<String, String> consumer,
             int uid,
             String expectedBaseKey,
@@ -2231,7 +2264,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
      * through the next START_PHASE_3_ALIAS transition above. The final record
      * is external only when phaseThreeComplete=true.
      */
-    private static JsonNode waitForShardedPhaseThreeCompletion(
+    private static JsonNode waitForPhaseThreeCompletion(
             KafkaConsumer<String, String> consumer,
             int uid,
             String expectedBaseKey,
@@ -2654,7 +2687,24 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         File validatorOutput = new File(PHASE1_VALIDATOR_JSON_PATH);
 
-        mergePhaseOneWorkerShardsForValidator(runDirectory, EXPECTED_WORKERS, uid, validatorOutput);
+        if (EXECUTION_MODE == OnePassExecutionMode.REPLICATED) {
+
+            consolidateReplicatedPhaseOneIndexesForValidator(
+                    runDirectory,
+                    EXPECTED_WORKERS,
+                    uid,
+                    validatorOutput
+            );
+
+        } else {
+
+            mergePhaseOneWorkerShardsForValidator(
+                    runDirectory,
+                    EXPECTED_WORKERS,
+                    uid,
+                    validatorOutput
+            );
+        }
 
         System.out.println();
         System.out.println("Phase-1 validator JSON written to: " + validatorOutput.getAbsolutePath());
@@ -2853,6 +2903,153 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         MAPPER.writerWithDefaultPrettyPrinter().writeValue(outputFile, validatorJson);
     }
+
+
+    /**
+     * REPLICATED-mode Phase-1 validation.
+     *
+     * In replicated mode every worker must hold the same COMPLETE Phase-1
+     * index set after the final alias installation barrier. Therefore we do
+     * not add worker files together. We assert exact equality and write one
+     * canonical copy for the independent validator.
+     */
+    private static void consolidateReplicatedPhaseOneIndexesForValidator(
+            File runDirectory,
+            int expectedWorkers,
+            int expectedUid,
+            File outputFile) throws Exception {
+
+        JsonNode referenceIndexes = null;
+
+        for (int workerId = 0; workerId < expectedWorkers; workerId++) {
+
+            File workerFile =
+                    new File(
+                            runDirectory,
+                            "worker-" + workerId + ".json"
+                    );
+
+            JsonNode root =
+                    MAPPER.readTree(
+                            workerFile
+                    );
+
+            int fileUid =
+                    intField(
+                            root,
+                            "uid",
+                            -1
+                    );
+
+            if (fileUid != expectedUid) {
+
+                throw new IllegalStateException(
+                        "Replicated validator UID mismatch."
+                                + " file=" + workerFile.getAbsolutePath()
+                                + ", expected=" + expectedUid
+                                + ", actual=" + fileUid
+                );
+            }
+
+            int fileWorkerId =
+                    intField(
+                            root,
+                            "workerId",
+                            -1
+                    );
+
+            if (fileWorkerId != workerId) {
+
+                throw new IllegalStateException(
+                        "Replicated validator workerId mismatch."
+                                + " expected=" + workerId
+                                + ", actual=" + fileWorkerId
+                                + ", file=" + workerFile.getAbsolutePath()
+                );
+            }
+
+            int fileExpectedWorkers =
+                    intField(
+                            root,
+                            "expectedWorkers",
+                            -1
+                    );
+
+            if (fileExpectedWorkers != expectedWorkers) {
+
+                throw new IllegalStateException(
+                        "Replicated validator expectedWorkers mismatch."
+                                + " worker=" + workerId
+                                + ", expected=" + expectedWorkers
+                                + ", actual=" + fileExpectedWorkers
+                );
+            }
+
+            JsonNode indexes =
+                    root.get(
+                            "edgeIndexes"
+                    );
+
+            if (indexes == null
+                    || !indexes.isObject()) {
+
+                throw new IllegalStateException(
+                        "Replicated worker validation file has no edgeIndexes: "
+                                + workerFile.getAbsolutePath()
+                );
+            }
+
+            if (referenceIndexes == null) {
+
+                referenceIndexes =
+                        indexes.deepCopy();
+
+            } else if (!referenceIndexes.equals(indexes)) {
+
+                throw new IllegalStateException(
+                        "Replicated Phase-1 indexes differ between workers."
+                                + " worker=" + workerId
+                                + ", file=" + workerFile.getAbsolutePath()
+                );
+            }
+        }
+
+        ObjectNode output =
+                MAPPER.createObjectNode();
+
+        output.set(
+                "edgeIndexes",
+                referenceIndexes == null
+                        ? MAPPER.createObjectNode()
+                        : referenceIndexes
+        );
+
+        File parent =
+                outputFile.getParentFile();
+
+        if (parent != null
+                && !parent.exists()
+                && !parent.mkdirs()) {
+
+            throw new IllegalStateException(
+                    "Could not create validator output directory: "
+                            + parent.getAbsolutePath()
+            );
+        }
+
+        MAPPER.writerWithDefaultPrettyPrinter()
+                .writeValue(
+                        outputFile,
+                        output
+                );
+
+        System.out.println(
+                "Replicated Phase-1 validation passed: all "
+                        + expectedWorkers
+                        + " workers have identical complete indexes."
+        );
+    }
+
 
     private static void deleteRecursively(File file) {
 
@@ -3270,6 +3467,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         ObjectNode parameters = MAPPER.createObjectNode();
 
         parameters.put("onePassSql", TEST_ONEPASS_SQL);
+        parameters.put("onePassExecutionMode", EXECUTION_MODE.name());
 
         request.set("parameters", parameters);
 
@@ -3815,7 +4013,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // PLAN VALIDATION
     // =====================================================================
 
-    private static void validatePlanForShardedOnePassV1(CompiledOnePassPlan plan) {
+    private static void validatePlanForOnePass(CompiledOnePassPlan plan) {
 
         if (plan == null) {
             throw new IllegalArgumentException("Compiled plan must not be null");
@@ -3879,6 +4077,14 @@ public final class OnepassSamplerSdeMultiworkerTest {
         }
     }
 
+    private static String implementationLabel() {
+
+        return EXECUTION_MODE == OnePassExecutionMode.REPLICATED
+                ? "SDE_KAFKA_MULTIWORKER_REPLICATED_LEVEL_SYNC"
+                : "SDE_KAFKA_MULTIWORKER_SHARDED";
+    }
+
+
     // =====================================================================
     // BENCHMARK
     // =====================================================================
@@ -3938,7 +4144,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         long rows = countFor("phase1_rows_processed");
 
         System.out.println();
-        System.out.println("=== Sharded OnePass* Phase 1 benchmark ===");
+        System.out.println("=== " + EXECUTION_MODE + " OnePass* Phase 1 benchmark ===");
 
         System.out.printf("%-42s %12.3f s  [OUTSIDE TIMER]%n", "phase1_kafka_preload", preloadSeconds);
 
@@ -4050,7 +4256,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         int installedWorkerCount = intField(installed, "installedWorkerCount", -1);
 
         System.out.println();
-        System.out.println("=== Sharded OnePass* Phase 2 benchmark ===");
+        System.out.println("=== " + EXECUTION_MODE + " OnePass* Phase 2 benchmark ===");
 
         System.out.printf("%-42s %12.3f s  [OUTSIDE TIMER]%n", "phase2_root_kafka_preload", preloadSeconds);
 
@@ -4111,7 +4317,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
                 );
 
         System.out.println();
-        System.out.println("=== Sharded OnePass* Phase 3 benchmark ===");
+        System.out.println("=== " + EXECUTION_MODE + " OnePass* Phase 3 benchmark ===");
 
         System.out.printf(
                 "%-42s %12.3f s  [OUTSIDE TIMER]%n",
@@ -5093,59 +5299,103 @@ public final class OnepassSamplerSdeMultiworkerTest {
     private static void configureRuntimeArguments(String[] args) {
 
         /*
-         * Supported command-line forms:
+         * Supported positional forms are unchanged:
          *
          *   <testRowLimit> <expectedWorkers>
          *
-         * or, if Kafka brokers must also be overridden:
+         * or:
          *
          *   <kafkaBrokers> <testRowLimit> <expectedWorkers>
          *
-         * Backward compatibility:
+         * or the legacy:
          *
          *   <kafkaBrokers>
          *
-         * still behaves exactly as before.
+         * Architecture is selected independently with:
          *
-         * If no command-line value is supplied, the existing -Donepass.*
-         * properties and class defaults are used.
+         *   --mode=SHARDED
+         *   --mode=REPLICATED
+         *
+         * The system property also remains available:
+         *
+         *   -Donepass.executionMode=REPLICATED
          */
-
-        String kafkaArgument = null;
+        List<String> positional =
+                new ArrayList<String>();
 
         if (args != null) {
 
-            if (args.length == 1) {
+            for (String arg : args) {
 
-                kafkaArgument = args[0];
+                if (arg != null
+                        && arg.startsWith("--mode=")) {
 
-            } else if (args.length == 2) {
+                    EXECUTION_MODE =
+                            OnePassExecutionMode.fromString(
+                                    arg.substring(
+                                            "--mode=".length()
+                                    )
+                            );
 
-                TEST_ROW_LIMIT = parseTestRowLimitArgument(args[0]);
+                } else {
 
-                EXPECTED_WORKERS = parseExpectedWorkersArgument(args[1]);
-
-            } else if (args.length == 3) {
-
-                kafkaArgument = args[0];
-
-                TEST_ROW_LIMIT = parseTestRowLimitArgument(args[1]);
-
-                EXPECTED_WORKERS = parseExpectedWorkersArgument(args[2]);
-
-            } else if (args.length > 3) {
-
-                throw new IllegalArgumentException(
-                        "Usage: [<kafkaBrokers>] <testRowLimit> <expectedWorkers> "
-                                + "or the legacy single <kafkaBrokers> argument."
-                );
+                    positional.add(arg);
+                }
             }
+        }
+
+        String[] legacyArgs =
+                positional.toArray(
+                        new String[0]
+                );
+
+        String kafkaArgument = null;
+
+        if (legacyArgs.length == 1) {
+
+            kafkaArgument = legacyArgs[0];
+
+        } else if (legacyArgs.length == 2) {
+
+            TEST_ROW_LIMIT =
+                    parseTestRowLimitArgument(
+                            legacyArgs[0]
+                    );
+
+            EXPECTED_WORKERS =
+                    parseExpectedWorkersArgument(
+                            legacyArgs[1]
+                    );
+
+        } else if (legacyArgs.length == 3) {
+
+            kafkaArgument =
+                    legacyArgs[0];
+
+            TEST_ROW_LIMIT =
+                    parseTestRowLimitArgument(
+                            legacyArgs[1]
+                    );
+
+            EXPECTED_WORKERS =
+                    parseExpectedWorkersArgument(
+                            legacyArgs[2]
+                    );
+
+        } else if (legacyArgs.length > 3) {
+
+            throw new IllegalArgumentException(
+                    "Usage: [<kafkaBrokers>] <testRowLimit> <expectedWorkers> "
+                            + "[--mode=SHARDED|REPLICATED] "
+                            + "or the legacy single <kafkaBrokers> argument."
+            );
         }
 
         if (kafkaArgument != null
                 && !kafkaArgument.trim().isEmpty()) {
 
-            BOOTSTRAP_SERVERS = kafkaArgument.trim();
+            BOOTSTRAP_SERVERS =
+                    kafkaArgument.trim();
 
         } else {
 
@@ -5168,18 +5418,29 @@ public final class OnepassSamplerSdeMultiworkerTest {
          * existing -Donepass.testRowLimit / -Donepass.workers properties.
          */
         if (TEST_ROW_LIMIT < -1L) {
-            throw new IllegalArgumentException("testRowLimit must be -1 (full relation) or >= 0. Actual=" + TEST_ROW_LIMIT
+
+            throw new IllegalArgumentException(
+                    "testRowLimit must be -1 (full relation) or >= 0. Actual="
+                            + TEST_ROW_LIMIT
             );
         }
 
         if (EXPECTED_WORKERS <= 0) {
+
             throw new IllegalArgumentException(
-                    "expectedWorkers must be > 0. Actual=" + EXPECTED_WORKERS
+                    "expectedWorkers must be > 0. Actual="
+                            + EXPECTED_WORKERS
             );
         }
 
-        System.out.println("[OnePass TEST CONFIG]" + " kafka=" + BOOTSTRAP_SERVERS + ", testRowLimit=" +
-                TEST_ROW_LIMIT + ", expectedWorkers=" + EXPECTED_WORKERS
+        System.out.println(
+                "[OnePass TEST CONFIG]"
+                        + " kafka=" + BOOTSTRAP_SERVERS
+                        + ", testRowLimit=" + TEST_ROW_LIMIT
+                        + ", expectedWorkers=" + EXPECTED_WORKERS
+                        + ", executionMode=" + EXECUTION_MODE
+                        + ", phase1Protocol="
+                        + EXECUTION_MODE.phaseOneProtocol()
         );
     }
 

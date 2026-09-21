@@ -52,8 +52,6 @@ public class Run {
 	private static int parallelism;
 	private static String kafkaOutputTopic;
 	private static String kafkaOnePassStateTopic;
-	private static OnePassDataRouterCoFlatMap.RoutingMode onePassRoutingMode =
-			OnePassDataRouterCoFlatMap.RoutingMode.ROUND_ROBIN;
 
 	/**
 	 * @param args Program arguments. You have to provide 4 arguments otherwise
@@ -159,7 +157,7 @@ public class Run {
 
 		//Replace generic dataRouter with round-robin for One-pass*
 		DataStream<Datapoint> DataStream = dataStream.connect(RQ_Stream)
-				.flatMap(new OnePassDataRouterCoFlatMap(onePassRoutingMode)).name("ONEPASS_AWARE_DATA_ROUTER");
+				.flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_AWARE_DATA_ROUTER");
 
 		/*
 		 * Global-state chunks are already keyed by workerKey.
@@ -572,12 +570,6 @@ public class Run {
 			} else {
 				kafkaOnePassStateTopic = "onepassStateTopic";
 			}
-			if (args.length > 6) {
-				onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.fromString(args[6]
-				);
-			} else {
-				onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.ROUND_ROBIN;
-			}
 			//parallelism2 = Integer.parseInt(args[5]);
 			//multi = Integer.parseInt(args[5]);
 
@@ -597,7 +589,6 @@ public class Run {
 			//kafkaBrokersList = "159.69.32.166:9092";
 			kafkaOutputTopic = "estimationTopic";
 			kafkaOnePassStateTopic = "onepassStateTopic";
-			onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
 		}
 	}
 }

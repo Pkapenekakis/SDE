@@ -58,6 +58,8 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
     private String activeEdgeId = "";
     private String nextCommand = "";
     private String nextAlias = "";
+    private String protocol = "";
+    private int epoch = -1;
 
     private int expectedWorkers;
 
@@ -162,6 +164,32 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
                 return false;
             }
 
+            String payloadProtocol = textField(payload, "protocol", "");
+            if (!payloadProtocol.isEmpty()) {
+                if (protocol.isEmpty()) {
+                    protocol = payloadProtocol;
+
+                } else if (!protocol.equals(payloadProtocol)) {
+                    throw new IllegalStateException("Mismatching Phase-1 protocols in same reduction." +
+                            " expected=" + protocol + ", received=" + payloadProtocol);
+                }
+            }
+
+            int payloadEpoch = intField(payload, "epoch", -1);
+
+            if (payloadEpoch > 0) {
+                if (epoch < 0) {
+                    epoch = payloadEpoch;
+                } else if (epoch != payloadEpoch) {
+                    throw new IllegalStateException("Mismatching Phase-1 epochs in same reduction." +
+                            " expected=" + epoch + ", received=" + payloadEpoch);
+                }
+            }
+
+            if ("REPLICATED_PHASE1_V1".equals(payloadProtocol) && includesStableState) {
+                throw new IllegalStateException("Replicated Phase-1 must not resend stable indexes.");
+            }
+
             JsonNode phaseOneResult = payload.get("phaseOneResult");
 
             if (phaseOneResult != null && !phaseOneResult.isNull()) {
@@ -222,6 +250,27 @@ public final class OnePassIndexReduceFunction extends ReduceFunction implements 
             globalPhaseOneResult.put("edgeSummaries", buildEdgeSummaries());
 
             payload.put("globalPhaseOneResult", globalPhaseOneResult);
+
+            //Replicated
+            Map<String, Double> activeIndex = mergedEdgeIndexes.get(activeEdgeId);
+            long globalKeyCount = activeIndex == null ? 0L : activeIndex.size();
+            double globalTotalWeight = 0.0d;
+
+            if (activeIndex != null) {
+                for (Double weight : activeIndex.values()) {
+                    if (weight != null) {
+                        globalTotalWeight += weight;
+                    }
+                }
+            }
+
+            long globalSeenTuples = mergedSeenTuplesByAlias.getOrDefault(activeAlias, 0L);
+
+            payload.put("protocol", protocol.isEmpty() ? "REPLICATED_PHASE1_V1" : protocol);
+            payload.put("epoch", epoch);
+            payload.put("globalSeenTuples", globalSeenTuples);
+            payload.put("globalKeyCount", globalKeyCount);
+            payload.put("globalTotalWeight", globalTotalWeight);
 
             return MAPPER.writeValueAsString(payload);
 

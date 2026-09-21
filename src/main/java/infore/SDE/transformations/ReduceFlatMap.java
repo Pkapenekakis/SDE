@@ -146,6 +146,24 @@ public class ReduceFlatMap extends RichFlatMapFunction<Estimation, Estimation> {
     private void decorateOnePassReducedEstimation(Estimation value) {
         String[] param = value.getParam();
 
+        if (value.getRequestID() == 72 && param != null && param.length > 0 && "LOCAL_PHASE1_RESULT".equals(param[0])) {
+            String resultId = param.length > 1 ? param[1] : "PHASE1_RESULT_" + value.getUID();
+            String globalKey = value.getUID() + "_REPLICATED_PHASE1_" + resultId + "_GLOBAL";
+            value.setRequestID(73);
+            value.setEstimationkey(globalKey);
+            value.setKey(globalKey);
+            value.setParam(new String[]{"GLOBAL_PHASE1_RESULT", resultId, Integer.toString(value.getNoOfP())});
+        }
+
+        if (value.getRequestID() == 74 && param != null && param.length > 0 && "LOCAL_PHASE1_INDEX_INSTALLED".equals(param[0])) {
+            String resultId = param.length > 1 ? param[1] : "PHASE1_RESULT_" + value.getUID();
+            String globalKey = value.getUID() + "_REPLICATED_PHASE1_INSTALLED_" + resultId + "_GLOBAL";
+            value.setRequestID(75);
+            value.setEstimationkey(globalKey);
+            value.setKey(globalKey);
+            value.setParam(new String[]{"GLOBAL_PHASE1_INDEX_INSTALLED", resultId, Integer.toString(value.getNoOfP())});
+        }
+
         if (value.getRequestID() == 76 && param != null && param.length > 0 &&
                 "LOCAL_PHASE1_SHARD_READY".equals(param[0])) {
 

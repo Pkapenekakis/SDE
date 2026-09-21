@@ -806,6 +806,34 @@ public final class OnePassSamplerSynopsis implements Serializable {
         return phaseOneState.getSeenTupleCount(alias);
     }
 
+    public void installReplicatedPhaseOneAliasIndex(String activeAlias, Phase1LinkWeightIndex globalIndex, long globalSeenTuples) {
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("installReplicatedPhaseOneAliasIndex() " + "requires PHASE_1. Current phase=" + phase);
+        }
+
+        phaseOneState.installGlobalAliasEdge(activeAlias, globalIndex, globalSeenTuples);
+    }
+
+    /**
+     * REPLICATED-index Phase-3 continuation lookup.
+     *
+     * Unlike lookupShardedPhaseThreeChildWeight(), this method does not require
+     * the worker to be the deterministic owner of the child edge/key because
+     * every worker has the complete Phase-1 index.
+     */
+    public double lookupReplicatedPhaseThreeChildWeight(Object payload, int childIndex) {
+        requireShardedPhaseThreeActive();
+        OnePassTuple tuple = OnePassTupleExtractor.extract(payload);
+        java.util.List<CompiledOnePassPlan.DirectedJoinEdge> childEdges = plan.getChildEdges(tuple.getTable());
+
+        if (childIndex < 0 || childIndex >= childEdges.size()) {
+            throw new IllegalArgumentException("Invalid replicated Phase-3 childIndex=" + childIndex +
+                    " for alias=" + tuple.getTable());
+        }
+
+        return phaseOneState.lookupPhaseThreeChildContinuationWeight(tuple, childIndex);
+    }
+
     /**
      * DEBUG / VALIDATION ONLY.
      */

@@ -58,7 +58,6 @@
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/sql/OnePassWeightedByParser.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/worker/PhaseTwo/OnePassPhaseTwoEnrichmentBuffer.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/lib/TimeSeries/MyTimeSeries.java
-/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/OnePassPhaseTwoSampleChunker.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/OnePassPhaseThreeTransitionMapper.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/MaritimeSketch.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/Onepass/SingleWorker/PhaseOneSdeIntegrationTest.java
@@ -102,7 +101,6 @@
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/Sketches/windowPastDFT.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/lib/WLSH/SimilarSims.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/reduceFunctions/onepass/OnePassSampleReduceFunction.java
-/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/Onepass/Deprecated/PhaseOneTpchQ3Test.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/ContinuousSynopsis.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassPartialSample.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/producersForTesting/sendAISTest.java
@@ -131,10 +129,11 @@
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/Bloomfilter.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/messages/Onepass/JoinEdgeSpec.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/messages/Request.java
+/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/routing/OnePassWorkerPartitioner.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/RqRouterFlatMap.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/debug/OnePassPhaseTwoValidatorExporter.java
+/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/Onepass/MultiWorker/OnepassSamplerSdeMultiworkerTest.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/PastDFTSynopsis.java
-/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/coordinator/OnePassWorkerPartitioner.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/lib/Coresets/KmeansPP.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/lib/Coresets/Point.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/RUNRadiusAsPartitioner_Test.java
@@ -145,13 +144,13 @@
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/sources/kafkaConsumer.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/reduceFunctions/SimpleMaxFunction.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/worker/PhaseOne/OnePassPhaseOneEnrichmentBuffer.java
-/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/Onepass/Deprecated/Phase2TestDriver.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/reduceFunctions/onepass/OnePassIndexReduceFunction.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/producersForTesting/Datapoint1.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/OnePassSampler/TupleWeightExpressionEvaluator.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/sources/kafkaProducer4.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/DummydataRouterCoFlatMap.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/reduceFunctions/CoordinatorFunction.java
+/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/OnePassExecutionMode.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/Sketches/LSH.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/OnePassSampler/PhaseTwo/OnlineMultinomialSampler.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassExtensionChoice.java
@@ -168,7 +167,6 @@
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/transformations/onepass/worker/OnePassTupleBufferGate.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/lib/TimeSeries/windowDFT.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/reduceFunctions/WLSH_Reduce.java
-/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/Onepass/MultiWorker/OnePassSamplerSdeCoordinatorTest.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/OnePassSampler/PhaseOne/OnePassPhaseOneState.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/miniSDE.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/LossyCountingSynopsis.java
@@ -196,7 +194,6 @@
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/producersForTesting/sendSpringTest.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/RUNAISTest.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/OnePassSampler/PhaseTwo/OnePassRootSampler.java
-/home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/Experiments/Onepass/Deprecated/GenericOnePassTestDriver.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/messages/Datapoint.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/infore/SDE/synopses/AMSsynopsis.java
 /home/vboxuser/IdeaProjects/SDE/src/main/java/lib/WDFT/DFT.java

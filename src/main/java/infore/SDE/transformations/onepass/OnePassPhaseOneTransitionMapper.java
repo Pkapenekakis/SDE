@@ -8,72 +8,109 @@ import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.util.Collector;
 
 /**
- * Stateless replacement for a Phase-1 coordinator.
- * GLOBAL_PHASE1_ALIAS_READY -> START_NEXT_ALIAS / START_PHASE_2 RequestTopic message.
+ * Stateless Phase-1 transition mapper.
+ *
+ * SHARDED:
+ *   request 77 GLOBAL_PHASE1_ALIAS_READY
+ *       -> START_NEXT_ALIAS / START_PHASE_2
+ *
+ * REPLICATED:
+ *   request 75 GLOBAL_PHASE1_INDEX_INSTALLED
+ *       -> START_NEXT_ALIAS / START_PHASE_2
+ *
+ * The replicated path deliberately waits until EVERY worker has installed
+ * the completed active index before releasing the next alias.
  */
-public final class OnePassPhaseOneTransitionMapper
-        extends RichFlatMapFunction<Estimation, Estimation> {
+public final class OnePassPhaseOneTransitionMapper extends RichFlatMapFunction<Estimation, Estimation> {
 
     private static final long serialVersionUID = 1L;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Override
     public void flatMap(Estimation value, Collector<Estimation> out) throws Exception {
-        if (value == null || value.getSynopsisID() != 30 || value.getRequestID() != 77) {
+
+        if (value == null || value.getSynopsisID() != 30) {
             return;
         }
 
-        JsonNode ready = value.getEstimation() instanceof String ? MAPPER.readTree((String) value.getEstimation())
-                : MAPPER.valueToTree(value.getEstimation());
+        JsonNode payload = value.getEstimation() instanceof String ?
+                MAPPER.readTree((String) value.getEstimation()) : MAPPER.valueToTree(value.getEstimation());
 
-        if (!"GLOBAL_PHASE1_ALIAS_READY".equals(ready.get("type").asText(""))) {
+        if (value.getRequestID() == 77 && "GLOBAL_PHASE1_ALIAS_READY".equals(textField(payload, "type", ""))) {
+            emitTransition(payload, "SHARDED_PHASE1_V1", textField(payload, "alias", ""), out);
             return;
         }
 
-        String nextCommand = ready.get("nextCommand").asText("");
+        if (value.getRequestID() == 75 && "GLOBAL_PHASE1_INDEX_INSTALLED".equals(textField(payload, "type", ""))) {
+            emitTransition(payload, "REPLICATED_PHASE1_V1", textField(payload, "activeAlias",
+                    textField(payload, "alias", "")), out);
+        }
+    }
+
+    private void emitTransition(JsonNode ready, String protocol, String completedAlias, Collector<Estimation> out) {
+        String nextCommand = textField(ready, "nextCommand", "");
         if (!"START_NEXT_ALIAS".equals(nextCommand) && !"START_PHASE_2".equals(nextCommand)) {
-            throw new IllegalStateException("Invalid nextCommand in GLOBAL_PHASE1_ALIAS_READY: " + ready);
+            throw new IllegalStateException("Invalid Phase-1 nextCommand: " + ready);
         }
 
-        int uid = ready.get("uid").asInt();
-        int completedEpoch = ready.get("epoch").asInt();
-        int expectedWorkers = ready.get("expectedWorkers").asInt();
-        String baseKey = ready.get("baseKey").asText("");
-        String nextAlias = ready.get("nextAlias").asText("");
-        String resultId = ready.get("resultId").asText("");
+        int uid = intField(ready, "uid", -1);
+        int completedEpoch = intField(ready, "epoch", -1);
+        int expectedWorkers = intField(ready, "expectedWorkers", -1);
+        String baseKey = textField(ready, "baseKey", "");
+        String nextAlias = textField(ready, "nextAlias", "");
+        String resultId = textField(ready, "resultId", "");
 
-        ObjectNode payload = MAPPER.createObjectNode();
-        payload.put("type", nextCommand);
-        payload.put("onePassCommand", nextCommand);
-        payload.put("protocol", "SHARDED_PHASE1_V1");
-        payload.put("phase", "PHASE1");
-        payload.put("uid", uid);
-        payload.put("completedAlias", ready.get("alias").asText(""));
-        payload.put("completedEpoch", completedEpoch);
-        payload.put("epoch", completedEpoch + 1);
-        payload.put("nextAlias", nextAlias);
-        payload.put("onePassAlias", nextAlias);
-        payload.put("resultId", resultId);
-        payload.put("expectedWorkers", expectedWorkers);
-        payload.put("baseKey", baseKey);
-        payload.put("activeEdgeId", ready.get("activeEdgeId").asText(""));
-        payload.put("globalSeenTuples", ready.get("globalSeenTuples").asLong(0L));
-        payload.put("globalKeyCount", ready.get("globalKeyCount").asLong(0L));
-        payload.put("globalTotalWeight", ready.get("globalTotalWeight").asDouble(0.0d));
+        if (uid < 0 || completedEpoch <= 0 || expectedWorkers <= 0 || baseKey.isEmpty() || completedAlias.isEmpty() || nextAlias.isEmpty() || resultId.isEmpty()) {
+            throw new IllegalStateException("Incomplete Phase-1 transition metadata: " + ready);
+        }
 
-        /*
-         * Request(Estimation) uses estimationkey as DataSetkey, therefore this
-         * MUST be baseKey (not a unique result key).
-         */
-        Estimation request = new Estimation(uid, baseKey, 7, 30, baseKey, payload.toString(),
-                new String[] {
-                        nextCommand,
-                        nextAlias,
-                        Integer.toString(completedEpoch + 1),
-                        resultId
-                }, expectedWorkers
-        );
+        ObjectNode transition = MAPPER.createObjectNode();
+
+        transition.put("type", nextCommand);
+        transition.put("onePassCommand", nextCommand);
+        transition.put("protocol", protocol);
+        transition.put("phase", "PHASE1");
+        transition.put("uid", uid);
+        transition.put("completedAlias", completedAlias);
+        transition.put("completedEpoch", completedEpoch);
+        transition.put("epoch", completedEpoch + 1);
+        transition.put("nextAlias", nextAlias);
+        transition.put("onePassAlias", nextAlias);
+        transition.put("resultId", resultId);
+        transition.put("expectedWorkers", expectedWorkers);
+        transition.put("baseKey", baseKey);
+        transition.put("activeEdgeId", textField(ready, "activeEdgeId", ""));
+        transition.put("globalSeenTuples", longField(ready, "globalSeenTuples", 0L));
+        transition.put("globalKeyCount", longField(ready, "globalKeyCount", 0L));
+        transition.put("globalTotalWeight", doubleField(ready, "globalTotalWeight", 0.0d));
+        Estimation request = new Estimation(uid, baseKey, 7, 30, baseKey, transition.toString(),
+                new String[]{nextCommand, nextAlias, Integer.toString(completedEpoch + 1), resultId}, expectedWorkers);
 
         out.collect(request);
+    }
+
+    private static String textField(JsonNode node, String field, String defaultValue) {
+        JsonNode value = node == null ? null : node.get(field);
+        if (value == null || value.isNull()) {
+            return defaultValue;
+        }
+
+        String text = value.asText();
+        return text == null || text.trim().isEmpty() ? defaultValue : text.trim();
+    }
+
+    private static int intField(JsonNode node, String field, int defaultValue) {
+        JsonNode value = node == null ? null : node.get(field);
+        return value == null || value.isNull() ? defaultValue : value.asInt(defaultValue);
+    }
+
+    private static long longField(JsonNode node, String field, long defaultValue) {
+        JsonNode value = node == null ? null : node.get(field);
+        return value == null || value.isNull() ? defaultValue : value.asLong(defaultValue);
+    }
+
+    private static double doubleField(JsonNode node, String field, double defaultValue) {
+        JsonNode value = node == null ? null : node.get(field);
+        return value == null || value.isNull() ? defaultValue : value.asDouble(defaultValue);
     }
 }

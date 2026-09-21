@@ -27,10 +27,13 @@ public final class OnePassStateTopicEmitter
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final int ONEPASS_SYNOPSIS_ID = 30;
+    private static final int REQUEST_GLOBAL_PHASE1_INDEX = 73;
     private static final int REQUEST_STATE_TRANSFER = 78;
     private static final int REQUEST_GLOBAL_PHASE2_ROOT_SAMPLE = 83;
     private static final int REQUEST_GLOBAL_PHASE3_ALIAS_SELECTIONS = 88;
 
+    private static final String TYPE_GLOBAL_PHASE1_RESULT = "GLOBAL_PHASE1_RESULT";
+    private static final String STATE_TYPE_GLOBAL_PHASE1_INDEX = "GLOBAL_PHASE1_INDEX";
     private static final String TYPE_GLOBAL_PHASE2_ROOT_SAMPLE = "GLOBAL_PHASE2_ROOT_SAMPLE";
     private static final String TYPE_GLOBAL_PHASE3_ALIAS_SELECTIONS = "GLOBAL_PHASE3_ALIAS_SELECTIONS";
     private static final String TYPE_GLOBAL_STATE_CHUNK = "GLOBAL_STATE_CHUNK";
@@ -42,6 +45,9 @@ public final class OnePassStateTopicEmitter
 
     private final int maxEntriesPerChunk;
     private final int maxApproxBytesPerChunk;
+
+
+
 
     public OnePassStateTopicEmitter() {
         this(DEFAULT_MAX_ENTRIES_PER_CHUNK, DEFAULT_MAX_APPROX_BYTES_PER_CHUNK);
@@ -80,6 +86,12 @@ public final class OnePassStateTopicEmitter
             return;
         }
 
+        if (value.getRequestID() == REQUEST_GLOBAL_PHASE1_INDEX &&
+                TYPE_GLOBAL_PHASE1_RESULT.equals(textField(payload, "type", ""))) {
+            emitReplicatedPhaseOneIndex(value, payload, out);
+            return;
+        }
+
         if (value.getRequestID() == REQUEST_GLOBAL_PHASE2_ROOT_SAMPLE &&
                 TYPE_GLOBAL_PHASE2_ROOT_SAMPLE.equals(textField(payload, "type", ""))) {
             emitPhaseTwoRootSample(value, payload, out);
@@ -90,6 +102,99 @@ public final class OnePassStateTopicEmitter
                 TYPE_GLOBAL_PHASE3_ALIAS_SELECTIONS.equals(textField(payload, "type", ""))) {
             emitPhaseThreeAliasSelections(value, payload, out);
         }
+    }
+
+    private void emitReplicatedPhaseOneIndex(Estimation value, JsonNode payload, Collector<String> out) throws Exception {
+
+        int uid = intField(payload, "uid", value.getUID());
+        int expectedWorkers = intField(payload, "expectedWorkers", value.getNoOfP());
+        if (expectedWorkers <= 0) {
+            expectedWorkers = value.getNoOfP() > 0 ? value.getNoOfP() : 1;
+        }
+
+        String resultId = textField(payload, "resultId", "PHASE1_RESULT_" + uid);
+        String stateRef = textField(payload, "stateRef", uid + "_PHASE1_" + resultId + "_GLOBAL_INDEX");
+        String baseKey = textField(payload, "baseKey", "");
+        String activeAlias = textField(payload, "activeAlias", "");
+        String activeEdgeId = textField(payload, "activeEdgeId", "");
+
+        if (baseKey.isEmpty() || activeAlias.isEmpty() || activeEdgeId.isEmpty()) {
+            throw new IllegalStateException("GLOBAL_PHASE1_RESULT has incomplete routing metadata: " + payload);
+        }
+
+        JsonNode globalPhaseOneResult = payload.get("globalPhaseOneResult");
+        if (globalPhaseOneResult == null || !globalPhaseOneResult.isObject()) {
+            throw new IllegalStateException("GLOBAL_PHASE1_RESULT has no globalPhaseOneResult object.");
+        }
+
+        JsonNode edgeIndexes = globalPhaseOneResult.get("edgeIndexes");
+        if (edgeIndexes == null || !edgeIndexes.isObject()) {
+            throw new IllegalStateException("GLOBAL_PHASE1_RESULT has no edgeIndexes object.");
+        }
+
+        JsonNode activeIndex = edgeIndexes.get(activeEdgeId);
+
+        if (activeIndex == null || !activeIndex.isObject()) {
+            throw new IllegalStateException("GLOBAL_PHASE1_RESULT has no active edge index." + " edge=" + activeEdgeId);
+        }
+
+        ArrayNode allEntries = MAPPER.createArrayNode();
+        java.util.Iterator<java.util.Map.Entry<String, JsonNode>> fields = activeIndex.fields();
+
+        while (fields.hasNext()) {
+            java.util.Map.Entry<String, JsonNode> field = fields.next();
+            ObjectNode entry = MAPPER.createObjectNode();
+            entry.put("joinKey", field.getKey());
+            entry.put("weight", field.getValue().asDouble(0.0d));
+            allEntries.add(entry);
+        }
+
+        List<ChunkRange> ranges = buildChunkRanges(allEntries);
+
+        int chunkCount = ranges.size();
+
+        for (int chunkId = 0; chunkId < chunkCount; chunkId++) {
+            ChunkRange range = ranges.get(chunkId);
+            ObjectNode chunk = MAPPER.createObjectNode();
+            chunk.put("type", TYPE_GLOBAL_STATE_CHUNK);
+            chunk.put("stateType", STATE_TYPE_GLOBAL_PHASE1_INDEX);
+            chunk.put("protocol", "REPLICATED_PHASE1_V1");
+
+            /*
+             * One Kafka copy per chunk.
+             * Fan-out is performed by OnePassStateTopicParser AFTER Kafka.
+             */
+            chunk.put("broadcastToWorkers", true);
+
+            chunk.put("uid", uid);
+            chunk.put("synopsisID", ONEPASS_SYNOPSIS_ID);
+            chunk.put("phase", "PHASE1");
+            chunk.put("epoch", intField(payload, "epoch", -1));
+            chunk.put("resultId", resultId);
+            chunk.put("stateRef", stateRef);
+            chunk.put("queryName", textField(payload, "queryName", ""));
+            chunk.put("rootAlias", textField(payload, "rootAlias", ""));
+            chunk.put("baseKey", baseKey);
+            chunk.put("activeAlias", activeAlias);
+            chunk.put("activeEdgeId", activeEdgeId);
+            chunk.put("nextCommand", textField(payload, "nextCommand", ""));
+            chunk.put("nextAlias", textField(payload, "nextAlias", ""));
+            chunk.put("expectedWorkers", expectedWorkers);
+            chunk.put("globalSeenTuples", longField(payload, "globalSeenTuples", 0L));
+            chunk.put("globalKeyCount", longField(payload, "globalKeyCount", allEntries.size()));
+            chunk.put("globalTotalWeight", doubleField(payload, "globalTotalWeight", 0.0d));
+            chunk.put("indexEntryCount", allEntries.size());
+            chunk.put("chunkId", chunkId);
+            chunk.put("chunkCount", chunkCount);
+            ArrayNode entries = sliceArray(allEntries, range.from, range.to);
+            chunk.set("entries", entries);
+            chunk.put("entryCount", entries.size());
+            out.collect(MAPPER.writeValueAsString(chunk));
+        }
+
+        System.out.println("[OnePassStateTopicEmitter] GLOBAL_PHASE1_INDEX emitted." + " uid=" + uid +
+                ", alias=" + activeAlias + ", edge=" + activeEdgeId + ", entries=" + allEntries.size() +
+                ", kafkaChunks=" + chunkCount + ", logicalWorkers=" + expectedWorkers);
     }
 
     private void emitPhaseTwoRootSample(Estimation value, JsonNode payload, Collector<String> out) throws Exception {

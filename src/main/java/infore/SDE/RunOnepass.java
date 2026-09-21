@@ -45,9 +45,6 @@ public class RunOnepass {
     private static String kafkaOutputTopic;
     private static String kafkaOnePassStateTopic;
 
-    private static OnePassDataRouterCoFlatMap.RoutingMode onePassRoutingMode =
-            OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
-
     public static void main(String[] args) throws Exception {
         initializeParameters(args);
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -110,7 +107,7 @@ public class RunOnepass {
         // ONEPASS-AWARE DATA ROUTING
         // ================================================================
         DataStream<Datapoint> routedDataStream = parsedDataStream.connect(parsedRequestStream).
-                flatMap(new OnePassDataRouterCoFlatMap(onePassRoutingMode)).name("ONEPASS_AWARE_DATA_ROUTER");
+                flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_AWARE_DATA_ROUTER");
 
         //StateTopic records enter exactly the same physical worker path as ordinary routed data.
         DataStream<Datapoint> dataStreamWithState = routedDataStream.union(onePassStateTopicDataStream);
@@ -198,11 +195,42 @@ public class RunOnepass {
          *
          * OnePass currently uses:
          *
+         * 72 -> LOCAL_PHASE1_RESULT (replicated Phase-1 active-edge merge)
+         * 74 -> LOCAL_PHASE1_INDEX_INSTALLED
          * 76 -> LOCAL_PHASE1_SHARD_READY
          * 82 -> LOCAL_PHASE2_ROOT_SUMMARY
          * 85 -> LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED
+         * 87 -> LOCAL_PHASE3_ALIAS_SELECTIONS
+         * 90 -> LOCAL_PHASE3_ALIAS_SELECTIONS_INSTALLED
          */
         DataStream<Estimation> partialOutputStream = multy.flatMap(new ReduceFlatMap()).name("REDUCE");
+
+        DataStream<Estimation> onePassGlobalReplicatedPhaseOneIndexes = partialOutputStream.filter(
+                new FilterFunction<Estimation>() {
+                    private static final long serialVersionUID = 1L;
+
+                    @Override
+                    public boolean filter(Estimation value) {
+
+                        return value != null && value.getSynopsisID() == ONEPASS_SYNOPSIS_ID
+                                && value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(firstParam(value));
+                    }
+                }
+        ).name("ONEPASS_GLOBAL_REPLICATED_PHASE1_INDEX");
+
+        DataStream<Estimation> onePassGlobalReplicatedPhaseOneInstalled = partialOutputStream.filter(
+                new FilterFunction<Estimation>() {
+                    private static final long serialVersionUID = 1L;
+
+                    @Override
+                    public boolean filter(Estimation value) {
+
+                        return value != null && value.getSynopsisID() == ONEPASS_SYNOPSIS_ID &&
+                                value.getRequestID() == 75 && "GLOBAL_PHASE1_INDEX_INSTALLED".equals(firstParam(value));
+                    }
+                }
+        ).name("ONEPASS_GLOBAL_REPLICATED_PHASE1_INSTALLED");
+
         // ================================================================
         // PHASE 1 GLOBAL READINESS - REQUEST 77
         // ================================================================
@@ -220,11 +248,19 @@ public class RunOnepass {
         }).name("ONEPASS_PHASE1_ALIAS_READY");
 
         /*
-         * Stateless transition:
-         * GLOBAL_PHASE1_ALIAS_READY  -> START_NEXT_ALIAS / START_PHASE_2
+         * Stateless Phase-1 transitions:
+         *
+         * SHARDED:
+         *   request 77 GLOBAL_PHASE1_ALIAS_READY
+         *       -> START_NEXT_ALIAS / START_PHASE_2
+         *
+         * REPLICATED:
+         *   request 75 GLOBAL_PHASE1_INDEX_INSTALLED
+         *       -> START_NEXT_ALIAS / START_PHASE_2
          */
         DataStream<Estimation> onePassPhaseOneTransitions = onePassPhaseOneAliasReady.
-                flatMap(new OnePassPhaseOneTransitionMapper()).name("ONEPASS_PHASE1_TRANSITION_MAPPER").setParallelism(1);
+                union(onePassGlobalReplicatedPhaseOneInstalled).flatMap(new OnePassPhaseOneTransitionMapper()).
+                name("ONEPASS_PHASE1_TRANSITION_MAPPER").setParallelism(1);
 
         // ================================================================
         // PHASE 2 GLOBAL ROOT SAMPLE - REQUEST 83
@@ -294,11 +330,16 @@ public class RunOnepass {
 
         /*
          * request 78: targeted sharded computation/state work.
-         * request 83: bounded global root sample.
-         * OnePassStateTopicEmitter understands both.
+         * request 73: completed replicated Phase-1 edge index.
+         * request 83: bounded global Phase-2 root sample.
+         * request 88: global Phase-3 alias selections.
+         *
+         * OnePassStateTopicEmitter dispatches by requestID/type.
          */
         DataStream<Estimation> onePassStateTopicFeedback = onePassStateTransferStream.
-                union(onePassGlobalPhaseTwoRootSamples, onePassGlobalPhaseThreeAliasSelections);
+                union(onePassGlobalReplicatedPhaseOneIndexes,
+                        onePassGlobalPhaseTwoRootSamples,
+                        onePassGlobalPhaseThreeAliasSelections);
 
         onePassStateTopicFeedback.flatMap(new OnePassStateTopicEmitter()).name("ONEPASS_STATE_TOPIC_EMITTER").
                 addSink(onePassStateProducer.getProducer()).name("ONEPASS_STATE_TOPIC_OUTPUT");
@@ -352,8 +393,8 @@ public class RunOnepass {
         // GENERIC SDE GLOBAL REDUCE
         // ================================================================
         /*
-         * 77, 83 and 86 are already globally reduced and have dedicated
-         * OnePass branches above.
+         * 73, 75, 77, 83, 86, 88 and 91 are already globally reduced and
+         * have dedicated OnePass branches above.
          *
          * They should not go through GReduceFlatMap.
          */
@@ -370,7 +411,7 @@ public class RunOnepass {
 
         finalStream.addSink(estimationProducer.getProducer()).name("FINAL_STREAM_EXTERNAL_OUTPUT");
 
-        env.execute("Streaming SDE");
+        env.execute("Pkapenekakis Streaming SDE");
     }
 
     /**
@@ -423,6 +464,14 @@ public class RunOnepass {
         }
 
         String type = firstParam(value);
+
+        if (value.getRequestID() == 73 && "GLOBAL_PHASE1_RESULT".equals(type)) {
+            return true;
+        }
+
+        if (value.getRequestID() == 75 && "GLOBAL_PHASE1_INDEX_INSTALLED".equals(type)) {
+            return true;
+        }
 
         if (value.getRequestID() == 77 && "GLOBAL_PHASE1_ALIAS_READY".equals(type)) {
             return true;
@@ -491,6 +540,7 @@ public class RunOnepass {
         switch (value.getRequestID()) {
 
             case 72: // LOCAL_PHASE1_RESULT
+            case 74: //LOCAL_PHASE1_INDEX_INSTALLED
             case 76: // LOCAL_PHASE1_SHARD_READY
             case 82: // LOCAL_PHASE2_ROOT_SUMMARY
             case 85: // LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED
@@ -514,29 +564,14 @@ public class RunOnepass {
             kafkaBrokersList = args[3];
             parallelism = Integer.parseInt(args[4]);
             kafkaOnePassStateTopic = args.length > 5 ? args[5] : "onepassStateTopic";
-
-            //JOIN_KEY_HASH is the correct fallback for the current distributed OnePass design.
-            onePassRoutingMode = args.length > 6 ? OnePassDataRouterCoFlatMap.RoutingMode.fromString(args[6]) :
-                    OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
-
         } else {
-
             System.out.println("[INFO] Default values");
             kafkaDataInputTopic = "dataTopic";
             kafkaRequestInputTopic = "requestTopic";
             kafkaOutputTopic = "estimationTopic";
             kafkaBrokersList = "localhost:9092";
-            parallelism = 1;
+            parallelism = 4;
             kafkaOnePassStateTopic = "onepassStateTopic";
-            onePassRoutingMode = OnePassDataRouterCoFlatMap.RoutingMode.JOIN_KEY_HASH;
         }
-
-//        System.out.println("[INFO] dataTopic=" + kafkaDataInputTopic);
-//        System.out.println("[INFO] requestTopic=" + kafkaRequestInputTopic);
-//        System.out.println("[INFO] outputTopic=" + kafkaOutputTopic);
-//        System.out.println("[INFO] onePassStateTopic=" + kafkaOnePassStateTopic);
-//        System.out.println("[INFO] brokers=" + kafkaBrokersList);
-//        System.out.println("[INFO] parallelism=" + parallelism);
-//        System.out.println("[INFO] onePassRoutingMode=" + onePassRoutingMode);
     }
 }

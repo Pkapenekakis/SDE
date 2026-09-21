@@ -483,4 +483,48 @@ public class OnePassPhaseOneState implements Serializable {
 
         return localIndex.getOrZero(lookupKey);
     }
+
+    /**
+     * REPLICATED Phase-1 barrier install.
+     * <p>
+     * Replaces this worker's local partial index for activeAlias with the
+     * globally reduced completed edge index.
+     * <p>
+     * Previously completed edges remain untouched, so each edge is transferred
+     * through the State Topic only once.
+     */
+    public void installGlobalAliasEdge(String activeAlias, Phase1LinkWeightIndex globalIndex, long globalSeenTuples) {
+        if (activeAlias == null || activeAlias.trim().isEmpty()) {
+            throw new IllegalArgumentException("activeAlias must not be blank");
+        }
+
+        if (globalIndex == null) {
+            throw new IllegalArgumentException("globalIndex must not be null");
+        }
+
+        if (plan.isRoot(activeAlias)) {
+            throw new IllegalArgumentException("Root alias cannot install a Phase-1 parent edge: " + activeAlias);
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(activeAlias);
+        if (parentEdge == null) {
+            throw new IllegalStateException("Alias has no parent edge: " + activeAlias);
+        }
+
+        if (!parentEdge.getEdgeId().equals(globalIndex.getEdgeId())) {
+
+            throw new IllegalStateException("Replicated Phase-1 edge mismatch." + " alias=" + activeAlias +
+                    ", expectedEdge=" + parentEdge.getEdgeId() + ", receivedEdge=" + globalIndex.getEdgeId());
+        }
+
+        /*
+         * Replace, do NOT add.
+         *
+         * The old value is this worker's local partial active index.
+         * Adding the global index to it would double count this worker.
+         */
+        indexByEdgeId.put(globalIndex.getEdgeId(), globalIndex.copy());
+
+        seenTuplesByAlias.put(activeAlias, globalSeenTuples);
+    }
 }

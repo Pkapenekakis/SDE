@@ -158,6 +158,43 @@ public final class OnePassShardOwnership {
         return ownerForEdgeKey(firstChild.getEdgeId(), lookupKey, parallelism);
     }
 
+    /**
+     * Replicated-index Phase-3 input owner.
+     * <p>
+     * The tuple goes directly to the final parent-edge weighted-selection owner.
+     * All child continuation indexes are replicated, so no intermediate
+     * child-index-owner hops are required.
+     */
+    public static int ownerForPhaseThreeSelectionTuple(OnePassTuple tuple, CompiledOnePassPlan plan, int parallelism) {
+
+        if (tuple == null) {
+            throw new IllegalArgumentException("tuple must not be null");
+        }
+
+        if (plan == null) {
+            throw new IllegalArgumentException("plan must not be null");
+        }
+
+        String alias = tuple.getTable();
+
+        if (!plan.containsAlias(alias)) {
+            throw new IllegalArgumentException("Unknown Phase-3 alias '" + alias + "'");
+        }
+
+        if (plan.isRoot(alias)) {
+            throw new IllegalArgumentException("Phase-3 input cannot be root alias '" + alias + "'");
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(alias);
+
+        if (parentEdge == null) {
+            throw new IllegalStateException("Non-root Phase-3 alias '" + alias + "' has no parent edge");
+        }
+
+        JoinValue selectionKey = JoinValue.fromTuple(tuple, parentEdge.getChildFields());
+        return ownerForEdgeKey(parentEdge.getEdgeId(), selectionKey, parallelism);
+    }
+
     // deterministic FNV-1a 64-bit hash, folded to int
     private static int stableWorkerHash(String routingKey, int parallelism) {
         byte[] bytes = routingKey.getBytes(StandardCharsets.UTF_8);

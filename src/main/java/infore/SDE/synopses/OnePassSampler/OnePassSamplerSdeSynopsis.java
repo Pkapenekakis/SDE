@@ -6,6 +6,7 @@ import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.messages.Request;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneResult;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.*;
 import infore.SDE.synopses.Synopsis;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
@@ -1502,6 +1503,106 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         }
 
         return field.asInt(defaultValue);
+    }
+
+    public Estimation buildLocalReplicatedPhaseOneResultEstimation(String workerKey, int uid, int workerId,
+                                                                   int expectedWorkers, int actualParallelism,
+                                                                   String resultId, String activeAlias, int epoch,
+                                                                   String nextCommand, String nextAlias) {
+
+        String normalizedAlias = activeAlias == null ? "" : activeAlias.trim();
+        if (normalizedAlias.isEmpty()) {
+            throw new IllegalArgumentException("activeAlias must not be blank");
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(normalizedAlias);
+        if (parentEdge == null) {
+            throw new IllegalStateException("Replicated Phase-1 alias has no parent edge: " + normalizedAlias);
+        }
+
+        String activeEdgeId = parentEdge.getEdgeId();
+
+        /*
+         * IMPORTANT: includeStableState=false.
+         *
+         * Every already-completed lower-level edge already exists on all workers.
+         * Sending it again would make an edge pay the network cost repeatedly.
+         */
+        OnePassPhaseOneResult localActiveEdge = lifecycle.exportLocalP1ResultForDistMerge(normalizedAlias,
+                activeEdgeId, false);
+        String normalizedWorkerKey = workerKey == null ? "" : workerKey.trim();
+        String baseKey = stripOnePassWorkerSuffix(normalizedWorkerKey, expectedWorkers, workerId);
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+
+        payload.put("type", "LOCAL_PHASE1_RESULT");
+        payload.put("protocol", "REPLICATED_PHASE1_V1");
+        payload.put("uid", uid);
+        payload.put("workerId", workerId);
+        payload.put("expectedWorkers", expectedWorkers);
+        payload.put("actualParallelism", actualParallelism);
+        payload.put("phase", "PHASE1");
+        payload.put("epoch", epoch);
+        payload.put("resultId", resultId);
+        payload.put("queryName", plan.getQueryName());
+        payload.put("rootAlias", plan.getRootAlias());
+        payload.put("workerKey", normalizedWorkerKey);
+        payload.put("baseKey", baseKey);
+        payload.put("activeAlias", normalizedAlias);
+        payload.put("activeEdgeId", activeEdgeId);
+        payload.put("nextCommand", nextCommand == null ? "" : nextCommand.trim());
+        payload.put("nextAlias", nextAlias == null ? "" : nextAlias.trim());
+        payload.put("phaseOneResult", localActiveEdge.toDebugMap());
+        payload.put("includesStableState", false);
+
+        String json;
+        try {
+            json = MAPPER.writeValueAsString(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not serialize replicated LOCAL_PHASE1_RESULT", e);
+        }
+
+        String reduceKey = uid + "_REPLICATED_PHASE1_" + resultId;
+        return new Estimation(uid, reduceKey, 72, 30, reduceKey, json,
+                new String[]{"LOCAL_PHASE1_RESULT", resultId, normalizedAlias, Integer.toString(epoch),
+                        Integer.toString(workerId), Integer.toString(expectedWorkers)}, expectedWorkers);
+    }
+
+    public void installReplicatedPhaseOneAliasIndex(JsonNode state) {
+
+        if (state == null || state.isNull()) {
+            throw new IllegalArgumentException("Replicated Phase-1 state must not be null");
+        }
+
+        String activeAlias = textField(state, "activeAlias", "");
+        String activeEdgeId = textField(state, "activeEdgeId", "");
+        long globalSeenTuples = longField(state, "globalSeenTuples", 0L);
+        JsonNode entries = state.get("entries");
+
+        if (activeAlias.isEmpty() || activeEdgeId.isEmpty()) {
+            throw new IllegalStateException("Incomplete replicated Phase-1 state: " + state);
+        }
+
+        if (entries == null || !entries.isArray()) {
+            throw new IllegalStateException("Replicated Phase-1 state has no entries array: " + state);
+        }
+
+        Phase1LinkWeightIndex index = new Phase1LinkWeightIndex(activeEdgeId);
+
+        for (JsonNode entry : entries) {
+            String joinKey = textField(entry, "joinKey", "");
+            if (joinKey.isEmpty()) {
+                throw new IllegalStateException("Replicated Phase-1 entry has no joinKey: " + entry);
+            }
+
+            double weight = doubleField(entry, "weight", 0.0d);
+            index.add(parseJoinValue(joinKey), weight);
+        }
+
+        lifecycle.installReplicatedPhaseOneAliasIndex(activeAlias, index, globalSeenTuples);
+    }
+
+    public double lookupReplicatedPhaseThreeChildWeight(Object payload, int childIndex) {
+        return lifecycle.lookupReplicatedPhaseThreeChildWeight(payload, childIndex);
     }
 
     /**

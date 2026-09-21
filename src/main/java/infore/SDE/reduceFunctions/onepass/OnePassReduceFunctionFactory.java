@@ -25,6 +25,11 @@ public final class OnePassReduceFunctionFactory {
                     0, value.getParam(), value.getSynopsisID(), value.getRequestID());
         }
 
+        if ("LOCAL_PHASE1_INDEX_INSTALLED".equals(type) || value.getRequestID() == 74) {
+            return new OnePassWorkerReadyReduceFunction(value.getNoOfP(), 0, value.getParam(),
+                    value.getSynopsisID(), value.getRequestID());
+        }
+
         if ("LOCAL_PHASE2_ROOT_SAMPLE_INSTALLED".equals(type) || value.getRequestID() == 85) {
             return new OnePassWorkerReadyReduceFunction(value.getNoOfP(), 0, value.getParam(),
                     value.getSynopsisID(), value.getRequestID());
