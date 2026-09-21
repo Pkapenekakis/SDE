@@ -834,6 +834,24 @@ public final class OnePassSamplerSynopsis implements Serializable {
         return phaseOneState.lookupPhaseThreeChildContinuationWeight(tuple, childIndex);
     }
 
+    public void installReplicatedPhaseOneAliasIndexOwned(String activeAlias, Phase1LinkWeightIndex globalIndex, long globalSeenTuples) {
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("installReplicatedPhaseOneAliasIndexOwned() " +
+                    "requires PHASE_1. Current phase=" + phase);
+        }
+
+        phaseOneState.installGlobalAliasEdgeOwned(activeAlias, globalIndex, globalSeenTuples);
+    }
+
+    public void discardReplicatedPhaseOneLocalAliasIndex(String activeAlias) {
+        if (phase != Phase.PHASE_1) {
+            throw new IllegalStateException("discardReplicatedPhaseOneLocalAliasIndex() " +
+                    "requires PHASE_1. Current phase=" + phase);
+        }
+
+        phaseOneState.discardLocalAliasEdge(activeAlias);
+    }
+
     /**
      * DEBUG / VALIDATION ONLY.
      */

@@ -46,6 +46,18 @@ public final class OnePassStateTopicEmitter
     private final int maxEntriesPerChunk;
     private final int maxApproxBytesPerChunk;
 
+    /*
+     * Phase-1 replicated indexes contain very small records:
+     *
+     *   { "joinKey": "...", "weight": double }
+     *
+     * Do not call JsonNode.toString() for every index entry merely to estimate
+     * serialized size. A fixed entry-count chunk is predictable and substantially
+     * cheaper on the cluster.
+     */
+    private static final int PHASE1_INDEX_ENTRIES_PER_CHUNK =
+            Math.max(1, Integer.getInteger("sde.onepass.phase1IndexEntriesPerChunk", 1024));
+
 
 
 
@@ -106,8 +118,10 @@ public final class OnePassStateTopicEmitter
 
     private void emitReplicatedPhaseOneIndex(Estimation value, JsonNode payload, Collector<String> out) throws Exception {
 
+        final long startedNanos = System.nanoTime();
         int uid = intField(payload, "uid", value.getUID());
         int expectedWorkers = intField(payload, "expectedWorkers", value.getNoOfP());
+
         if (expectedWorkers <= 0) {
             expectedWorkers = value.getNoOfP() > 0 ? value.getNoOfP() : 1;
         }
@@ -133,39 +147,40 @@ public final class OnePassStateTopicEmitter
         }
 
         JsonNode activeIndex = edgeIndexes.get(activeEdgeId);
-
         if (activeIndex == null || !activeIndex.isObject()) {
             throw new IllegalStateException("GLOBAL_PHASE1_RESULT has no active edge index." + " edge=" + activeEdgeId);
         }
 
-        ArrayNode allEntries = MAPPER.createArrayNode();
+        final int totalEntries = activeIndex.size();
+        final int chunkCount = Math.max(1, (totalEntries + PHASE1_INDEX_ENTRIES_PER_CHUNK - 1) / PHASE1_INDEX_ENTRIES_PER_CHUNK);
+        System.out.println("[OnePassStateTopicEmitter] GLOBAL_PHASE1_INDEX start." + " uid=" + uid +
+                ", alias=" + activeAlias + ", edge=" + activeEdgeId + ", entries=" + totalEntries +
+                ", entriesPerChunk=" + PHASE1_INDEX_ENTRIES_PER_CHUNK + ", kafkaChunks=" + chunkCount + ", logicalWorkers=" + expectedWorkers);
+
         java.util.Iterator<java.util.Map.Entry<String, JsonNode>> fields = activeIndex.fields();
-
-        while (fields.hasNext()) {
-            java.util.Map.Entry<String, JsonNode> field = fields.next();
-            ObjectNode entry = MAPPER.createObjectNode();
-            entry.put("joinKey", field.getKey());
-            entry.put("weight", field.getValue().asDouble(0.0d));
-            allEntries.add(entry);
-        }
-
-        List<ChunkRange> ranges = buildChunkRanges(allEntries);
-
-        int chunkCount = ranges.size();
+        int emittedEntries = 0;
 
         for (int chunkId = 0; chunkId < chunkCount; chunkId++) {
-            ChunkRange range = ranges.get(chunkId);
+            ArrayNode entries = MAPPER.createArrayNode();
+            while (fields.hasNext() && entries.size() < PHASE1_INDEX_ENTRIES_PER_CHUNK) {
+                java.util.Map.Entry<String, JsonNode> field = fields.next();
+                ObjectNode entry = MAPPER.createObjectNode();
+                entry.put("joinKey", field.getKey());
+                entry.put("weight", field.getValue().asDouble(0.0d));
+                entries.add(entry);
+                emittedEntries++;
+            }
+
             ObjectNode chunk = MAPPER.createObjectNode();
             chunk.put("type", TYPE_GLOBAL_STATE_CHUNK);
             chunk.put("stateType", STATE_TYPE_GLOBAL_PHASE1_INDEX);
             chunk.put("protocol", "REPLICATED_PHASE1_V1");
 
             /*
-             * One Kafka copy per chunk.
-             * Fan-out is performed by OnePassStateTopicParser AFTER Kafka.
+             * Exactly one physical Kafka copy of each chunk.
+             * OnePassStateTopicParser performs P-way fan-out after Kafka.
              */
             chunk.put("broadcastToWorkers", true);
-
             chunk.put("uid", uid);
             chunk.put("synopsisID", ONEPASS_SYNOPSIS_ID);
             chunk.put("phase", "PHASE1");
@@ -181,20 +196,36 @@ public final class OnePassStateTopicEmitter
             chunk.put("nextAlias", textField(payload, "nextAlias", ""));
             chunk.put("expectedWorkers", expectedWorkers);
             chunk.put("globalSeenTuples", longField(payload, "globalSeenTuples", 0L));
-            chunk.put("globalKeyCount", longField(payload, "globalKeyCount", allEntries.size()));
+            chunk.put("globalKeyCount", longField(payload, "globalKeyCount", totalEntries));
             chunk.put("globalTotalWeight", doubleField(payload, "globalTotalWeight", 0.0d));
-            chunk.put("indexEntryCount", allEntries.size());
+            chunk.put("indexEntryCount", totalEntries);
             chunk.put("chunkId", chunkId);
             chunk.put("chunkCount", chunkCount);
-            ArrayNode entries = sliceArray(allEntries, range.from, range.to);
             chunk.set("entries", entries);
             chunk.put("entryCount", entries.size());
+
             out.collect(MAPPER.writeValueAsString(chunk));
+
+
+            if (chunkId == 0 || chunkId + 1 == chunkCount || (chunkId + 1) % 64 == 0) {
+
+                long elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000L;
+
+                System.out.println("[OnePassStateTopicEmitter] GLOBAL_PHASE1_INDEX progress." +
+                        " uid=" + uid + ", alias=" + activeAlias + ", chunk=" + (chunkId + 1) + "/" + chunkCount +
+                        ", emittedEntries=" + emittedEntries + "/" + totalEntries + ", elapsedMs=" + elapsedMs);
+            }
         }
 
+        if (fields.hasNext() || emittedEntries != totalEntries) {
+            throw new IllegalStateException("GLOBAL_PHASE1_INDEX streaming count mismatch." +
+                    " expectedEntries=" + totalEntries + ", emittedEntries=" + emittedEntries);
+        }
+
+        long elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000L;
         System.out.println("[OnePassStateTopicEmitter] GLOBAL_PHASE1_INDEX emitted." + " uid=" + uid +
-                ", alias=" + activeAlias + ", edge=" + activeEdgeId + ", entries=" + allEntries.size() +
-                ", kafkaChunks=" + chunkCount + ", logicalWorkers=" + expectedWorkers);
+                ", alias=" + activeAlias + ", edge=" + activeEdgeId + ", entries=" + totalEntries +
+                ", kafkaChunks=" + chunkCount + ", logicalWorkers=" + expectedWorkers + ", elapsedMs=" + elapsedMs);
     }
 
     private void emitPhaseTwoRootSample(Estimation value, JsonNode payload, Collector<String> out) throws Exception {

@@ -524,7 +524,65 @@ public class OnePassPhaseOneState implements Serializable {
          * Adding the global index to it would double count this worker.
          */
         indexByEdgeId.put(globalIndex.getEdgeId(), globalIndex.copy());
-
         seenTuplesByAlias.put(activeAlias, globalSeenTuples);
     }
+
+    /**
+     * REPLICATED mode only.
+     * <p>
+     * Called after the local active edge has been serialized into request 72.
+     * The completed global edge will later replace this empty placeholder.
+     */
+    public void discardLocalAliasEdge(String activeAlias) {
+        if (activeAlias == null || activeAlias.trim().isEmpty() || plan.isRoot(activeAlias)) {
+            return;
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(activeAlias);
+
+        if (parentEdge == null) {
+            throw new IllegalStateException("Alias has no parent edge: " + activeAlias);
+        }
+
+        indexByEdgeId.put(parentEdge.getEdgeId(), new Phase1LinkWeightIndex(parentEdge.getEdgeId()));
+    }
+
+    /**
+     * REPLICATED Phase-1 ownership-transfer install.
+     * <p>
+     * The caller guarantees that globalIndex is newly constructed for this worker
+     * and will not be mutated after this call.
+     * <p>
+     * This avoids a complete LinkedHashMap copy at the Phase-1 synchronization
+     * barrier.
+     */
+    public void installGlobalAliasEdgeOwned(String activeAlias, Phase1LinkWeightIndex globalIndex, long globalSeenTuples) {
+
+        if (activeAlias == null || activeAlias.trim().isEmpty()) {
+            throw new IllegalArgumentException("activeAlias must not be blank");
+        }
+
+        if (globalIndex == null) {
+            throw new IllegalArgumentException("globalIndex must not be null");
+        }
+
+        if (plan.isRoot(activeAlias)) {
+            throw new IllegalArgumentException("Root alias cannot install a Phase-1 parent edge: " + activeAlias);
+        }
+
+        CompiledOnePassPlan.DirectedJoinEdge parentEdge = plan.getParentEdge(activeAlias);
+
+        if (parentEdge == null) {
+            throw new IllegalStateException("Alias has no parent edge: " + activeAlias);
+        }
+
+        if (!parentEdge.getEdgeId().equals(globalIndex.getEdgeId())) {
+            throw new IllegalStateException("Replicated Phase-1 edge mismatch." + " alias=" + activeAlias +
+                    ", expectedEdge=" + parentEdge.getEdgeId() + ", receivedEdge=" + globalIndex.getEdgeId());
+        }
+
+        indexByEdgeId.put(globalIndex.getEdgeId(), globalIndex);
+        seenTuplesByAlias.put(activeAlias, globalSeenTuples);
+    }
+
 }

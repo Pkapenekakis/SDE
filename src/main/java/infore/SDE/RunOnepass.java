@@ -3,6 +3,7 @@ package infore.SDE;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -44,14 +45,19 @@ public class RunOnepass {
     private static int parallelism;
     private static String kafkaOutputTopic;
     private static String kafkaOnePassStateTopic;
+    private static String onePassKafkaConsumerRunId;
 
     public static void main(String[] args) throws Exception {
         initializeParameters(args);
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
-        kafkaStringConsumer dataConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic, true);
-        kafkaStringConsumer requestConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic);
-        kafkaStringConsumer onePassStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic);
+        String consumerGroupPrefix = "onepass-" + onePassKafkaConsumerRunId;
+        kafkaStringConsumer dataConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic,
+                consumerGroupPrefix + "-data", true, true);
+        kafkaStringConsumer requestConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic,
+                consumerGroupPrefix + "-request", false, true);
+        kafkaStringConsumer onePassStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic,
+                consumerGroupPrefix + "-state", false, true);
         kafkaProducerEstimation estimationProducer = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
 
         //RequestTopic feedback is used for stateless OnePass lifecycle
@@ -573,5 +579,8 @@ public class RunOnepass {
             parallelism = 4;
             kafkaOnePassStateTopic = "onepassStateTopic";
         }
+        onePassKafkaConsumerRunId = System.getProperty("onepass.kafkaConsumerRunId", UUID.randomUUID().toString());
+        System.out.println("[INFO] onePassKafkaConsumerRunId=" + onePassKafkaConsumerRunId);
     }
+
 }

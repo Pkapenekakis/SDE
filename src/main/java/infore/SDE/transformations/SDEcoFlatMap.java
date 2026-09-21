@@ -17,6 +17,7 @@ import infore.SDE.synopses.OnePassSampler.OnePassTuple;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.JoinValue;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOne;
 import infore.SDE.synopses.OnePassSampler.PhaseOne.OnePassPhaseOneContribution;
+import infore.SDE.synopses.OnePassSampler.PhaseOne.Phase1LinkWeightIndex;
 import infore.SDE.synopses.OnePassSampler.PhaseTwo.OnePassShardedPhaseTwoState;
 import infore.SDE.transformations.onepass.*;
 import infore.SDE.transformations.onepass.debug.OnePassPhaseOneValidatorExporter;
@@ -100,6 +101,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 	//State-topic messages may race ahead of START_PHASE_2 on another Flink input.
 	private final Map<Integer, List<JsonNode>> pendingOnePassPhaseTwoStateByUid = new HashMap<Integer, List<JsonNode>>();
 	private final Set<String> emittedOnePassPhaseTwoLocalSummaries = new HashSet<String>();
+	private final Map<String, ReplicatedPhaseOneIndexAccumulator> onePassReplicatedPhaseOneAccumulators =
+			new HashMap<String, ReplicatedPhaseOneIndexAccumulator>();
 
 	private static final String ONEPASS_COMMAND_START_NEXT_ALIAS = "START_NEXT_ALIAS";
 	private static final String ONEPASS_COMMAND_START_PHASE_2 = "START_PHASE_2";
@@ -1443,6 +1446,7 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		Estimation local = onePass.buildLocalReplicatedPhaseOneResultEstimation(node.getKey(), uid, pId,
 				expectedWorkers, actualParallelism, resultId, alias, epoch, nextCommand, nextAlias);
 		collector.collect(local);
+		onePass.discardReplicatedPhaseOneLocalAliasIndex(alias);
 		System.out.println("[OnePass REPLICATED PHASE1 LOCAL INDEX]" + " uid=" + uid + ", worker=" + pId +
 				", alias=" + alias + ", epoch=" + epoch + ", resultId=" + resultId);
 	}
@@ -1518,6 +1522,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		onePassExecutionModeByUid.remove(uid);
 
 		installedOnePassReplicatedPhaseOneStateRefs.removeIf(key -> key != null && key.startsWith(uid + "_"));
+
+		onePassReplicatedPhaseOneAccumulators.keySet().removeIf(key -> key != null && key.startsWith(uid + "_"));
 
 		System.out.println("[OnePass REMOVE] worker-local state cleared." + " uid=" + uid + ", workerId=" + pId +
 				", key=" + request.getKey());
@@ -3539,7 +3545,9 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 				ONEPASS_STATE_TYPE_PHASE1_REPLICATED_INDEX.equals(textField(payload, "stateType", ""));
 	}
 
-	private void handleOnePassReplicatedPhaseOneIndexChunk(Datapoint node, ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+	private void handleOnePassReplicatedPhaseOneIndexChunk(Datapoint node, ArrayList<Synopsis> synopses,
+														   Collector<Estimation> collector) {
+
 		JsonNode chunk = node.getValues();
 		String stateRef = textField(chunk, "stateRef", "");
 		int chunkId = intField(chunk, "chunkId", -1);
@@ -3552,7 +3560,8 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		if (workerId != pId) {
-			throw new IllegalStateException("Replicated Phase-1 chunk reached wrong worker." + " target=" + workerId + ", actual=" + pId);
+			throw new IllegalStateException("Replicated Phase-1 chunk reached wrong worker." +
+					" target=" + workerId + ", actual=" + pId);
 		}
 
 		if (chunkId < 0 || chunkCount <= 0 || chunkId >= chunkCount) {
@@ -3562,125 +3571,132 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		OnePassExecutionMode executionMode = onePassExecutionModeByUid.getOrDefault(uid, OnePassExecutionMode.SHARDED);
 
 		if (executionMode != OnePassExecutionMode.REPLICATED) {
-			throw new IllegalStateException("Replicated Phase-1 state reached a SHARDED synopsis." + " uid=" + uid + ", worker=" + pId);
+			throw new IllegalStateException("Replicated Phase-1 state reached a SHARDED synopsis." +
+					" uid=" + uid + ", worker=" + pId);
 		}
 
 		if (installedOnePassReplicatedPhaseOneStateRefs.contains(stateRef)) {
 			return;
 		}
 
-		Map<Integer, JsonNode> chunks = onePassStateChunksByRef.computeIfAbsent(stateRef, k -> new HashMap<Integer, JsonNode>());
-		JsonNode existing = chunks.get(chunkId);
+		ReplicatedPhaseOneIndexAccumulator accumulator = onePassReplicatedPhaseOneAccumulators.get(stateRef);
+		if (accumulator == null) {
+			accumulator = new ReplicatedPhaseOneIndexAccumulator(chunk);
+			onePassReplicatedPhaseOneAccumulators.put(stateRef, accumulator);
+		}
 
-		if (existing != null) {
-			if (!existing.equals(chunk)) {
-				throw new IllegalStateException("Conflicting duplicate replicated Phase-1 chunk." +
+		if (accumulator.chunkCount != chunkCount) {
+			throw new IllegalStateException("Replicated Phase-1 chunkCount changed." + " stateRef=" + stateRef +
+					", expected=" + accumulator.chunkCount + ", received=" + chunkCount);
+		}
+
+		/*
+		 * Kafka/Flink may redeliver a record. Do not add a duplicate chunk twice.
+		 */
+		if (accumulator.receivedChunks.get(chunkId)) {
+			return;
+		}
+
+		requireSameChunkText(accumulator.metadata, chunk, "resultId", stateRef);
+		requireSameChunkText(accumulator.metadata, chunk, "activeAlias", stateRef);
+		requireSameChunkText(accumulator.metadata, chunk, "activeEdgeId", stateRef);
+		requireSameChunkText(accumulator.metadata, chunk, "baseKey", stateRef);
+		requireSameChunkInt(accumulator.metadata, chunk, "expectedWorkers", stateRef);
+		requireSameChunkInt(accumulator.metadata, chunk, "epoch", stateRef);
+		JsonNode entries = chunk.get("entries");
+
+		if (entries == null || !entries.isArray()) {
+			throw new IllegalStateException("Replicated Phase-1 chunk has no entries array." +
+					" stateRef=" + stateRef + ", chunkId=" + chunkId);
+		}
+
+		int declaredEntryCount = intField(chunk, "entryCount", -1);
+
+		if (declaredEntryCount != entries.size()) {
+			throw new IllegalStateException("Replicated Phase-1 chunk entryCount mismatch." + " stateRef=" + stateRef +
+					", chunkId=" + chunkId + ", declared=" + declaredEntryCount + ", actual=" + entries.size());
+		}
+
+		for (JsonNode entry : entries) {
+			String joinKey = textField(entry, "joinKey", "");
+
+			if (joinKey.isEmpty()) {
+				throw new IllegalStateException("Replicated Phase-1 entry has no joinKey." +
 						" stateRef=" + stateRef + ", chunkId=" + chunkId);
 			}
 
+			double weight = doubleField(entry, "weight", 0.0d);
+			accumulator.index.add(parseReplicatedPhaseOneJoinValue(joinKey), weight);
+			accumulator.receivedEntryCount++;
+		}
+
+		accumulator.receivedChunks.set(chunkId);
+		accumulator.receivedChunkCount++;
+
+		if (chunkId == 0 || accumulator.receivedChunkCount == accumulator.chunkCount || accumulator.receivedChunkCount % 64 == 0) {
+			System.out.println("[OnePass REPLICATED PHASE1 INDEX RECEIVE]" + " uid=" + uid + ", worker=" + pId +
+					", stateRef=" + stateRef + ", chunks=" + accumulator.receivedChunkCount + "/" +
+					accumulator.chunkCount + ", entries=" + accumulator.receivedEntryCount);
+		}
+
+		if (accumulator.receivedChunkCount < accumulator.chunkCount) {
 			return;
 		}
 
-		chunks.put(chunkId, chunk.deepCopy());
-
-		if (chunks.size() < chunkCount) {
-			return;
+		/*
+		 * All chunk IDs must be present, not merely N arbitrary records.
+		 */
+		if (accumulator.receivedChunks.cardinality() != accumulator.chunkCount) {
+			throw new IllegalStateException("Replicated Phase-1 chunk cardinality mismatch." + " stateRef=" + stateRef);
 		}
 
-		JsonNode assembled = assembleOnePassReplicatedPhaseOneIndex(stateRef, chunks, chunkCount);
-		onePassStateChunksByRef.remove(stateRef);
-		installCompletedOnePassReplicatedPhaseOneIndex(node.getKey(), assembled, synopses, collector);
+		if (accumulator.expectedEntryCount >= 0 && accumulator.receivedEntryCount != accumulator.expectedEntryCount) {
+			throw new IllegalStateException("Replicated Phase-1 index entry count mismatch." + " stateRef=" + stateRef +
+					", expected=" + accumulator.expectedEntryCount + ", actual=" + accumulator.receivedEntryCount);
+		}
+
+		onePassReplicatedPhaseOneAccumulators.remove(stateRef);
+		finishReplicatedPhaseOneIndexInstall(accumulator, synopses, collector);
 	}
 
-	private JsonNode assembleOnePassReplicatedPhaseOneIndex(String stateRef, Map<Integer, JsonNode> chunks, int chunkCount) {
-		JsonNode first = chunks.get(0);
-		if (first == null) {
-			throw new IllegalStateException("Missing replicated Phase-1 chunk 0." + " stateRef=" + stateRef);
+	private static JoinValue parseReplicatedPhaseOneJoinValue(String joinKey) {
+		if (joinKey == null) {
+			throw new IllegalArgumentException("joinKey must not be null");
 		}
 
-		ObjectNode assembled = MAPPER.createObjectNode();
-		assembled.put("type", ONEPASS_STATE_TYPE_PHASE1_REPLICATED_INDEX);
-		assembled.put("stateType", ONEPASS_STATE_TYPE_PHASE1_REPLICATED_INDEX);
-		assembled.put("stateRef", stateRef);
-		copyIfPresent(first, assembled, "protocol");
-		copyIfPresent(first, assembled, "uid");
-		copyIfPresent(first, assembled, "synopsisID");
-		copyIfPresent(first, assembled, "phase");
-		copyIfPresent(first, assembled, "epoch");
-		copyIfPresent(first, assembled, "resultId");
-		copyIfPresent(first, assembled, "queryName");
-		copyIfPresent(first, assembled, "rootAlias");
-		copyIfPresent(first, assembled, "baseKey");
-		copyIfPresent(first, assembled, "workerId");
-		copyIfPresent(first, assembled, "workerKey");
-		copyIfPresent(first, assembled, "expectedWorkers");
-		copyIfPresent(first, assembled, "activeAlias");
-		copyIfPresent(first, assembled, "activeEdgeId");
-		copyIfPresent(first, assembled, "nextCommand");
-		copyIfPresent(first, assembled, "nextAlias");
-		copyIfPresent(first, assembled, "globalSeenTuples");
-		copyIfPresent(first, assembled, "globalKeyCount");
-		copyIfPresent(first, assembled, "globalTotalWeight");
-		copyIfPresent(first, assembled, "indexEntryCount");
-		ArrayNode entries = MAPPER.createArrayNode();
-
-		for (int id = 0; id < chunkCount; id++) {
-			JsonNode chunk = chunks.get(id);
-			if (chunk == null) {
-				throw new IllegalStateException("Missing replicated Phase-1 chunk " + id + ". stateRef=" + stateRef);
-			}
-
-			requireSameChunkText(first, chunk, "resultId", stateRef);
-			requireSameChunkText(first, chunk, "activeAlias", stateRef);
-			requireSameChunkText(first, chunk, "activeEdgeId", stateRef);
-			requireSameChunkText(first, chunk, "baseKey", stateRef);
-			requireSameChunkInt(first, chunk, "expectedWorkers", stateRef);
-			requireSameChunkInt(first, chunk, "epoch", stateRef);
-			JsonNode chunkEntries = chunk.get("entries");
-
-			if (chunkEntries == null || !chunkEntries.isArray()) {
-				throw new IllegalStateException("Replicated Phase-1 chunk has no entries array." +
-						" stateRef=" + stateRef + ", chunkId=" + id);
-			}
-
-			int declaredEntryCount = intField(chunk, "entryCount", -1);
-			if (declaredEntryCount != chunkEntries.size()) {
-				throw new IllegalStateException("Replicated Phase-1 chunk entryCount mismatch." +
-						" stateRef=" + stateRef + ", chunkId=" + id);
-			}
-
-			for (JsonNode entry : chunkEntries) {
-				entries.add(entry);
-			}
+		String trimmed = joinKey.trim();
+		if (trimmed.indexOf('|') >= 0) {
+			return new JoinValue(Arrays.asList(trimmed.split("\\|", -1)));
 		}
 
-		int expectedEntryCount = intField(first, "indexEntryCount", -1);
-
-		if (expectedEntryCount >= 0 && entries.size() != expectedEntryCount) {
-			throw new IllegalStateException("Replicated Phase-1 index size mismatch." + " stateRef=" + stateRef +
-					", expected=" + expectedEntryCount + ", actual=" + entries.size());
-		}
-
-		assembled.set("entries", entries);
-		return assembled;
+		return JoinValue.ofSingle(trimmed);
 	}
 
-	private void installCompletedOnePassReplicatedPhaseOneIndex(String workerKey, JsonNode state,
-																ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
-		int uid = intField(state, "uid", -1);
-		String stateRef = textField(state, "stateRef", "");
+	private void finishReplicatedPhaseOneIndexInstall(ReplicatedPhaseOneIndexAccumulator accumulator,
+													  ArrayList<Synopsis> synopses, Collector<Estimation> collector) {
+
+		JsonNode metadata = accumulator.metadata;
+		int uid = intField(metadata, "uid", -1);
+		String stateRef = textField(metadata, "stateRef", "");
 		OnePassSamplerSdeSynopsis onePass = findOnePassSynopsisByUid(uid, synopses);
 
 		if (onePass == null) {
-			throw new IllegalStateException("Replicated Phase-1 index reached worker " + "without OnePass synopsis." + " uid=" + uid + ", worker=" + pId);
+			throw new IllegalStateException("Replicated Phase-1 index reached worker " +
+					"without OnePass synopsis." + " uid=" + uid + ", worker=" + pId);
 		}
 
-		onePass.installReplicatedPhaseOneAliasIndex(state);
-		installedOnePassReplicatedPhaseOneStateRefs.add(stateRef);
-		int expectedWorkers = intField(state, "expectedWorkers", onePassExpectedWorkersByUid.getOrDefault(uid, 1));
-		String resultId = textField(state, "resultId", "PHASE1_RESULT_" + uid);
-		Map<String, Object> ack = new LinkedHashMap<String, Object>();
+		String activeAlias = textField(metadata, "activeAlias", "");
+		long globalSeenTuples = longField(metadata, "globalSeenTuples", 0L);
 
+		/*
+		 * The accumulator owns this index exclusively.
+		 * Transfer it into Phase-1 state without copying the full map again.
+		 */
+		onePass.installReplicatedPhaseOneAliasIndexOwned(activeAlias, accumulator.index, globalSeenTuples);
+		installedOnePassReplicatedPhaseOneStateRefs.add(stateRef);
+		int expectedWorkers = intField(metadata, "expectedWorkers", onePassExpectedWorkersByUid.getOrDefault(uid, 1));
+		String resultId = textField(metadata, "resultId", "PHASE1_RESULT_" + uid);
+		Map<String, Object> ack = new LinkedHashMap<String, Object>();
 		ack.put("type", "LOCAL_PHASE1_INDEX_INSTALLED");
 		ack.put("protocol", "REPLICATED_PHASE1_V1");
 		ack.put("phase", "PHASE1");
@@ -3689,16 +3705,15 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		ack.put("expectedWorkers", expectedWorkers);
 		ack.put("stateRef", stateRef);
 		ack.put("resultId", resultId);
-		ack.put("epoch", intField(state, "epoch", -1));
-		ack.put("activeAlias", textField(state, "activeAlias", ""));
-		ack.put("activeEdgeId", textField(state, "activeEdgeId", ""));
-		ack.put("nextCommand", textField(state, "nextCommand", ""));
-		ack.put("nextAlias", textField(state, "nextAlias", ""));
-		ack.put("baseKey", textField(state, "baseKey", ""));
-		ack.put("globalSeenTuples", longField(state, "globalSeenTuples", 0L));
-		ack.put("globalKeyCount", longField(state, "globalKeyCount", 0L));
-		ack.put("globalTotalWeight", doubleField(state, "globalTotalWeight", 0.0d));
-
+		ack.put("epoch", intField(metadata, "epoch", -1));
+		ack.put("activeAlias", activeAlias);
+		ack.put("activeEdgeId", textField(metadata, "activeEdgeId", ""));
+		ack.put("nextCommand", textField(metadata, "nextCommand", ""));
+		ack.put("nextAlias", textField(metadata, "nextAlias", ""));
+		ack.put("baseKey", textField(metadata, "baseKey", ""));
+		ack.put("globalSeenTuples", globalSeenTuples);
+		ack.put("globalKeyCount", longField(metadata, "globalKeyCount", 0L));
+		ack.put("globalTotalWeight", doubleField(metadata, "globalTotalWeight", 0.0d));
 		String json;
 
 		try {
@@ -3708,10 +3723,13 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		}
 
 		String reduceKey = uid + "_PHASE1_INDEX_INSTALLED_" + resultId;
-
 		collector.collect(new Estimation(uid, reduceKey, 74, ONEPASS_SYNOPSIS_ID, reduceKey, json,
 				new String[]{"LOCAL_PHASE1_INDEX_INSTALLED", resultId, Integer.toString(pId),
 						Integer.toString(expectedWorkers)}, expectedWorkers));
+
+		System.out.println("[OnePass REPLICATED PHASE1 INDEX INSTALLED]" + " uid=" + uid +
+				", worker=" + pId + ", alias=" + activeAlias + ", stateRef=" + stateRef +
+				", entries=" + accumulator.receivedEntryCount);
 	}
 
 	private boolean isOnePassReplicatedPhaseOneTransitionRequest(Request request) {
@@ -3794,6 +3812,47 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 			processPendingOnePassEndAlias(uid, rootAlias, synopses, collector);
 			System.out.println("[OnePass REPLICATED PHASE2 START]" + " uid=" + uid +
 					", worker=" + pId + ", rootAlias=" + rootAlias + ", released=" + released.size());
+		}
+	}
+
+	private static final class ReplicatedPhaseOneIndexAccumulator {
+
+		private final ObjectNode metadata;
+		private final Phase1LinkWeightIndex index;
+		private final BitSet receivedChunks;
+
+		private final int chunkCount;
+		private final int expectedEntryCount;
+
+		private int receivedChunkCount;
+		private long receivedEntryCount;
+
+		private ReplicatedPhaseOneIndexAccumulator(JsonNode firstChunk) {
+			if (firstChunk == null || !firstChunk.isObject()) {
+				throw new IllegalArgumentException("firstChunk must be an object");
+			}
+
+			String activeEdgeId = textField(firstChunk, "activeEdgeId", "");
+			if (activeEdgeId.isEmpty()) {
+				throw new IllegalStateException("Replicated Phase-1 first chunk has no activeEdgeId: " + firstChunk);
+			}
+
+			this.chunkCount = intField(firstChunk, "chunkCount", -1);
+			this.expectedEntryCount = intField(firstChunk, "indexEntryCount", -1);
+			if (chunkCount <= 0) {
+				throw new IllegalStateException("Replicated Phase-1 chunkCount must be > 0: " + firstChunk);
+			}
+
+			this.index = new Phase1LinkWeightIndex(activeEdgeId);
+			this.receivedChunks = new BitSet(chunkCount);
+			this.metadata = MAPPER.createObjectNode();
+			java.util.Iterator<java.util.Map.Entry<String, JsonNode>> fields = firstChunk.fields();
+			while (fields.hasNext()) {
+				java.util.Map.Entry<String, JsonNode> field = fields.next();
+				if (!"entries".equals(field.getKey())) {
+					this.metadata.set(field.getKey(), field.getValue());
+				}
+			}
 		}
 	}
 }

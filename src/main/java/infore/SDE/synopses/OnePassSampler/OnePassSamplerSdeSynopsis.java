@@ -1605,6 +1605,15 @@ public final class OnePassSamplerSdeSynopsis extends Synopsis {
         return lifecycle.lookupReplicatedPhaseThreeChildWeight(payload, childIndex);
     }
 
+    public void installReplicatedPhaseOneAliasIndexOwned(String activeAlias, Phase1LinkWeightIndex globalIndex,
+                                                         long globalSeenTuples) {
+        lifecycle.installReplicatedPhaseOneAliasIndexOwned(activeAlias, globalIndex, globalSeenTuples);
+    }
+
+    public void discardReplicatedPhaseOneLocalAliasIndex(String activeAlias) {
+        lifecycle.discardReplicatedPhaseOneLocalAliasIndex(activeAlias);
+    }
+
     /**
      * DEBUG / VALIDATION ONLY.
      */

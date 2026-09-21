@@ -61,6 +61,7 @@ infore/SDE/experiments/RUNRadiusAsPartitioner_Test$3.class
 infore/SDE/experiments/RUNRadiusAsPartitioner_Test.class
 infore/SDE/RunOnepass$1.class
 infore/SDE/synopses/OnePassSampler/PhaseTwo/OnePassPhaseTwoState.class
+infore/SDE/transformations/SDEcoFlatMap$1.class
 infore/SDE/synopses/OnePassSampler/TupleWeightExpressionEvaluator$Parser.class
 lib/Coresets/Bucket.class
 infore/SDE/Experiments/Onepass/SingleWorker/OnePassPhaseOneTest.class
@@ -111,6 +112,7 @@ infore/SDE/synopses/Sketches/Bitmap.class
 infore/SDE/Run$7.class
 infore/SDE/producersForTesting/sendAISTest.class
 infore/SDE/transformations/onepass/sql/OnePassCatalog$CatalogDataset.class
+infore/SDE/transformations/SDEcoFlatMap$ReplicatedPhaseOneIndexAccumulator.class
 infore/SDE/synopses/OnePassSampler/PhaseThree/OnePassCompletedSample.class
 infore/SDE/synopses/Counters.class
 infore/SDE/reduceFunctions/RadiusReduce.class
