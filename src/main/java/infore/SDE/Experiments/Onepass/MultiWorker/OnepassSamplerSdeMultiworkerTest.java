@@ -17,6 +17,7 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.TimeoutException;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -116,7 +117,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
     private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
             "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
 
-    */
+*/
     // =========================
     // SOFTNET
     // Uncomment these and comment the LOCAL definitions above.
@@ -167,7 +168,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // The JVM properties still work, but these are intentionally not final so
     // configureRuntimeArguments(args) can override them from the terminal.
     private static long TEST_ROW_LIMIT =
-            Long.parseLong(System.getProperty("onepass.testRowLimit", "1000000"));
+            Long.parseLong(System.getProperty("onepass.testRowLimit", "200000"));
 
     private static int EXPECTED_WORKERS =
             Integer.parseInt(System.getProperty("onepass.workers", "4"));
@@ -184,8 +185,28 @@ public final class OnepassSamplerSdeMultiworkerTest {
     private static OnePassExecutionMode EXECUTION_MODE =
             OnePassExecutionMode.fromString(System.getProperty("onepass.executionMode", "REPLICATED"));
 
-    private static final long TIMEOUT_MS = Long.parseLong(System.getProperty("onepass.timeoutMs",
-            Long.toString(30L * 60L * 1000L)));
+    /*
+     * Main benchmark wait timeout.
+     *
+     * 0 means wait indefinitely. This is the default for cluster/thesis runs so
+     * a temporarily stalled Kafka/Flink pipeline does not make the benchmark
+     * process exit merely because a wall-clock timeout elapsed.
+     *
+     * Set -Donepass.timeoutMs=<positive-ms> if a bounded wait is desired for a
+     * specific local/debug run.
+     */
+    private static final long TIMEOUT_MS =
+            Long.parseLong(System.getProperty("onepass.timeoutMs", "0"));
+
+    /*
+     * Backoff between retries when Kafka's synchronous metadata/offset APIs hit
+     * their own default.api.timeout.ms. The retry itself is unbounded.
+     */
+    private static final long KAFKA_OBSERVER_RETRY_DELAY_MS =
+            Long.parseLong(System.getProperty(
+                    "onepass.kafkaObserverRetryDelayMs",
+                    "1000"
+            ));
 
     /*
      * Kafka transaction timeout.
@@ -341,6 +362,9 @@ public final class OnepassSamplerSdeMultiworkerTest {
         System.out.println("TPC-H dir        = " + TEST_TPCH_DIR);
         System.out.println("TEST_ROW_LIMIT   = " + TEST_ROW_LIMIT);
         System.out.println("transactionTimeoutMs = " + TRANSACTION_TIMEOUT_MS);
+        System.out.println("mainWaitTimeoutMs = " + TIMEOUT_MS
+                + (TIMEOUT_MS <= 0L ? " (INFINITE)" : ""));
+        System.out.println("kafkaObserverRetryDelayMs = " + KAFKA_OBSERVER_RETRY_DELAY_MS);
         System.out.println("RUN_PHASE_2      = " + RUN_PHASE_2);
         System.out.println("RUN_PHASE_3      = " + RUN_PHASE_3);
         System.out.println("EXPORT_PHASE1_INDEXES = " + EXPORT_PHASE1_INDEXES);
@@ -1536,7 +1560,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         int recordsSeen = 0;
 
-        while (System.currentTimeMillis() < deadline) {
+        while (timeoutMs <= 0L || System.currentTimeMillis() < deadline) {
 
             ConsumerRecords<String, String> records = consumer.poll(1000L);
 
@@ -1664,7 +1688,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         int recordsSeen =
                 0;
 
-        while (System.currentTimeMillis()
+        while (timeoutMs <= 0L || System.currentTimeMillis()
                 < deadline) {
 
             ConsumerRecords<String, String> records =
@@ -1980,7 +2004,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         int recordsSeen =
                 0;
 
-        while (System.currentTimeMillis()
+        while (timeoutMs <= 0L || System.currentTimeMillis()
                 < deadline) {
 
             ConsumerRecords<String, String> records =
@@ -2282,7 +2306,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         int recordsSeen =
                 0;
 
-        while (System.currentTimeMillis()
+        while (timeoutMs <= 0L || System.currentTimeMillis()
                 < deadline) {
 
             ConsumerRecords<String, String> records =
@@ -3912,8 +3936,6 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         props.put("delivery.timeout.ms", "900000");
 
-        props.put("request.timeout.ms", "300000");
-
         props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
 
         props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
@@ -3946,8 +3968,6 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         props.put("auto.offset.reset", "latest");
 
-        props.put("request.timeout.ms", "300000");
-
         props.put("fetch.max.bytes", "104857600");
 
         props.put("max.partition.fetch.bytes", "104857600");
@@ -3959,44 +3979,150 @@ public final class OnepassSamplerSdeMultiworkerTest {
         return new KafkaConsumer<String, String>(props);
     }
 
-    private static void initializeObserver(KafkaConsumer<String, String> consumer, String topic) {
+    private static void initializeObserver(
+            KafkaConsumer<String, String> consumer,
+            String topic) {
 
-        List<PartitionInfo> partitionInfos = consumer.partitionsFor(topic);
-        if (partitionInfos == null || partitionInfos.isEmpty()) {
-            throw new IllegalStateException("Kafka topic has no discoverable partitions: " + topic);
+        int attempts = 0;
+
+        while (true) {
+
+            attempts++;
+
+            try {
+
+                initializeObserverOnce(
+                        consumer,
+                        topic
+                );
+
+                return;
+
+            } catch (TimeoutException timeout) {
+
+                /*
+                 * Kafka's synchronous metadata/offset APIs use
+                 * default.api.timeout.ms internally (commonly 60000 ms).
+                 *
+                 * A slow cluster must not terminate a thesis benchmark merely
+                 * because one metadata/offset lookup exceeded that API timeout.
+                 * Retry forever unless the process itself is interrupted.
+                 */
+                System.err.println(
+                        "Kafka observer initialization timed out."
+                                + " topic=" + topic
+                                + ", attempt=" + attempts
+                                + ". Retrying in "
+                                + KAFKA_OBSERVER_RETRY_DELAY_MS
+                                + " ms..."
+                );
+
+                try {
+
+                    Thread.sleep(
+                            KAFKA_OBSERVER_RETRY_DELAY_MS
+                    );
+
+                } catch (InterruptedException interrupted) {
+
+                    Thread.currentThread().interrupt();
+
+                    throw new IllegalStateException(
+                            "Interrupted while retrying Kafka observer initialization."
+                                    + " topic=" + topic,
+                            interrupted
+                    );
+                }
+            }
+        }
+    }
+
+    private static void initializeObserverOnce(
+            KafkaConsumer<String, String> consumer,
+            String topic) {
+
+        List<PartitionInfo> partitionInfos =
+                consumer.partitionsFor(
+                        topic
+                );
+
+        if (partitionInfos == null
+                || partitionInfos.isEmpty()) {
+
+            throw new IllegalStateException(
+                    "Kafka topic has no discoverable partitions: "
+                            + topic
+            );
         }
 
-        List<TopicPartition> partitions = new ArrayList<TopicPartition>();
+        List<TopicPartition> partitions =
+                new ArrayList<TopicPartition>();
+
         for (PartitionInfo info : partitionInfos) {
-            partitions.add(new TopicPartition(topic, info.partition()));
+
+            partitions.add(
+                    new TopicPartition(
+                            topic,
+                            info.partition()
+                    )
+            );
         }
 
-        consumer.assign(partitions);
-        Map<TopicPartition, Long> startingOffsets = consumer.endOffsets(partitions);
+        consumer.assign(
+                partitions
+        );
+
+        Map<TopicPartition, Long> startingOffsets =
+                consumer.endOffsets(
+                        partitions
+                );
 
         for (TopicPartition partition : partitions) {
-            Long offset = startingOffsets.get(partition);
+
+            Long offset =
+                    startingOffsets.get(
+                            partition
+                    );
 
             if (offset == null) {
-                throw new IllegalStateException("Could not resolve end offset for Kafka observer." + " topic=" + topic + ", partition=" + partition);
+
+                throw new IllegalStateException(
+                        "Could not resolve end offset for Kafka observer."
+                                + " topic=" + topic
+                                + ", partition=" + partition
+                );
             }
 
-            consumer.seek(partition, offset);
+            /*
+             * We already know the exact desired observer position from
+             * endOffsets(). seek() is sufficient.
+             *
+             * Do NOT call consumer.position(partition) here. position() is a
+             * synchronous Kafka API and was the source of:
+             *
+             *   Timeout of 60000ms expired before the position ...
+             */
+            consumer.seek(
+                    partition,
+                    offset
+            );
+
+            System.out.println(
+                    "Kafka observer start position:"
+                            + " topic=" + topic
+                            + ", partition=" + partition.partition()
+                            + ", offset=" + offset
+            );
         }
 
-        /*
-         * Force KafkaConsumer's local position to be materialized before returning.
-         *
-         * At this point no Phase-2 root data has been committed yet, so every
-         * Phase-2 output produced after this method returns must be visible to the
-         * observer.
-         */
-        for (TopicPartition partition : partitions) {
-            long position = consumer.position(partition);
-            System.out.println("Kafka observer start position:" + " topic=" + topic + ", partition=" + partition.partition() + ", offset=" + position);
-        }
-
-        System.out.println("Kafka observer READY on " + topic + ", partitions=" + partitions + ", startingOffsets=" + startingOffsets);
+        System.out.println(
+                "Kafka observer READY on "
+                        + topic
+                        + ", partitions="
+                        + partitions
+                        + ", startingOffsets="
+                        + startingOffsets
+        );
     }
 
     private static void sendJsonAsync(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) {
@@ -5531,7 +5657,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
         long deadline = System.currentTimeMillis() + timeoutMs;
         int recordsSeen = 0;
 
-        while (System.currentTimeMillis() < deadline) {
+        while (timeoutMs <= 0L || System.currentTimeMillis() < deadline) {
             ConsumerRecords<String, String> records = consumer.poll(1000L);
             for (ConsumerRecord<String, String> record : records) {
                 recordsSeen++;

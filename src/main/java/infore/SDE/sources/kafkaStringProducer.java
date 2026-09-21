@@ -40,9 +40,9 @@ class JsonStringKeyedSerializer implements KeyedSerializationSchema<String> {
 
     @Override
     public byte[] serializeKey(String element) {
+
         try {
             JsonNode node = MAPPER.readTree(element);
-
             JsonNode workerKey = node.get("workerKey");
 
             if (workerKey != null && !workerKey.isNull()) {
@@ -52,12 +52,14 @@ class JsonStringKeyedSerializer implements KeyedSerializationSchema<String> {
             JsonNode stateRef = node.get("stateRef");
 
             if (stateRef != null && !stateRef.isNull()) {
-                return stateRef.asText().getBytes(StandardCharsets.UTF_8);
+                JsonNode chunkId = node.get("chunkId");
+                String kafkaKey = stateRef.asText();
+                if (chunkId != null && !chunkId.isNull()) {
+                    kafkaKey += "#" + chunkId.asInt(-1);
+                }
+                return kafkaKey.getBytes(StandardCharsets.UTF_8);
             }
-
-        } catch (Exception ignored) {
-        }
-
+        } catch (Exception ignored) {}
         return "onepass-global-state".getBytes(StandardCharsets.UTF_8);
     }
 
