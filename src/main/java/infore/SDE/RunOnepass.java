@@ -46,6 +46,7 @@ public class RunOnepass {
     private static String kafkaOutputTopic;
     private static String kafkaOnePassStateTopic;
     private static String onePassKafkaConsumerRunId;
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static void main(String[] args) throws Exception {
         initializeParameters(args);
@@ -76,66 +77,73 @@ public class RunOnepass {
 
             @Override
             public Datapoint map(String node) throws IOException {
-                ObjectMapper objectMapper = new ObjectMapper();
-                return objectMapper.readValue(node, Datapoint.class);
+                return MAPPER.readValue(node, Datapoint.class);
             }
-        }).name("DATA_SOURCE").keyBy((KeySelector<Datapoint, String>) Datapoint::getKey);
+        }).name("DATA_SOURCE");
 
         // ================================================================
         // REQUEST SOURCE
         // ================================================================
 
+        /*
+         * Keep the base parsed request stream UNKEYED.
+         * It is used in two different ways:
+         * 1. keyed -> RqRouterFlatMap -> actual synopsis workers
+         * 2. broadcast -> every OnePassDataRouterCoFlatMap subtask
+         */
         DataStream<Request> parsedRequestStream = kafkaRequestStream.map(new MapFunction<String, Request>() {
             private static final long serialVersionUID = 1L;
-
             @Override
             public Request map(String node) throws IOException {
-                ObjectMapper objectMapper = new ObjectMapper();
-                return objectMapper.readValue(node, Request.class);
+                return MAPPER.readValue(node, Request.class);
             }
-        }).name("REQUEST_SOURCE").keyBy((KeySelector<Request, String>) Request::getKey);
-        DataStream<Request> synopsisRequests = parsedRequestStream.flatMap(new RqRouterFlatMap()).name("REQUEST_ROUTER");
+        }).name("REQUEST_SOURCE");
+
+        /*
+         * Branch 1:
+         * Existing request routing path.
+         * This branch may be keyed because it is NOT broadcast afterwards.
+         */
+        DataStream<Request> keyedRequestStream = parsedRequestStream.keyBy((KeySelector<Request, String>) Request::getKey);
+        DataStream<Request> synopsisRequests = keyedRequestStream.flatMap(new RqRouterFlatMap()).name("REQUEST_ROUTER");
 
         // ================================================================
         // ONEPASS STATE TOPIC SOURCE
         // ================================================================
-        /*
-         * Targeted request-78 messages already contain workerKey.
-         *
-         * Global Phase-2 sample chunks are written only once to Kafka and
-         * OnePassStateTopicParser fans them out to the physical workers
-         * after Kafka.
-         */
         DataStream<Datapoint> onePassStateTopicDataStream = kafkaOnePassStateStream.
                 flatMap(new OnePassStateTopicParser()).name("ONEPASS_STATE_TOPIC_PARSER");
 
-        // ================================================================
-        // ONEPASS-AWARE DATA ROUTING
-        // ================================================================
-        DataStream<Datapoint> routedDataStream = parsedDataStream.connect(parsedRequestStream).
-                flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_AWARE_DATA_ROUTER");
-
-        //StateTopic records enter exactly the same physical worker path as ordinary routed data.
-        DataStream<Datapoint> dataStreamWithState = routedDataStream.union(onePassStateTopicDataStream);
+    // ================================================================
+    // ONEPASS-AWARE DATA ROUTING
+    // ================================================================
 
         /*
-         * IMPORTANT:
-         * Do not keyBy again after partitionCustom.
-         *
-         * _KEYED_0, _KEYED_1, ... must reach their intended physical
-         * Flink subtasks.
+         * Branch 2:
+         * Broadcast the UNKEYED parsed request stream.
+         * Every physical OnePassDataRouterCoFlatMap subtask must learn the
+         * ADD request / execution mode / compiled plan / lifecycle transitions,
+         * because data now arrives through multiple Kafka source partitions.
          */
+        DataStream<Request> broadcastRoutingRequests = parsedRequestStream.broadcast();
+
+        DataStream<Datapoint> routedDataStream = parsedDataStream.connect(broadcastRoutingRequests).
+                flatMap(new OnePassDataRouterCoFlatMap()).name("ONEPASS_AWARE_DATA_ROUTER");
+
+        // ================================================================
+        // NORMAL DATA + STATE TOPIC
+        // ================================================================
+
+        DataStream<Datapoint> dataStreamWithState = routedDataStream.union(onePassStateTopicDataStream);
         DataStream<Datapoint> partitionedDataStream = dataStreamWithState.
                 partitionCustom(new OnePassWorkerPartitioner(), (KeySelector<Datapoint, String>) Datapoint::getKey);
-
         DataStream<Request> partitionedSynopsisRequests = synopsisRequests.
                 partitionCustom(new OnePassWorkerPartitioner(), (KeySelector<Request, String>) Request::getKey);
 
         // ================================================================
         // SYNOPSIS MAINTENANCE
         // ================================================================
-        DataStream<Estimation> estimationStream = partitionedDataStream.
-                connect(partitionedSynopsisRequests).flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
+        DataStream<Estimation> estimationStream = partitionedDataStream.connect(partitionedSynopsisRequests).
+                flatMap(new SDEcoFlatMap()).name("SYNOPSES_MAINTENANCE");
 
         // ================================================================
         // STATE TOPIC WORK - REQUEST 78
@@ -505,14 +513,13 @@ public class RunOnepass {
         }
 
         try {
-            ObjectMapper mapper = new ObjectMapper();
             JsonNode payload;
             if (value.getEstimation() instanceof JsonNode) {
                 payload = (JsonNode) value.getEstimation();
             } else if (value.getEstimation() instanceof String) {
-                payload = mapper.readTree((String) value.getEstimation());
+                payload = MAPPER.readTree((String) value.getEstimation());
             } else {
-                payload = mapper.valueToTree(value.getEstimation());
+                payload = MAPPER.valueToTree(value.getEstimation());
             }
 
             JsonNode complete = payload.get("phaseThreeComplete");
@@ -576,7 +583,7 @@ public class RunOnepass {
             kafkaRequestInputTopic = "requestTopic";
             kafkaOutputTopic = "estimationTopic";
             kafkaBrokersList = "localhost:9092";
-            parallelism = 4;
+            parallelism = 8;
             kafkaOnePassStateTopic = "onepassStateTopic";
         }
         onePassKafkaConsumerRunId = System.getProperty("onepass.kafkaConsumerRunId", UUID.randomUUID().toString());

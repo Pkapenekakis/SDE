@@ -7,6 +7,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import infore.SDE.messages.Onepass.OnePassParams;
 import infore.SDE.transformations.onepass.CompiledOnePassPlan;
 import infore.SDE.transformations.onepass.OnePassExecutionMode;
+import infore.SDE.transformations.onepass.OnePassShardOwnership;
+import infore.SDE.transformations.onepass.OnePassTupleExtractor;
+import infore.SDE.synopses.OnePassSampler.OnePassTuple;
 import infore.SDE.transformations.onepass.sql.OnePassCatalog;
 import infore.SDE.transformations.onepass.sql.OnePassQueryCatalogLoader;
 import infore.SDE.transformations.onepass.sql.OnePassSqlCompiler;
@@ -93,31 +96,31 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // LOCAL TEST SETTINGS
     // ---------------------------------------------------------------------
 
-/*
-    private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
-    private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
-            "dataTopic");
-    private static final String REQUEST_TOPIC = System.getProperty("onepass.requestTopic",
-            "requestTopic");
-    private static final String OUTPUT_TOPIC = System.getProperty("onepass.outputTopic",
-            "estimationTopic");
 
-    private static final String STATE_TOPIC = System.getProperty("onepass.stateTopic",
-            "onepassStateTopic");
+//    private static String BOOTSTRAP_SERVERS = LOCAL_BOOTSTRAP_SERVERS;
+//    private static final String DATA_TOPIC = System.getProperty("onepass.dataTopic",
+//            "dataTopic");
+//    private static final String REQUEST_TOPIC = System.getProperty("onepass.requestTopic",
+//            "requestTopic");
+//    private static final String OUTPUT_TOPIC = System.getProperty("onepass.outputTopic",
+//            "estimationTopic");
+//
+//    private static final String STATE_TOPIC = System.getProperty("onepass.stateTopic",
+//            "onepassStateTopic");
+//
+//    private static final String TEST_TPCH_DIR = System.getProperty("onepass.tpchDir",
+//            "/home/vboxuser/Desktop/Thesis/tpch-data/sf1");
+//
+//    private static final String DEFAULT_PHASE1_BENCHMARK_CSV_PATH =
+//            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_sharded_local.csv";
+//
+//    private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
+//            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase2_sharded_local.csv";
+//
+//    private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
+//            "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
 
-    private static final String TEST_TPCH_DIR = System.getProperty("onepass.tpchDir",
-            "/home/vboxuser/Desktop/Thesis/tpch-data/sf1");
 
-    private static final String DEFAULT_PHASE1_BENCHMARK_CSV_PATH =
-            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase1_sharded_local.csv";
-
-    private static final String DEFAULT_PHASE2_BENCHMARK_CSV_PATH =
-            "/home/vboxuser/Desktop/Thesis/onepass_multiworker_phase2_sharded_local.csv";
-
-    private static final String DEFAULT_COMBINED_BENCHMARK_CSV_PATH =
-            "/home/vboxuser/Desktop/Thesis/onepass_all_phases_local.csv";
-
-*/
     // =========================
     // SOFTNET
     // Uncomment these and comment the LOCAL definitions above.
@@ -168,10 +171,10 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // The JVM properties still work, but these are intentionally not final so
     // configureRuntimeArguments(args) can override them from the terminal.
     private static long TEST_ROW_LIMIT =
-            Long.parseLong(System.getProperty("onepass.testRowLimit", "200000"));
+            Long.parseLong(System.getProperty("onepass.testRowLimit", "1000000"));
 
     private static int EXPECTED_WORKERS =
-            Integer.parseInt(System.getProperty("onepass.workers", "4"));
+            Integer.parseInt(System.getProperty("onepass.workers", "8"));
 
     /*
      * SHARDED:
@@ -184,6 +187,29 @@ public final class OnepassSamplerSdeMultiworkerTest {
      */
     private static OnePassExecutionMode EXECUTION_MODE =
             OnePassExecutionMode.fromString(System.getProperty("onepass.executionMode", "REPLICATED"));
+
+    /*
+     * All thesis/local Kafka topics have 16 partitions.
+     *
+     * A run with P workers deliberately uses only partitions [0, P-1], so the
+     * number of active Kafka data lanes equals the OnePass worker count.
+     */
+    private static final int CONFIGURED_TOPIC_PARTITIONS =
+            Integer.parseInt(System.getProperty(
+                    "onepass.topicPartitions",
+                    "16"
+            ));
+
+    /*
+     * Marker understood by OnePassDataRouterCoFlatMap.
+     *
+     * Each Kafka input lane gets its own END_ALIAS marker. The marker is sent
+     * to exactly the same Kafka partition as that worker's tuples and is then
+     * routed only to that OnePass worker. This preserves per-worker ordering
+     * while allowing the data topic to use P Kafka partitions in parallel.
+     */
+    private static final String ONEPASS_TARGET_WORKER_FIELD =
+            "__onePassTargetWorker";
 
     /*
      * Main benchmark wait timeout.
@@ -326,9 +352,30 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
     private OnepassSamplerSdeMultiworkerTest() {}
 
+    private enum InputRoutingPhase {
+        PHASE1,
+        PHASE2,
+        PHASE3
+    }
+
     public static void main(String[] args) throws Exception {
 
         configureRuntimeArguments(args);
+
+        if (EXPECTED_WORKERS <= 0) {
+            throw new IllegalArgumentException(
+                    "EXPECTED_WORKERS must be > 0. actual=" + EXPECTED_WORKERS
+            );
+        }
+
+        if (EXPECTED_WORKERS > CONFIGURED_TOPIC_PARTITIONS) {
+            throw new IllegalArgumentException(
+                    "This test uses one Kafka data partition per OnePass worker."
+                            + " workers=" + EXPECTED_WORKERS
+                            + ", configuredTopicPartitions="
+                            + CONFIGURED_TOPIC_PARTITIONS
+            );
+        }
 
         int uid = UUID.randomUUID().toString().hashCode() & 0x7fffffff;
 
@@ -352,6 +399,9 @@ public final class OnepassSamplerSdeMultiworkerTest {
         System.out.println("uid              = " + uid);
         System.out.println("baseKey          = " + baseKey);
         System.out.println("workers          = " + EXPECTED_WORKERS);
+        System.out.println("activeDataPartitions = 0.." + (EXPECTED_WORKERS - 1)
+                + " (" + EXPECTED_WORKERS + " of "
+                + CONFIGURED_TOPIC_PARTITIONS + " configured partitions)");
         System.out.println("executionMode    = " + EXECUTION_MODE);
         System.out.println("phase1Protocol   = " + EXECUTION_MODE.phaseOneProtocol());
         System.out.println("bootstrap        = " + BOOTSTRAP_SERVERS);
@@ -1183,7 +1233,18 @@ public final class OnepassSamplerSdeMultiworkerTest {
             try {
                 System.out.println("Preparing Kafka transaction for alias=" + alias + ", epoch=" + epoch + "...");
 
-                long rows = streamAlias(aliasProducer, DATA_TOPIC, baseKey, streamId, catalog, plan, alias, TEST_ROW_LIMIT, plan.getRequiredFieldsByAlias());
+                long rows = streamAlias(
+                        aliasProducer,
+                        DATA_TOPIC,
+                        baseKey,
+                        streamId,
+                        catalog,
+                        plan,
+                        alias,
+                        TEST_ROW_LIMIT,
+                        plan.getRequiredFieldsByAlias(),
+                        InputRoutingPhase.PHASE1
+                );
 
                 if (rows <= 0L) {
                     throw new IllegalStateException("No rows were read for Phase-1 alias " + alias);
@@ -1192,11 +1253,21 @@ public final class OnepassSamplerSdeMultiworkerTest {
                 ObjectNode endAlias = buildEndAliasDatapoint(baseKey, streamId, uid, alias, epoch, resultId, EXPECTED_WORKERS, nextCommand, nextAlias);
 
                 /*
-                 * END_ALIAS is in the SAME transaction and uses the SAME Kafka
-                 * key as the alias tuples. Therefore it becomes visible only
-                 * after all tuple records for this alias.
+                 * One END_ALIAS is appended to every active worker partition.
+                 * Each marker is behind all tuples routed to that worker and is
+                 * in the SAME transaction as the alias data.
+                 *
+                 * Production routes each targeted marker only to its worker, so
+                 * every worker closes the alias only after its own input lane is
+                 * fully drained.
                  */
-                sendJsonAsync(aliasProducer, DATA_TOPIC, baseKey, endAlias);
+                sendEndAliasToAllWorkerPartitions(
+                        aliasProducer,
+                        DATA_TOPIC,
+                        baseKey,
+                        endAlias,
+                        EXPECTED_WORKERS
+                );
 
                 aliasProducer.flush();
 
@@ -1257,7 +1328,18 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             System.out.println("Preparing Kafka transaction for Phase-2 root alias=" + rootAlias + ", epoch=" + epoch + "...");
 
-            long rows = streamAlias(rootProducer, DATA_TOPIC, baseKey, streamId, catalog, plan, rootAlias, TEST_ROW_LIMIT, plan.getRequiredFieldsByAlias());
+            long rows = streamAlias(
+                    rootProducer,
+                    DATA_TOPIC,
+                    baseKey,
+                    streamId,
+                    catalog,
+                    plan,
+                    rootAlias,
+                    TEST_ROW_LIMIT,
+                    plan.getRequiredFieldsByAlias(),
+                    InputRoutingPhase.PHASE2
+            );
 
             if (rows <= 0L) {
 
@@ -1267,11 +1349,17 @@ public final class OnepassSamplerSdeMultiworkerTest {
             ObjectNode endRoot = buildPhaseTwoEndAliasDatapoint(baseKey, streamId, uid, rootAlias, epoch, resultId, EXPECTED_WORKERS);
 
             /*
-             * Same transaction + same Kafka key as the root tuples.
-             * With read_committed, END_ALIAS(root) cannot be observed before
-             * all earlier root rows in this transaction become visible.
+             * One END_ALIAS is appended to every active worker partition.
+             * With read_committed, each worker marker becomes visible only with
+             * the root transaction and is ordered behind that worker's tuples.
              */
-            sendJsonAsync(rootProducer, DATA_TOPIC, baseKey, endRoot);
+            sendEndAliasToAllWorkerPartitions(
+                    rootProducer,
+                    DATA_TOPIC,
+                    baseKey,
+                    endRoot,
+                    EXPECTED_WORKERS
+            );
 
             rootProducer.flush();
 
@@ -1390,7 +1478,8 @@ public final class OnepassSamplerSdeMultiworkerTest {
                                 plan,
                                 alias,
                                 TEST_ROW_LIMIT,
-                                plan.getRequiredFieldsByAlias()
+                                plan.getRequiredFieldsByAlias(),
+                                InputRoutingPhase.PHASE3
                         );
 
                 if (rows <= 0L) {
@@ -1418,15 +1507,16 @@ public final class OnepassSamplerSdeMultiworkerTest {
                         );
 
                 /*
-                 * END_ALIAS is in the same transaction and uses the same base
-                 * Kafka key as every replay tuple. The OnePass router broadcasts
-                 * the marker to all logical workers after commit.
+                 * One END_ALIAS is appended to every active worker partition.
+                 * The production router sends each targeted marker only to the
+                 * corresponding logical worker, preserving per-worker ordering.
                  */
-                sendJsonAsync(
+                sendEndAliasToAllWorkerPartitions(
                         aliasProducer,
                         DATA_TOPIC,
                         baseKey,
-                        endAlias
+                        endAlias,
+                        EXPECTED_WORKERS
                 );
 
                 aliasProducer.flush();
@@ -3713,56 +3803,250 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // TPC-H -> DATAPOINT PRELOAD
     // =====================================================================
 
-    private static long streamAlias(KafkaProducer<String, String> producer, String topic, String datasetKey, String streamId, OnePassCatalog catalog, CompiledOnePassPlan plan, String alias, long maxRows, Map<String, Set<String>> requiredFieldsByAlias) throws Exception {
+    private static long streamAlias(
+            KafkaProducer<String, String> producer,
+            String topic,
+            String datasetKey,
+            String streamId,
+            OnePassCatalog catalog,
+            CompiledOnePassPlan plan,
+            String alias,
+            long maxRows,
+            Map<String, Set<String>> requiredFieldsByAlias,
+            InputRoutingPhase routingPhase) throws Exception {
 
-        File file = tableFileForAlias(catalog, plan, alias);
+        File file =
+                tableFileForAlias(
+                        catalog,
+                        plan,
+                        alias
+                );
 
-        List<String> columns = columnsForAlias(catalog, plan, alias);
+        List<String> columns =
+                columnsForAlias(
+                        catalog,
+                        plan,
+                        alias
+                );
 
-        String separator = separatorForAlias(catalog, plan, alias);
+        String separator =
+                separatorForAlias(
+                        catalog,
+                        plan,
+                        alias
+                );
 
-        Set<String> requiredFields = requiredFieldsByAlias == null ? null : requiredFieldsByAlias.get(alias);
+        Set<String> requiredFields =
+                requiredFieldsByAlias == null
+                        ? null
+                        : requiredFieldsByAlias.get(alias);
 
-        if (ENABLE_REQUIRED_FIELD_PRUNING && requiredFields == null) {
+        if (ENABLE_REQUIRED_FIELD_PRUNING
+                && requiredFields == null) {
 
-            throw new IllegalStateException("Required-field pruning is enabled, " + "but plan has no required fields for alias: " + alias);
+            throw new IllegalStateException(
+                    "Required-field pruning is enabled, "
+                            + "but plan has no required fields for alias: "
+                            + alias
+            );
         }
 
-        System.out.println("  file: " + file.getAbsolutePath());
+        System.out.println(
+                "  file: "
+                        + file.getAbsolutePath()
+        );
 
-        System.out.println("  required fields: " + requiredFields);
+        System.out.println(
+                "  required fields: "
+                        + requiredFields
+        );
 
-        long count = 0L;
+        System.out.println(
+                "  Kafka input lanes: "
+                        + EXPECTED_WORKERS
+                        + " partitions [0.."
+                        + (EXPECTED_WORKERS - 1)
+                        + "], routingPhase="
+                        + routingPhase
+        );
 
-        BufferedReader br = new BufferedReader(new FileReader(file));
+        long count =
+                0L;
+
+        long[] rowsByPartition =
+                new long[EXPECTED_WORKERS];
+
+        BufferedReader br =
+                new BufferedReader(
+                        new FileReader(file)
+                );
 
         try {
+
             String line;
 
             while ((line = br.readLine()) != null) {
 
-                if (maxRows >= 0L && count >= maxRows) {
+                if (maxRows >= 0L
+                        && count >= maxRows) {
+
                     break;
                 }
 
-                ObjectNode tuple = tupleJsonFromLine(alias, columns, separator, line, requiredFields);
+                ObjectNode tuple =
+                        tupleJsonFromLine(
+                                alias,
+                                columns,
+                                separator,
+                                line,
+                                requiredFields
+                        );
 
-                ObjectNode datapoint = wrapTupleAsDatapoint(datasetKey, streamId, tuple);
+                int targetWorker =
+                        inputWorkerForTuple(
+                                tuple,
+                                plan,
+                                routingPhase
+                        );
 
-                sendJsonAsync(producer, topic, datasetKey, datapoint);
+                if (targetWorker < 0
+                        || targetWorker >= EXPECTED_WORKERS) {
+
+                    throw new IllegalStateException(
+                            "Invalid input worker."
+                                    + " alias=" + alias
+                                    + ", phase=" + routingPhase
+                                    + ", worker=" + targetWorker
+                                    + ", expectedWorkers="
+                                    + EXPECTED_WORKERS
+                    );
+                }
+
+                ObjectNode datapoint =
+                        wrapTupleAsDatapoint(
+                                datasetKey,
+                                streamId,
+                                tuple
+                        );
+
+                /*
+                 * Explicit Kafka partition = initial OnePass owner.
+                 *
+                 * The Kafka key may remain the stable dataset key because the
+                 * explicit partition argument bypasses Kafka's key partitioner.
+                 */
+                sendJsonAsyncToPartition(
+                        producer,
+                        topic,
+                        targetWorker,
+                        datasetKey,
+                        datapoint
+                );
+
+                rowsByPartition[targetWorker]++;
 
                 count++;
 
                 if (count % 50000L == 0L) {
-                    System.out.println("    prepared " + count + " rows for alias " + alias);
+
+                    System.out.println(
+                            "    prepared "
+                                    + count
+                                    + " rows for alias "
+                                    + alias
+                    );
                 }
             }
 
         } finally {
+
             br.close();
         }
 
+        StringBuilder distribution =
+                new StringBuilder();
+
+        for (int worker = 0;
+             worker < rowsByPartition.length;
+             worker++) {
+
+            if (worker > 0) {
+                distribution.append(", ");
+            }
+
+            distribution
+                    .append(worker)
+                    .append('=')
+                    .append(rowsByPartition[worker]);
+        }
+
+        System.out.println(
+                "  partition distribution alias="
+                        + alias
+                        + ": "
+                        + distribution
+        );
+
         return count;
+    }
+
+    private static int inputWorkerForTuple(
+            ObjectNode tupleNode,
+            CompiledOnePassPlan plan,
+            InputRoutingPhase routingPhase) {
+
+        OnePassTuple tuple =
+                OnePassTupleExtractor.extract(
+                        tupleNode
+                );
+
+        switch (routingPhase) {
+
+            case PHASE1:
+
+                return OnePassShardOwnership
+                        .ownerForPhaseOneInputTuple(
+                                tuple,
+                                plan,
+                                EXPECTED_WORKERS
+                        );
+
+            case PHASE2:
+
+                return OnePassShardOwnership
+                        .ownerForPhaseTwoRootTuple(
+                                tuple,
+                                plan,
+                                EXPECTED_WORKERS
+                        );
+
+            case PHASE3:
+
+                if (EXECUTION_MODE
+                        == OnePassExecutionMode.REPLICATED) {
+
+                    return OnePassShardOwnership
+                            .ownerForPhaseThreeSelectionTuple(
+                                    tuple,
+                                    plan,
+                                    EXPECTED_WORKERS
+                            );
+                }
+
+                return OnePassShardOwnership
+                        .ownerForPhaseThreeInputTuple(
+                                tuple,
+                                plan,
+                                EXPECTED_WORKERS
+                        );
+
+            default:
+
+                throw new IllegalStateException(
+                        "Unsupported input routing phase: "
+                                + routingPhase
+                );
+        }
     }
 
     private static File tableFileForAlias(OnePassCatalog catalog, CompiledOnePassPlan plan, String alias) {
@@ -4123,6 +4407,71 @@ public final class OnepassSamplerSdeMultiworkerTest {
                         + ", startingOffsets="
                         + startingOffsets
         );
+    }
+
+    private static void sendJsonAsyncToPartition(
+            KafkaProducer<String, String> producer,
+            String topic,
+            int partition,
+            String key,
+            JsonNode json) {
+
+        producer.send(
+                new ProducerRecord<String, String>(
+                        topic,
+                        partition,
+                        key,
+                        json.toString()
+                )
+        );
+    }
+
+    private static void sendEndAliasToAllWorkerPartitions(
+            KafkaProducer<String, String> producer,
+            String topic,
+            String datasetKey,
+            ObjectNode baseEndAliasDatapoint,
+            int expectedWorkers) {
+
+        if (baseEndAliasDatapoint == null
+                || baseEndAliasDatapoint.get("values") == null
+                || !baseEndAliasDatapoint.get("values").isObject()) {
+
+            throw new IllegalArgumentException(
+                    "END_ALIAS datapoint must contain an object values payload."
+            );
+        }
+
+        for (int worker = 0;
+             worker < expectedWorkers;
+             worker++) {
+
+            ObjectNode laneMarker =
+                    baseEndAliasDatapoint.deepCopy();
+
+            ObjectNode marker =
+                    (ObjectNode) laneMarker.get(
+                            "values"
+                    );
+
+            marker.put(
+                    ONEPASS_TARGET_WORKER_FIELD,
+                    worker
+            );
+
+            marker.put(
+                    "__onePassInputPartition",
+                    worker
+            );
+
+            sendJsonAsyncToPartition(
+                    producer,
+                    topic,
+                    worker,
+                    datasetKey,
+                    laneMarker
+            );
+        }
     }
 
     private static void sendJsonAsync(KafkaProducer<String, String> producer, String topic, String key, JsonNode json) {

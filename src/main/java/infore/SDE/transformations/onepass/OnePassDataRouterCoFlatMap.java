@@ -36,6 +36,7 @@ public final class OnePassDataRouterCoFlatMap
     private static final long serialVersionUID = 1L;
 
     private static final String ONEPASS_DATA_BARRIER_FIELD = "__onePassDataBarrier";
+    private static final String ONEPASS_TARGET_WORKER_FIELD = "__onePassTargetWorker";
     private static final String ONEPASS_END_ALIAS_TYPE = "END_ALIAS";
     private static final String START_PHASE_2 = "START_PHASE_2";
     private static final String START_PHASE_3_ALIAS = "START_PHASE_3_ALIAS";
@@ -63,7 +64,24 @@ public final class OnePassDataRouterCoFlatMap
             return;
         }
 
-        if (isOnePassDataBarrier(value) || isOnePassEndAlias(value)) {
+        if (isOnePassDataBarrier(value)) {
+            broadcastToWorkers(value, baseKey, p, out);
+            return;
+        }
+
+        if (isOnePassEndAlias(value)) {
+            int targetWorker = onePassTargetWorker(value);
+
+            if (targetWorker >= 0) {
+                if (targetWorker >= p) {
+                    throw new IllegalStateException("END_ALIAS target worker is outside OnePass parallelism." +
+                            " targetWorker=" + targetWorker + ", parallelism=" + p + ", baseKey=" + baseKey);
+                }
+
+                out.collect(copyWithKey(value, OnePassShardOwnership.workerKey(baseKey, p, targetWorker)));
+                return;
+            }
+
             broadcastToWorkers(value, baseKey, p, out);
             return;
         }
@@ -252,5 +270,19 @@ public final class OnePassDataRouterCoFlatMap
 
         String value = field.asText();
         return value == null || value.trim().isEmpty() ? defaultValue : value.trim();
+    }
+
+    private static int onePassTargetWorker(Datapoint value) {
+        if (value == null || value.getValues() == null || value.getValues().isNull()) {
+            return -1;
+        }
+
+        JsonNode target = value.getValues().get(ONEPASS_TARGET_WORKER_FIELD);
+        if (target == null || target.isNull()) {
+
+            return -1;
+        }
+
+        return target.asInt(-1);
     }
 }
