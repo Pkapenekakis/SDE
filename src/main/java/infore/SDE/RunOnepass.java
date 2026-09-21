@@ -54,11 +54,11 @@ public class RunOnepass {
         env.setParallelism(parallelism);
         String consumerGroupPrefix = "onepass-" + onePassKafkaConsumerRunId;
         kafkaStringConsumer dataConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic,
-                consumerGroupPrefix + "-data", true, true);
+                "onepass-data", true);
         kafkaStringConsumer requestConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic,
-                consumerGroupPrefix + "-request", false, true);
+                "onepass-request", false);
         kafkaStringConsumer onePassStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic,
-                consumerGroupPrefix + "-state", false, true);
+                "onepass-state", false);
         kafkaProducerEstimation estimationProducer = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
 
         //RequestTopic feedback is used for stateless OnePass lifecycle
@@ -586,8 +586,6 @@ public class RunOnepass {
             parallelism = 8;
             kafkaOnePassStateTopic = "onepassStateTopic";
         }
-        onePassKafkaConsumerRunId = System.getProperty("onepass.kafkaConsumerRunId", UUID.randomUUID().toString());
-        System.out.println("[INFO] onePassKafkaConsumerRunId=" + onePassKafkaConsumerRunId);
     }
 
 }

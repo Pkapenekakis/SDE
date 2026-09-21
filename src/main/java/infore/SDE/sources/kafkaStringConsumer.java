@@ -36,11 +36,7 @@ public class kafkaStringConsumer {
         );
     }
 
-    /**
-     * Explicit cluster/benchmark constructor.
-     * Use a different group for data/request/state and a fresh run id for every detached thesis run.
-     */
-    public kafkaStringConsumer(String server, String topic, String groupId, boolean readCommitted, boolean startFromLatest) {
+    public kafkaStringConsumer(String server, String topic, String groupId, boolean readCommitted) {
 
         if (groupId == null || groupId.trim().isEmpty()) {
             throw new IllegalArgumentException("groupId must not be blank");
@@ -49,21 +45,19 @@ public class kafkaStringConsumer {
         Properties properties = new Properties();
         properties.setProperty("bootstrap.servers", server);
         properties.setProperty("group.id", groupId.trim());
-
+        properties.setProperty("auto.offset.reset", "latest");
         if (readCommitted) {
             properties.setProperty("isolation.level", "read_committed");
         }
 
         fc = new FlinkKafkaConsumer<String>(topic, new SimpleStringSchema(), properties);
 
-        if (startFromLatest) {
-            /*
-             * Thesis benchmark jobs are started before the producer test.
-             * A fresh job should not replay stale state/control records from an
-             * earlier experiment.
-             */
-            fc.setStartFromLatest();
-        }
+        /*
+         * Explicitly use committed group offsets.
+         *
+         * Do NOT call setStartFromLatest().
+         */
+        fc.setStartFromGroupOffsets();
     }
 
     public void cancel() {
