@@ -45,20 +45,15 @@ public class RunOnepass {
     private static int parallelism;
     private static String kafkaOutputTopic;
     private static String kafkaOnePassStateTopic;
-    private static String onePassKafkaConsumerRunId;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static void main(String[] args) throws Exception {
         initializeParameters(args);
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
-        String consumerGroupPrefix = "onepass-" + onePassKafkaConsumerRunId;
-        kafkaStringConsumer dataConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic,
-                "onepass-data", true);
-        kafkaStringConsumer requestConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic,
-                "onepass-request", false);
-        kafkaStringConsumer onePassStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic,
-                "onepass-state", false);
+        kafkaStringConsumer dataConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaDataInputTopic, true);
+        kafkaStringConsumer requestConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaRequestInputTopic, false);
+        kafkaStringConsumer onePassStateConsumer = new kafkaStringConsumer(kafkaBrokersList, kafkaOnePassStateTopic, false);
         kafkaProducerEstimation estimationProducer = new kafkaProducerEstimation(kafkaBrokersList, kafkaOutputTopic);
 
         //RequestTopic feedback is used for stateless OnePass lifecycle

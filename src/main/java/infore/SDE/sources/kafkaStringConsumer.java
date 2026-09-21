@@ -17,7 +17,6 @@ public class kafkaStringConsumer {
         properties.setProperty("group.id", "test");
         //.setStartFromEarliest()
         fc = (FlinkKafkaConsumer<String>) new FlinkKafkaConsumer<>(topic, new SimpleStringSchema(), properties);
-
     }
 
     public kafkaStringConsumer(String server, String topic, boolean readCommitted) {
@@ -29,41 +28,12 @@ public class kafkaStringConsumer {
             properties.setProperty("isolation.level", "read_committed");
         }
 
-        fc = (FlinkKafkaConsumer<String>) new FlinkKafkaConsumer<>(
-                topic,
-                new SimpleStringSchema(),
-                properties
-        );
-    }
-
-    public kafkaStringConsumer(String server, String topic, String groupId, boolean readCommitted) {
-
-        if (groupId == null || groupId.trim().isEmpty()) {
-            throw new IllegalArgumentException("groupId must not be blank");
-        }
-
-        Properties properties = new Properties();
-        properties.setProperty("bootstrap.servers", server);
-        properties.setProperty("group.id", groupId.trim());
-        properties.setProperty("auto.offset.reset", "latest");
-        if (readCommitted) {
-            properties.setProperty("isolation.level", "read_committed");
-        }
-
-        fc = new FlinkKafkaConsumer<String>(topic, new SimpleStringSchema(), properties);
-
-        /*
-         * Explicitly use committed group offsets.
-         *
-         * Do NOT call setStartFromLatest().
-         */
-        fc.setStartFromGroupOffsets();
+        fc = (FlinkKafkaConsumer<String>) new FlinkKafkaConsumer<>(topic, new SimpleStringSchema(), properties);
     }
 
     public void cancel() {
 
         fc.cancel();
-
     }
 
     public FlinkKafkaConsumer<String> getFc() {
