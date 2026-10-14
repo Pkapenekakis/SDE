@@ -44,6 +44,11 @@ import java.util.UUID;
  * Phase 1:
  * - TPC-H parsing + Kafka producer.send() happen outside phase1_algorithm_total.
  * - Each non-root alias is prepared in an open Kafka transaction.
+ * - Transactional IDs are stable slot IDs, so the next benchmark invocation
+ *   automatically fences/aborts any incomplete transaction left by a crashed
+ *   or force-stopped previous invocation.
+ * - A JVM shutdown hook also aborts active transactions on normal SIGINT/SIGTERM
+ *   termination (for example Ctrl+C).
  * - commitTransaction() releases one alias at a time and IS inside the Phase-1 timer.
  * - the phase ends when START_PHASE_2 is observed on RequestTopic.
  * <p>
@@ -127,10 +132,10 @@ public final class OnepassSamplerSdeMultiworkerTest {
     // =========================
 
     private static String BOOTSTRAP_SERVERS =SOFTNET_BOOTSTRAP_SERVERS;
-    private static final String DATA_TOPIC = "pkapenekakis-dataTopic";
-    private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic";
-    private static final String OUTPUT_TOPIC = "pkapenekakis-estimationTopic";
-    private static final String STATE_TOPIC = "pkapenekakis-onepassStateTopic";
+    private static final String DATA_TOPIC = "pkapenekakis-dataTopic-v2";
+    private static final String REQUEST_TOPIC = "pkapenekakis-requestTopic-v2";
+    private static final String OUTPUT_TOPIC = "pkapenekakis-estimationTopic-v2";
+    private static final String STATE_TOPIC = "pkapenekakis-onepassStateTopic-v2";
 
     private static final String TEST_TPCH_DIR = System.getProperty("onepass.tpchDir",
             "/home/pkapenekakis/onepass/tpch-data/sf1");
@@ -158,10 +163,18 @@ public final class OnepassSamplerSdeMultiworkerTest {
             System.getProperty("onepass.combinedCsv", DEFAULT_COMBINED_BENCHMARK_CSV_PATH);
 
 
-    private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY " +
-            "(" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
-            "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
+//    private static final String TEST_ONEPASS_SQL = "SELECT * FROM wq3_alias WEIGHTED BY " +
+//            "(" + "o.o_totalprice * (l.l_extendedprice * (1 - l.l_discount))) " +
+//            "LIMIT 10000 /* catalog='tpch-onepass-catalog.json', seed='test123', scalefactor=1 */";
 
+    private static final String TEST_QUERY_NAME = System.getProperty("onepass.queryName", "wq3_alias").trim();
+    private static final int TEST_SAMPLE_SIZE = Integer.parseInt(System.getProperty("onepass.sampleSize", "10000"));
+    private static final int TEST_SCALE_FACTOR = Integer.parseInt(System.getProperty("onepass.scaleFactor", "1"));
+    private static final String TEST_SEED = System.getProperty("onepass.seed", "test123").trim();
+    private static final String TEST_CATALOG_REF = System.getProperty("onepass.catalog", "tpch-onepass-catalog.json").trim();
+    private static final String TEST_WEIGHTED_BY = System.getProperty("onepass.weightedBy", "").trim();
+    private static final String EXPERIMENT_TAG = System.getProperty("onepass.experimentTag", "").trim();
+    private static final String TEST_ONEPASS_SQL = buildTestOnePassSql();
 //    private static final String TEST_ONEPASS_SQL = "SELECT * FROM w_branch_supplier WEIGHTED BY " +
 //            "(" + "l1.l_extendedprice * l2.l_extendedprice" + ") " +
 //            "LIMIT 1000 " + "/* catalog='tpch-onepass-catalog.json', " + "seed='branch-test-123', scalefactor=1 */";
@@ -244,6 +257,53 @@ public final class OnepassSamplerSdeMultiworkerTest {
     private static final int TRANSACTION_TIMEOUT_MS =
             Integer.parseInt(System.getProperty("onepass.transactionTimeoutMs", "600000"));
 
+    /*
+     * Crash-safe Kafka transaction identity.
+     *
+     * DO NOT put uid/System.nanoTime() in these transactional IDs.
+     *
+     * Kafka uses transactional.id as the durable producer identity. When a new
+     * producer calls initTransactions() with the same transactional.id, Kafka
+     * fences the previous producer epoch and completes/aborts any unfinished
+     * transaction left by that producer. Stable IDs therefore let the next test
+     * invocation recover immediately from a previous JVM crash / Ctrl+C instead
+     * of waiting for transaction.timeout.ms.
+     *
+     * Slots are reused between Phase 1, Phase 2 and Phase 3 because those phases
+     * never have open transactions at the same time.
+     */
+    private static final String TRANSACTIONAL_ID_PREFIX =
+            System.getProperty(
+                    "onepass.transactionalIdPrefix",
+                    "pkapenekakis-onepass-multiworker"
+            );
+
+    /*
+     * At startup we recover this many stable transaction slots. Keep this at
+     * least as large as the largest non-root alias count used by a benchmark
+     * query. The default comfortably covers the current TPC-H plans while
+     * keeping startup recovery bounded.
+     */
+    private static final int TRANSACTION_RECOVERY_SLOTS =
+            Integer.parseInt(
+                    System.getProperty(
+                            "onepass.transactionRecoverySlots",
+                            "16"
+                    )
+            );
+
+    /*
+     * Producers with an OPEN transaction are registered here. The shutdown hook
+     * aborts them on a normal JVM shutdown. A hard kill (SIGKILL / kill -9)
+     * cannot run Java cleanup, which is why stable transactional IDs + startup
+     * recovery are also required.
+     */
+    private static final Map<String, KafkaProducer<String, String>>
+            ACTIVE_TRANSACTIONAL_PRODUCERS =
+            new LinkedHashMap<String, KafkaProducer<String, String>>();
+
+    private static volatile boolean transactionShutdownHookInstalled = false;
+
     private static final boolean ENABLE_REQUIRED_FIELD_PRUNING = true;
 
     /*
@@ -263,7 +323,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
      * The CSV schema is stable in both modes; detailed columns are simply left
      * empty when this flag is false.
      */
-    private static final boolean WRITE_DETAILED_BENCHMARK_DATA = false;
+    private static final boolean WRITE_DETAILED_BENCHMARK_DATA = true;
 
     /*
      * Legacy compatibility only.
@@ -412,6 +472,8 @@ public final class OnepassSamplerSdeMultiworkerTest {
         System.out.println("TPC-H dir        = " + TEST_TPCH_DIR);
         System.out.println("TEST_ROW_LIMIT   = " + TEST_ROW_LIMIT);
         System.out.println("transactionTimeoutMs = " + TRANSACTION_TIMEOUT_MS);
+        System.out.println("transactionalIdPrefix = " + TRANSACTIONAL_ID_PREFIX);
+        System.out.println("transactionRecoverySlots = " + TRANSACTION_RECOVERY_SLOTS);
         System.out.println("mainWaitTimeoutMs = " + TIMEOUT_MS
                 + (TIMEOUT_MS <= 0L ? " (INFINITE)" : ""));
         System.out.println("kafkaObserverRetryDelayMs = " + KAFKA_OBSERVER_RETRY_DELAY_MS);
@@ -450,6 +512,18 @@ public final class OnepassSamplerSdeMultiworkerTest {
         OnePassCatalog catalog = OnePassQueryCatalogLoader.load(params.getDataset().getDbConfig());
 
         validatePlanForOnePass(plan);
+        validateTransactionalRecoveryCapacity(plan);
+
+        /*
+         * Install cleanup before opening any transactional producer.
+         *
+         * recoverStaleBenchmarkTransactions(...) is deliberately before ADD and
+         * before Phase-1 preload. If the previous benchmark JVM died with an open
+         * transaction, initTransactions() on the same stable slot ID forces Kafka
+         * to resolve that old producer epoch before this run writes any data.
+         */
+        installTransactionShutdownHook();
+        recoverStaleBenchmarkTransactions();
 
         System.out.println("Compiled plan:");
         System.out.println(plan);
@@ -469,12 +543,31 @@ public final class OnepassSamplerSdeMultiworkerTest {
         List<PreparedAliasTransaction> preparedPhaseThree = new ArrayList<PreparedAliasTransaction>();
 
         try {
-
             /*
              * Position the Phase-1 RequestTopic observer BEFORE ADD so no
              * transition produced for this UID can be missed.
              */
             initializeObserver(phaseOneFeedbackConsumer, REQUEST_TOPIC);
+
+            // =============================================================
+            // ADD
+            // =============================================================
+
+            System.out.println();
+            System.out.println("Sending ADD OnePass request with noOfP=" + EXPECTED_WORKERS + "...");
+
+            ObjectNode addRequest = buildOnePassAddRequest(baseKey, streamId, uid, EXPECTED_WORKERS);
+            sendJson(controlProducer, REQUEST_TOPIC, baseKey, addRequest);
+            controlProducer.flush();
+
+            /*
+             * Give the ADD time to reach both:
+             *
+             * 1. OnePassDataRouterCoFlatMap on every router subtask
+             * 2. SDEcoFlatMap on every synopsis worker
+             * This is setup time and is outside all measured algorithm timers.
+             */
+            Thread.sleep(15000L);
 
             // =============================================================
             // PHASE 1 PRELOAD
@@ -485,9 +578,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
             System.out.println();
 
             long phaseOnePreloadStartNanos = tic();
-
             preparedPhaseOne = preparePhaseOneTransactions(uid, baseKey, streamId, catalog, plan);
-
             long phaseOnePreloadNanos = System.nanoTime() - phaseOnePreloadStartNanos;
 
             System.out.printf("Phase-1 Kafka preload completed OUTSIDE algorithm timer: %.3f s%n", phaseOnePreloadNanos / 1_000_000_000.0d);
@@ -498,32 +589,19 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 totalPreparedPhaseOneRows += prepared.rows;
 
-                System.out.println("  PREPARED PHASE1 alias=" + prepared.alias + ", epoch=" + prepared.epoch + ", rows=" + prepared.rows + ", committed=" + prepared.committed);
+                System.out.println("  PREPARED PHASE1 alias=" + prepared.alias + ", epoch=" + prepared.epoch +
+                        ", rows=" + prepared.rows + ", committed=" + prepared.committed);
             }
 
             if (totalPreparedPhaseOneRows <= 0L) {
-
                 throw new IllegalStateException("No Phase-1 rows were preloaded.");
             }
-
-            // =============================================================
-            // ADD
-            // =============================================================
-
-            System.out.println();
-            System.out.println("Sending ADD OnePass request with noOfP=" + EXPECTED_WORKERS + "...");
-
-            ObjectNode addRequest = buildOnePassAddRequest(baseKey, streamId, uid, EXPECTED_WORKERS);
-
-            sendJson(controlProducer, REQUEST_TOPIC, baseKey, addRequest);
-
-            controlProducer.flush();
 
             /*
              * Existing temporary ADD synchronization.
              * Setup time; deliberately outside both algorithm timers.
              */
-            Thread.sleep(3000L);
+            Thread.sleep(13000L);
 
             // =============================================================
             // MEASURED PHASE 1
@@ -565,8 +643,10 @@ public final class OnepassSamplerSdeMultiworkerTest {
                  * The commit is the algorithm release signal and is therefore
                  * intentionally inside the measured interval.
                  */
-                prepared.producer.commitTransaction();
-                prepared.committed = true;
+                commitPreparedTransaction(
+                        prepared,
+                        "Phase-1"
+                );
 
                 System.out.println("Kafka transaction committed. " + alias + " is now visible to the read_committed SDE source.");
 
@@ -686,8 +766,10 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 long phaseTwoStartNanos = tic();
 
-                preparedPhaseTwoRoot.producer.commitTransaction();
-                preparedPhaseTwoRoot.committed = true;
+                commitPreparedTransaction(
+                        preparedPhaseTwoRoot,
+                        "Phase-2 root"
+                );
 
                 System.out.println("Kafka transaction committed. Phase-2 root " + preparedPhaseTwoRoot.alias + " is now visible to the read_committed SDE source.");
 
@@ -951,8 +1033,10 @@ public final class OnepassSamplerSdeMultiworkerTest {
                          * The transaction commit is the Phase-3 replay release
                          * signal and is intentionally inside the algorithm timer.
                          */
-                        prepared.producer.commitTransaction();
-                        prepared.committed = true;
+                        commitPreparedTransaction(
+                                prepared,
+                                "Phase-3 replay"
+                        );
 
                         System.out.println(
                                 "Kafka transaction committed. Phase-3 replay alias "
@@ -1165,10 +1249,47 @@ public final class OnepassSamplerSdeMultiworkerTest {
     }
 
 
-    private static void closePreparedTransaction(PreparedAliasTransaction prepared, String label) {
+    private static void commitPreparedTransaction(
+            PreparedAliasTransaction prepared,
+            String label) {
 
         if (prepared == null || prepared.producer == null) {
+            throw new IllegalArgumentException(
+                    "Prepared transaction is null for " + label
+            );
+        }
 
+        if (prepared.committed) {
+            throw new IllegalStateException(
+                    "Transaction already committed for "
+                            + label
+                            + ": alias="
+                            + prepared.alias
+                            + ", epoch="
+                            + prepared.epoch
+            );
+        }
+
+        /*
+         * Do not unregister until commitTransaction() has returned successfully.
+         * If commit throws, the producer stays in the active registry and the
+         * normal finally block / shutdown hook can still attempt an abort.
+         */
+        prepared.producer.commitTransaction();
+        prepared.committed = true;
+
+        unregisterActiveTransactionalProducer(
+                prepared.transactionalId,
+                prepared.producer
+        );
+    }
+
+
+    private static void closePreparedTransaction(
+            PreparedAliasTransaction prepared,
+            String label) {
+
+        if (prepared == null || prepared.producer == null) {
             return;
         }
 
@@ -1176,16 +1297,39 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             if (!prepared.committed) {
 
-                System.err.println("Aborting uncommitted " + label + " transaction: alias=" + prepared.alias + ", epoch=" + prepared.epoch);
+                System.err.println(
+                        "Aborting uncommitted "
+                                + label
+                                + " transaction: alias="
+                                + prepared.alias
+                                + ", epoch="
+                                + prepared.epoch
+                                + ", transactionalId="
+                                + prepared.transactionalId
+                );
 
                 prepared.producer.abortTransaction();
             }
 
         } catch (Exception abortError) {
 
-            System.err.println("WARNING: could not abort " + label + " transaction for alias=" + prepared.alias);
+            System.err.println(
+                    "WARNING: could not abort "
+                            + label
+                            + " transactional producer for alias="
+                            + prepared.alias
+                            + ", transactionalId="
+                            + prepared.transactionalId
+            );
 
             abortError.printStackTrace();
+
+        } finally {
+
+            unregisterActiveTransactionalProducer(
+                    prepared.transactionalId,
+                    prepared.producer
+            );
         }
 
         try {
@@ -1194,11 +1338,71 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         } catch (Exception closeError) {
 
-            System.err.println("WARNING: could not close " + label + " transactional producer for alias=" + prepared.alias);
+            System.err.println(
+                    "WARNING: could not close "
+                            + label
+                            + " transactional producer for alias="
+                            + prepared.alias
+                            + ", transactionalId="
+                            + prepared.transactionalId
+            );
 
             closeError.printStackTrace();
         }
     }
+
+
+    private static void abortAndCloseTransactionalProducer(
+            String transactionalId,
+            KafkaProducer<String, String> producer,
+            String label) {
+
+        if (producer == null) {
+            return;
+        }
+
+        try {
+
+            producer.abortTransaction();
+
+        } catch (Exception abortError) {
+
+            System.err.println(
+                    "WARNING: could not abort transactional producer."
+                            + " label="
+                            + label
+                            + ", transactionalId="
+                            + transactionalId
+            );
+
+            abortError.printStackTrace();
+
+        } finally {
+
+            unregisterActiveTransactionalProducer(
+                    transactionalId,
+                    producer
+            );
+        }
+
+        try {
+
+            producer.close();
+
+        } catch (Exception closeError) {
+
+            System.err.println(
+                    "WARNING: could not close transactional producer."
+                            + " label="
+                            + label
+                            + ", transactionalId="
+                            + transactionalId
+            );
+
+            closeError.printStackTrace();
+        }
+    }
+
 
     // =====================================================================
     // PHASE-1 PRELOAD
@@ -1224,9 +1428,17 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             String nextAlias = last ? plan.getRootAlias() : plan.getLeafToRootOrder().get(position);
 
-            String transactionalId = "onepass-p1-" + uid + "-" + epoch + "-" + alias + "-" + Long.toHexString(System.nanoTime());
+            int transactionSlot = position - 1;
 
-            KafkaProducer<String, String> aliasProducer = createTransactionalProducer(transactionalId);
+            String transactionalId =
+                    benchmarkTransactionalId(
+                            transactionSlot
+                    );
+
+            KafkaProducer<String, String> aliasProducer =
+                    createTransactionalProducer(
+                            transactionalId
+                    );
 
             boolean success = false;
 
@@ -1276,7 +1488,15 @@ public final class OnepassSamplerSdeMultiworkerTest {
                  * The transaction remains open until the measured algorithm
                  * reaches this alias.
                  */
-                prepared.add(new PreparedAliasTransaction(alias, epoch, rows, aliasProducer));
+                prepared.add(
+                        new PreparedAliasTransaction(
+                                alias,
+                                epoch,
+                                rows,
+                                transactionalId,
+                                aliasProducer
+                        )
+                );
 
                 success = true;
 
@@ -1289,15 +1509,12 @@ public final class OnepassSamplerSdeMultiworkerTest {
                  * moves into the prepared list, abort/close immediately.
                  */
                 if (!success) {
-                    try {
-                        aliasProducer.abortTransaction();
-                    } catch (Exception ignored) {
-                    }
 
-                    try {
-                        aliasProducer.close();
-                    } catch (Exception ignored) {
-                    }
+                    abortAndCloseTransactionalProducer(
+                            transactionalId,
+                            aliasProducer,
+                            "Phase-1 prepare alias=" + alias
+                    );
                 }
             }
         }
@@ -1318,9 +1535,20 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
         String resultId = phaseTwoResultId(uid);
 
-        String transactionalId = "onepass-p2-" + uid + "-" + epoch + "-" + rootAlias + "-" + Long.toHexString(System.nanoTime());
+        /*
+         * Phase 1 has fully committed before Phase 2 preparation starts, so slot
+         * 0 can be safely reused. Reinitializing the stable ID also fences any
+         * unexpectedly stale producer epoch before opening the root transaction.
+         */
+        String transactionalId =
+                benchmarkTransactionalId(
+                        0
+                );
 
-        KafkaProducer<String, String> rootProducer = createTransactionalProducer(transactionalId);
+        KafkaProducer<String, String> rootProducer =
+                createTransactionalProducer(
+                        transactionalId
+                );
 
         boolean success = false;
 
@@ -1363,7 +1591,14 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             rootProducer.flush();
 
-            PreparedAliasTransaction prepared = new PreparedAliasTransaction(rootAlias, epoch, rows, rootProducer);
+            PreparedAliasTransaction prepared =
+                    new PreparedAliasTransaction(
+                            rootAlias,
+                            epoch,
+                            rows,
+                            transactionalId,
+                            rootProducer
+                    );
 
             success = true;
 
@@ -1375,19 +1610,11 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
             if (!success) {
 
-                try {
-
-                    rootProducer.abortTransaction();
-
-                } catch (Exception ignored) {
-                }
-
-                try {
-
-                    rootProducer.close();
-
-                } catch (Exception ignored) {
-                }
+                abortAndCloseTransactionalProducer(
+                        transactionalId,
+                        rootProducer,
+                        "Phase-2 root prepare alias=" + rootAlias
+                );
             }
         }
     }
@@ -1436,16 +1663,14 @@ public final class OnepassSamplerSdeMultiworkerTest {
                             alias
                     );
 
+            /*
+             * Phase 3 starts only after every Phase-1 slot and the Phase-2 root
+             * transaction have completed, so Phase-3 can reuse the same stable
+             * transaction slot pool.
+             */
             String transactionalId =
-                    "onepass-p3-"
-                            + uid
-                            + "-"
-                            + aliasIndex
-                            + "-"
-                            + alias
-                            + "-"
-                            + Long.toHexString(
-                            System.nanoTime()
+                    benchmarkTransactionalId(
+                            aliasIndex
                     );
 
             KafkaProducer<String, String> aliasProducer =
@@ -1526,6 +1751,7 @@ public final class OnepassSamplerSdeMultiworkerTest {
                                 alias,
                                 epoch,
                                 rows,
+                                transactionalId,
                                 aliasProducer
                         )
                 );
@@ -1537,15 +1763,11 @@ public final class OnepassSamplerSdeMultiworkerTest {
 
                 if (!success) {
 
-                    try {
-                        aliasProducer.abortTransaction();
-                    } catch (Exception ignored) {
-                    }
-
-                    try {
-                        aliasProducer.close();
-                    } catch (Exception ignored) {
-                    }
+                    abortAndCloseTransactionalProducer(
+                            transactionalId,
+                            aliasProducer,
+                            "Phase-3 prepare alias=" + alias
+                    );
                 }
             }
         }
@@ -1595,50 +1817,455 @@ public final class OnepassSamplerSdeMultiworkerTest {
     }
 
 
-    private static KafkaProducer<String, String> createTransactionalProducer(String transactionalId) {
+    private static String benchmarkTransactionalId(
+            int slot) {
 
-        Properties props = baseProducerProperties();
+        if (slot < 0
+                || slot >= TRANSACTION_RECOVERY_SLOTS) {
 
-        props.put("enable.idempotence", "true");
+            throw new IllegalArgumentException(
+                    "Kafka transaction slot is outside configured recovery pool."
+                            + " slot="
+                            + slot
+                            + ", recoverySlots="
+                            + TRANSACTION_RECOVERY_SLOTS
+            );
+        }
 
-        props.put("transactional.id", transactionalId);
+        return TRANSACTIONAL_ID_PREFIX
+                + "-slot-"
+                + slot;
+    }
 
-        props.put("transaction.timeout.ms", Integer.toString(TRANSACTION_TIMEOUT_MS));
+
+    private static void validateTransactionalRecoveryCapacity(
+            CompiledOnePassPlan plan) {
+
+        if (TRANSACTION_RECOVERY_SLOTS <= 0) {
+
+            throw new IllegalArgumentException(
+                    "onepass.transactionRecoverySlots must be > 0. actual="
+                            + TRANSACTION_RECOVERY_SLOTS
+            );
+        }
+
+        int phaseOneSlots =
+                plan.getLeafToRootOrder() == null
+                        ? 0
+                        : plan.getLeafToRootOrder().size();
+
+        int phaseThreeSlots =
+                phaseThreeAliasOrder(
+                        plan
+                ).size();
+
+        int requiredSlots =
+                Math.max(
+                        1,
+                        Math.max(
+                                phaseOneSlots,
+                                phaseThreeSlots
+                        )
+                );
+
+        if (requiredSlots > TRANSACTION_RECOVERY_SLOTS) {
+
+            throw new IllegalStateException(
+                    "Compiled OnePass plan requires more simultaneous Kafka "
+                            + "transaction slots than the crash-recovery pool."
+                            + " requiredSlots="
+                            + requiredSlots
+                            + ", transactionRecoverySlots="
+                            + TRANSACTION_RECOVERY_SLOTS
+                            + ". Increase with "
+                            + "-Donepass.transactionRecoverySlots=<N>."
+            );
+        }
+    }
+
+
+    /**
+     * Fences and resolves every stable benchmark transactional ID before a new
+     * benchmark run starts.
+     *
+     * Kafka guarantees that initTransactions() initializes a new producer epoch
+     * for transactional.id and resolves an unfinished transaction from an older
+     * producer instance with the same ID. This is the hard-crash recovery path:
+     * it works even if the previous JVM never executed its finally block or
+     * shutdown hook.
+     */
+    private static void recoverStaleBenchmarkTransactions() {
+
+        System.out.println();
+        System.out.println(
+                "Recovering stable Kafka benchmark transaction slots before preload..."
+        );
+
+        for (int slot = 0;
+             slot < TRANSACTION_RECOVERY_SLOTS;
+             slot++) {
+
+            String transactionalId =
+                    benchmarkTransactionalId(
+                            slot
+                    );
+
+            KafkaProducer<String, String> recoveryProducer =
+                    null;
+
+            try {
+
+                Properties props =
+                        transactionalProducerProperties(
+                                transactionalId
+                        );
+
+                recoveryProducer =
+                        new KafkaProducer<String, String>(
+                                props
+                        );
+
+                /*
+                 * This call is the important part. If a previous process died
+                 * while this transactional.id had an open transaction, Kafka
+                 * fences that old producer epoch and resolves the unfinished
+                 * transaction before returning.
+                 */
+                recoveryProducer.initTransactions();
+
+                System.out.println(
+                        "  recovered transaction slot "
+                                + slot
+                                + ": "
+                                + transactionalId
+                );
+
+            } finally {
+
+                if (recoveryProducer != null) {
+
+                    try {
+
+                        recoveryProducer.close();
+
+                    } catch (Exception closeError) {
+
+                        System.err.println(
+                                "WARNING: could not close Kafka recovery producer."
+                                        + " transactionalId="
+                                        + transactionalId
+                        );
+
+                        closeError.printStackTrace();
+                    }
+                }
+            }
+        }
+
+        System.out.println(
+                "Kafka transaction-slot recovery complete."
+        );
+        System.out.println();
+    }
+
+
+    private static Properties transactionalProducerProperties(
+            String transactionalId) {
+
+        if (transactionalId == null
+                || transactionalId.trim().isEmpty()) {
+
+            throw new IllegalArgumentException(
+                    "transactionalId must not be blank"
+            );
+        }
+
+        Properties props =
+                baseProducerProperties();
+
+        props.put(
+                "enable.idempotence",
+                "true"
+        );
+
+        props.put(
+                "transactional.id",
+                transactionalId
+        );
+
+        props.put(
+                "transaction.timeout.ms",
+                Integer.toString(
+                        TRANSACTION_TIMEOUT_MS
+                )
+        );
 
         /*
-         * Larger batch than the small control producer because this producer
-         * is used to preload relation data.
+         * Larger batch than the small control producer because this producer is
+         * used to preload relation data.
          */
-        props.put("batch.size", "65536");
+        props.put(
+                "batch.size",
+                "65536"
+        );
 
-        props.put("linger.ms", "5");
+        props.put(
+                "linger.ms",
+                "5"
+        );
 
-        KafkaProducer<String, String> producer = new KafkaProducer<String, String>(props);
-
-        producer.initTransactions();
-        producer.beginTransaction();
-
-        return producer;
+        return props;
     }
+
+
+    private static KafkaProducer<String, String> createTransactionalProducer(
+            String transactionalId) {
+
+        Properties props =
+                transactionalProducerProperties(
+                        transactionalId
+                );
+
+        KafkaProducer<String, String> producer =
+                new KafkaProducer<String, String>(
+                        props
+                );
+
+        boolean registered =
+                false;
+
+        try {
+
+            /*
+             * Reusing the stable transactional.id is intentional. Besides normal
+             * producer initialization, it also fences an older crashed producer
+             * that somehow survived until this point.
+             */
+            producer.initTransactions();
+
+            registerActiveTransactionalProducer(
+                    transactionalId,
+                    producer
+            );
+
+            registered =
+                    true;
+
+            producer.beginTransaction();
+
+            return producer;
+
+        } catch (RuntimeException error) {
+
+            if (registered) {
+
+                unregisterActiveTransactionalProducer(
+                        transactionalId,
+                        producer
+                );
+            }
+
+            try {
+
+                producer.close();
+
+            } catch (Exception ignored) {
+            }
+
+            throw error;
+        }
+    }
+
+
+    private static void registerActiveTransactionalProducer(
+            String transactionalId,
+            KafkaProducer<String, String> producer) {
+
+        synchronized (ACTIVE_TRANSACTIONAL_PRODUCERS) {
+
+            KafkaProducer<String, String> previous =
+                    ACTIVE_TRANSACTIONAL_PRODUCERS.put(
+                            transactionalId,
+                            producer
+                    );
+
+            if (previous != null
+                    && previous != producer) {
+
+                ACTIVE_TRANSACTIONAL_PRODUCERS.put(
+                        transactionalId,
+                        previous
+                );
+
+                throw new IllegalStateException(
+                        "Transactional slot is already active inside this JVM."
+                                + " transactionalId="
+                                + transactionalId
+                );
+            }
+        }
+    }
+
+
+    private static void unregisterActiveTransactionalProducer(
+            String transactionalId,
+            KafkaProducer<String, String> producer) {
+
+        synchronized (ACTIVE_TRANSACTIONAL_PRODUCERS) {
+
+            KafkaProducer<String, String> current =
+                    ACTIVE_TRANSACTIONAL_PRODUCERS.get(
+                            transactionalId
+                    );
+
+            if (current == producer) {
+
+                ACTIVE_TRANSACTIONAL_PRODUCERS.remove(
+                        transactionalId
+                );
+            }
+        }
+    }
+
+
+    /**
+     * Best-effort immediate cleanup for normal process termination.
+     *
+     * Ctrl+C sends SIGINT and normal service/process termination sends SIGTERM;
+     * Java runs shutdown hooks for those cases. SIGKILL / kill -9 cannot execute
+     * Java code, so the stable-ID startup recovery above remains the authoritative
+     * hard-crash recovery mechanism.
+     */
+    private static void installTransactionShutdownHook() {
+
+        synchronized (ACTIVE_TRANSACTIONAL_PRODUCERS) {
+
+            if (transactionShutdownHookInstalled) {
+                return;
+            }
+
+            transactionShutdownHookInstalled =
+                    true;
+        }
+
+        Runtime.getRuntime().addShutdownHook(
+                new Thread(
+                        new Runnable() {
+
+                            @Override
+                            public void run() {
+
+                                Map<String, KafkaProducer<String, String>> snapshot;
+
+                                synchronized (ACTIVE_TRANSACTIONAL_PRODUCERS) {
+
+                                    snapshot =
+                                            new LinkedHashMap<String, KafkaProducer<String, String>>(
+                                                    ACTIVE_TRANSACTIONAL_PRODUCERS
+                                            );
+
+                                    ACTIVE_TRANSACTIONAL_PRODUCERS.clear();
+                                }
+
+                                if (snapshot.isEmpty()) {
+                                    return;
+                                }
+
+                                System.err.println(
+                                        "OnePass benchmark shutdown: aborting "
+                                                + snapshot.size()
+                                                + " open Kafka transaction(s)..."
+                                );
+
+                                for (Map.Entry<String, KafkaProducer<String, String>> entry
+                                        : snapshot.entrySet()) {
+
+                                    String transactionalId =
+                                            entry.getKey();
+
+                                    KafkaProducer<String, String> producer =
+                                            entry.getValue();
+
+                                    try {
+
+                                        producer.abortTransaction();
+
+                                        System.err.println(
+                                                "  aborted "
+                                                        + transactionalId
+                                        );
+
+                                    } catch (Exception abortError) {
+
+                                        System.err.println(
+                                                "  WARNING: shutdown abort failed for "
+                                                        + transactionalId
+                                        );
+
+                                        abortError.printStackTrace();
+
+                                    } finally {
+
+                                        try {
+
+                                            producer.close();
+
+                                        } catch (Exception closeError) {
+
+                                            System.err.println(
+                                                    "  WARNING: shutdown close failed for "
+                                                            + transactionalId
+                                            );
+
+                                            closeError.printStackTrace();
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "onepass-kafka-transaction-cleanup"
+                )
+        );
+    }
+
 
     private static final class PreparedAliasTransaction {
 
         private final String alias;
         private final int epoch;
         private final long rows;
+        private final String transactionalId;
         private final KafkaProducer<String, String> producer;
 
         private boolean committed;
 
-        private PreparedAliasTransaction(String alias, int epoch, long rows, KafkaProducer<String, String> producer) {
+        private PreparedAliasTransaction(
+                String alias,
+                int epoch,
+                long rows,
+                String transactionalId,
+                KafkaProducer<String, String> producer) {
 
-            this.alias = alias;
-            this.epoch = epoch;
-            this.rows = rows;
-            this.producer = producer;
-            this.committed = false;
+            this.alias =
+                    alias;
+
+            this.epoch =
+                    epoch;
+
+            this.rows =
+                    rows;
+
+            this.transactionalId =
+                    transactionalId;
+
+            this.producer =
+                    producer;
+
+            this.committed =
+                    false;
         }
     }
+
 
     // =====================================================================
     // PHASE-1 REQUEST-TOPIC OBSERVER (SHARDED OR REPLICATED)
@@ -5007,6 +5634,8 @@ public final class OnepassSamplerSdeMultiworkerTest {
                 + "timestamp_ms,"
                 + "implementation,"
                 + "seed,"
+                + "scale_factor,"
+                + "experiment_tag,"
                 + "root_alias,"
                 + "leaf_to_root_order,"
                 + "phase3_root_to_leaf_order,"
@@ -5033,7 +5662,6 @@ public final class OnepassSamplerSdeMultiworkerTest {
                 + "phase3_selection_count,"
                 + "phase3_installed_worker_count";
     }
-
 
     /**
      * Prevents silently appending the new Phase-3 benchmark row shape below an
@@ -5453,11 +6081,9 @@ public final class OnepassSamplerSdeMultiworkerTest {
                         )
                 );
 
-                fields.add(
-                        csv(
-                                plan.getRootAlias()
-                        )
-                );
+                fields.add(Integer.toString(plan.getDatasetScaleFactor()));
+                fields.add(csv(EXPERIMENT_TAG));
+                fields.add(csv(plan.getRootAlias()));
 
                 fields.add(
                         csv(
@@ -5623,9 +6249,9 @@ public final class OnepassSamplerSdeMultiworkerTest {
             } else {
 
                 /*
-                 * 28 optional detailed columns.
+                 * 30 optional detailed columns.
                  */
-                for (int i = 0; i < 28; i++) {
+                for (int i = 0; i < 30; i++) {
                     fields.add("");
                 }
             }
@@ -6096,5 +6722,58 @@ public final class OnepassSamplerSdeMultiworkerTest {
         }
 
         System.out.println("=======================================================");
+    }
+
+    private static String buildTestOnePassSql() {
+
+        if (TEST_QUERY_NAME.isEmpty()) {
+            throw new IllegalArgumentException("onepass.queryName must not be blank");
+        }
+
+        if (!TEST_QUERY_NAME.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+            throw new IllegalArgumentException("Invalid onepass.queryName: " + TEST_QUERY_NAME);
+        }
+
+        if (TEST_SAMPLE_SIZE <= 0) {
+            throw new IllegalArgumentException("onepass.sampleSize must be > 0. Actual=" + TEST_SAMPLE_SIZE);
+        }
+
+        if (TEST_SCALE_FACTOR <= 0) {
+            throw new IllegalArgumentException("onepass.scaleFactor must be > 0. Actual=" + TEST_SCALE_FACTOR);
+        }
+
+        if (TEST_SEED.isEmpty()) {
+            throw new IllegalArgumentException("onepass.seed must not be blank");
+        }
+
+        if (TEST_CATALOG_REF.isEmpty()) {
+            throw new IllegalArgumentException("onepass.catalog must not be blank");
+        }
+
+        /*
+         * These values are written inside the SQL metadata comment using
+         * single-quoted values. Reject a quote instead of silently producing
+         * malformed SQL metadata.
+         */
+        if (TEST_SEED.indexOf('\'') >= 0) {
+            throw new IllegalArgumentException("onepass.seed must not contain a single quote");
+        }
+
+        if (TEST_CATALOG_REF.indexOf('\'') >= 0) {
+            throw new IllegalArgumentException("onepass.catalog must not contain a single quote");
+        }
+
+        StringBuilder sql = new StringBuilder();
+
+        sql.append("SELECT * FROM ").append(TEST_QUERY_NAME).append(" ");
+
+        if (!TEST_WEIGHTED_BY.isEmpty()) {
+
+            sql.append("WEIGHTED BY (").append(TEST_WEIGHTED_BY).append(") ");
+        }
+
+        sql.append("LIMIT ").append(TEST_SAMPLE_SIZE).append(" /* catalog='").append(TEST_CATALOG_REF).append("', seed='").append(TEST_SEED).append("', scalefactor=").append(TEST_SCALE_FACTOR).append(" */");
+
+        return sql.toString();
     }
 }

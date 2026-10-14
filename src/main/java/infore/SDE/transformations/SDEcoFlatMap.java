@@ -1957,8 +1957,12 @@ public class SDEcoFlatMap extends RichCoFlatMapFunction<Datapoint, Request, Esti
 		 * into bounded SHARD_BATCH messages only after this worker can no longer
 		 * generate any final contribution for the alias.
 		 */
-		onePassPhaseOneTransferBuffer.addRemoteContribution(uid, baseKey, expectedWorkers, pId, targetWorker,
-				epoch, alias, contribution);
+		List<Estimation> flushed = onePassPhaseOneTransferBuffer.
+				addRemoteContribution(uid, baseKey, expectedWorkers, pId, targetWorker, epoch, alias, contribution);
+
+		for (Estimation estimation : flushed) {
+			collector.collect(estimation);
+		}
 	}
 
 	private void routePhaseOneEnrichmentWork(OnePassSamplerSdeSynopsis onePass, JsonNode tuplePayload,

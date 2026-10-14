@@ -78,6 +78,32 @@
           "r_name",
           "r_comment"
         ]
+      },
+      "part": {
+        "file": "part.tbl",
+        "separator": "|",
+        "columns": [
+          "p_partkey",
+          "p_name",
+          "p_mfgr",
+          "p_brand",
+          "p_type",
+          "p_size",
+          "p_container",
+          "p_retailprice",
+          "p_comment"
+        ]
+      },
+      "partsupp": {
+        "file": "partsupp.tbl",
+        "separator": "|",
+        "columns": [
+          "ps_partkey",
+          "ps_suppkey",
+          "ps_availqty",
+          "ps_supplycost",
+          "ps_comment"
+        ]
       }
     }
   },
@@ -494,6 +520,126 @@
         "cus": "1",
         "ord": "o_totalprice",
         "l2": "l_quantity"
+      }
+    },
+    "wq2_alias": {
+      "description": "Weighted TPC-H Q2-shaped part-partsupp-supplier-nation-region chain",
+      "defaultRoot": "p",
+      "relations": [
+        {
+          "alias": "p",
+          "table": "part"
+        },
+        {
+          "alias": "ps",
+          "table": "partsupp"
+        },
+        {
+          "alias": "s",
+          "table": "supplier"
+        },
+        {
+          "alias": "n",
+          "table": "nation"
+        },
+        {
+          "alias": "r",
+          "table": "region"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "p",
+          "leftField": "p_partkey",
+          "rightAlias": "ps",
+          "rightField": "ps_partkey"
+        },
+        {
+          "leftAlias": "ps",
+          "leftField": "ps_suppkey",
+          "rightAlias": "s",
+          "rightField": "s_suppkey"
+        },
+        {
+          "leftAlias": "s",
+          "leftField": "s_nationkey",
+          "rightAlias": "n",
+          "rightField": "n_nationkey"
+        },
+        {
+          "leftAlias": "n",
+          "leftField": "n_regionkey",
+          "rightAlias": "r",
+          "rightField": "r_regionkey"
+        }
+      ],
+      "projection": [
+        "p.p_partkey",
+        "ps.ps_suppkey",
+        "s.s_suppkey",
+        "n.n_nationkey",
+        "r.r_regionkey"
+      ],
+      "defaultWeightsByAlias": {
+        "p": "1",
+        "ps": "ps_supplycost",
+        "s": "1",
+        "n": "1",
+        "r": "1"
+      }
+    },
+    "wq10_branch": {
+      "description": "Weighted TPC-H Q10-shaped branching customer-orders-lineitem and customer-nation query",
+      "defaultRoot": "c",
+      "relations": [
+        {
+          "alias": "c",
+          "table": "customer"
+        },
+        {
+          "alias": "o",
+          "table": "orders"
+        },
+        {
+          "alias": "l",
+          "table": "lineitem"
+        },
+        {
+          "alias": "n",
+          "table": "nation"
+        }
+      ],
+      "joins": [
+        {
+          "leftAlias": "c",
+          "leftField": "c_custkey",
+          "rightAlias": "o",
+          "rightField": "o_custkey"
+        },
+        {
+          "leftAlias": "o",
+          "leftField": "o_orderkey",
+          "rightAlias": "l",
+          "rightField": "l_orderkey"
+        },
+        {
+          "leftAlias": "c",
+          "leftField": "c_nationkey",
+          "rightAlias": "n",
+          "rightField": "n_nationkey"
+        }
+      ],
+      "projection": [
+        "c.c_custkey",
+        "o.o_orderkey",
+        "l.l_linenumber",
+        "n.n_nationkey"
+      ],
+      "defaultWeightsByAlias": {
+        "c": "1",
+        "o": "o_totalprice",
+        "l": "l_extendedprice",
+        "n": "1"
       }
     }
   }

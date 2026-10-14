@@ -186,6 +186,7 @@ infore/SDE/producersForTesting/Datapoint1.class
 infore/SDE/MultySDE$1.class
 lib/WDFT/main.class
 infore/SDE/reduceFunctions/SimpleAvgFunction.class
+infore/SDE/Experiments/Onepass/MultiWorker/OnepassSamplerSdeMultiworkerTest$2.class
 infore/SDE/transformations/OlddataRouterCoFlatMap.class
 infore/SDE/synopses/OnePassSampler/PhaseTwo/OnePassRootSampleCandidate.class
 infore/SDE/synopses/OnePassSampler/PhaseOne/OnePassPhaseOne.class

@@ -51,6 +51,7 @@ public final class OnePassPhaseOneTransferBuffer implements Serializable {
     public static final int REQUEST_STATE_TRANSFER = 78;
     public static final int SYNOPSIS_ID = 30;
 
+
     /*
      * These limits now control only the outgoing messages created by
      * flushAlias(...).
@@ -58,7 +59,7 @@ public final class OnePassPhaseOneTransferBuffer implements Serializable {
      */
     private final int maxEntriesPerBatch;
     private final int maxApproxBytesPerBatch;
-
+    private final int maxBufferedKeysPerTransfer;
     /*
      * Complete alias-level aggregates.
      * One PendingAggregate exists for each:
@@ -80,15 +81,22 @@ public final class OnePassPhaseOneTransferBuffer implements Serializable {
 
     public OnePassPhaseOneTransferBuffer() {
         this(Integer.getInteger("sde.onepass.phase1.shardBatchEntries", 512),
-                Integer.getInteger("sde.onepass.phase1.shardBatchBytes", 256 * 1024));
+                Integer.getInteger("sde.onepass.phase1.shardBatchBytes", 256 * 1024),
+                Integer.getInteger("sde.onepass.phase1.maxBufferedRemoteKeys", 8192));
     }
 
     public OnePassPhaseOneTransferBuffer(int maxEntriesPerBatch, int maxApproxBytesPerBatch) {
-        if (maxEntriesPerBatch <= 0 || maxApproxBytesPerBatch <= 0) {
-            throw new IllegalArgumentException("Phase-1 batch limits must be > 0");
+        this(maxEntriesPerBatch, maxApproxBytesPerBatch, 8192);
+    }
+
+    public OnePassPhaseOneTransferBuffer(int maxEntriesPerBatch, int maxApproxBytesPerBatch, int maxBufferedKeysPerTransfer) {
+        if (maxEntriesPerBatch <= 0 || maxApproxBytesPerBatch <= 0 || maxBufferedKeysPerTransfer <= 0) {
+            throw new IllegalArgumentException("Phase-1 buffer limits must be > 0");
         }
+
         this.maxEntriesPerBatch = maxEntriesPerBatch;
         this.maxApproxBytesPerBatch = maxApproxBytesPerBatch;
+        this.maxBufferedKeysPerTransfer = maxBufferedKeysPerTransfer;
     }
 
 
@@ -102,11 +110,12 @@ public final class OnePassPhaseOneTransferBuffer implements Serializable {
      * If the same join key is produced many times by this source worker for
      * the same target/edge during the alias, all deltas are combined here.
      */
-    public void addRemoteContribution(int uid, String baseKey, int expectedWorkers, int sourceWorker,
-                                      int targetWorker, int epoch, String alias, OnePassPhaseOneContribution contribution) {
+    public List<Estimation> addRemoteContribution(int uid, String baseKey, int expectedWorkers, int sourceWorker,
+                                                  int targetWorker, int epoch, String alias,
+                                                  OnePassPhaseOneContribution contribution) {
 
         if (contribution == null || contribution.getDelta() == 0.0d) {
-            return;
+            return Collections.emptyList();
         }
 
         BatchKey key = new BatchKey(uid, baseKey, expectedWorkers, sourceWorker, targetWorker, epoch, alias, contribution.getEdgeId());
@@ -121,13 +130,16 @@ public final class OnePassPhaseOneTransferBuffer implements Serializable {
         Double current = aggregate.entries.get(joinKey);
         double updated = (current == null ? 0.0d : current.doubleValue()) + contribution.getDelta();
 
-        /*
-         * Normally deltas are positive for the current OnePass workload.
-         * Keeping the key even if updated == 0 preserves generic additive
-         * semantics and avoids silently changing behavior if signed deltas are
-         * introduced later.
-         */
         aggregate.entries.put(joinKey, updated);
+        if (aggregate.entries.size() >= maxBufferedKeysPerTransfer) {
+            List<Estimation> emitted = new ArrayList<Estimation>();
+            appendBatches(key, aggregate, emitted);
+            aggregate.entries.clear();
+
+            return emitted;
+        }
+
+        return Collections.emptyList();
     }
 
 
